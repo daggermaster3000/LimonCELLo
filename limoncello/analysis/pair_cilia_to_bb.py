@@ -69,7 +69,7 @@ def pair_from_mixed_df(df):
         cilia_coords[:, None, :] - basal_coords[None, :, :],
         axis=2
     )
-    print(dist_matrix)
+    
     dist_mask = dist_matrix.copy()
 
 
