@@ -1,6 +1,6 @@
 # LimonCELLo — DT neuron & cilia analysis
 
-![alt text](image.png)
+![alt text](assets/image.png)
 
 Overview
 --------
