@@ -9,11 +9,16 @@ datasets, focusing on associating cilia to neurites and classifying their locati
 
 Check out the [tutorial notebook](tutorial/tutorial.ipynb)
 
-1. Install runtime dependencies:
+*1. Clone the repo:*
+```powershell
+git clone https://github.com/daggermaster3000/LimonCELLo.git
+```
 
+*2. Install runtime dependencies:*
 ```powershell
 pip install numpy scipy pandas matplotlib pyclesperanto_prototype scikit-image
 ```
+
 
 
 
