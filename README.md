@@ -10,9 +10,13 @@ datasets, focusing on associating cilia to neurites and classifying their locati
 Check out the [tutorial notebook](tutorial/tutorial.ipynb)
 
 1. Install runtime dependencies:
-
+Using conda:
+```bash
+conda env create -f env.yml
+```
+or using pip:
 ```powershell
-pip install numpy scipy pandas matplotlib pyclesperanto_prototype scikit-image
+pip install numpy scipy pandas matplotlib pyclesperanto_prototype scikit-image apoc imaris_ims_file_reader seaborn tqdm skan stackview
 ```
 
 
