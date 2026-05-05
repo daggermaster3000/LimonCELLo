@@ -134,7 +134,7 @@ with tabs[0]:
 
         df = pd.read_excel(excel_path, sheet_name=sheet)
 
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width='stretch')
 
         st.download_button(
             "⬇️ Download Excel",
@@ -164,7 +164,7 @@ with tabs[1]:
                 format_func=lambda x: os.path.basename(x)
             )
 
-            st.image(selected_fig, use_container_width=True)
+            st.image(selected_fig, width='stretch')
 
         else:
             st.info("No figures found.")
@@ -183,7 +183,7 @@ with tabs[2]:
                 format_func=lambda x: os.path.basename(x)
             )
 
-            st.image(selected_overlay, use_container_width=True)
+            st.image(selected_overlay, width='stretch')
 
         else:
             st.info("No overlays found.")
