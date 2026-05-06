@@ -27,9 +27,20 @@ def run_pipeline3(
     tophat_radius=12,
     neurite_spot_sigma=5,
     cilia_classifier_path=r'segmenters\cilia-segmenter.cl',
+    axon_threshold=2.5,
+    soma_threshold=1.0,
+    p_low=2,
+    p_high=98,
+    outline_sigma=3,
+    gpu_device=None,
+    cilia_channel: int = 0,
+    neurites_channel: int = 1,
+    basal_bodies_channel: int = 2,
+    nuclei_channel: int = 3,
 ):
     print(cle.available_device_names(dev_type="gpu"))
-    cle.select_device('NVIDIA GeForce RTX 4090')  # optional but good practice
+    if gpu_device:
+        cle.select_device(gpu_device)
     print(cle.get_device())
     os.makedirs(output_path, exist_ok=True)
     csv_dir = os.path.join(output_path, "csv")
@@ -44,31 +55,35 @@ def run_pipeline3(
         print(f"Processing {file}...")
 
         # Load data
-        a, meta = load_image(os.path.join(input_path, file))
+        try:
+            a, meta = load_image(os.path.join(input_path, file))
+        except Exception as exc:
+            print(f"  ✗ Could not open {file}: {exc} — skipping.")
+            continue
         voxel_size = meta["voxel_size"]
         
-        a_norm = normalize_intensity(a,p_low=2,p_high=98)
+        a_norm = normalize_intensity(a, p_low=p_low, p_high=p_high)
         
         # Segmentation
         cilia_labels = segment_cilia_ml(
-            a[0, 0],
-            classifier_path = cilia_classifier_path,
-            )
+            a[0, cilia_channel],
+            classifier_path=cilia_classifier_path,
+        )
 
         nuclei_labels_otsu = segment_nuclei(
-            a_norm[0, 3],
+            a_norm[0, nuclei_channel],
             tophat_radius=(tophat_radius, tophat_radius, tophat_radius),
             spot_sigma=nuclei_spot_sigma,
-            outline_sigma=3,
+            outline_sigma=outline_sigma,
         )
 
         skeleton, neurites_label = segment_neurites(
-            a_norm[0, 1],
+            a_norm[0, neurites_channel],
             spot_sigma=neurite_spot_sigma,
         )
 
         basal_bodies_labels = segment_basal_bodies(
-            a[0,2]
+            a[0, basal_bodies_channel]
         )
 
         # get neurites masks
@@ -162,10 +177,21 @@ def run_pipeline3(
         os.makedirs(overlay_dir, exist_ok=True)
 
         # MIP of neurite + cilia channels
-        neurite_mip = np.max(a_norm[0, 1], axis=0)   # (Y, X)
-        cilia_mip = np.max(a_norm[0, 0], axis=0)     # (Y, X)
-        nuclei_mip = np.max(a_norm[0,3], axis = 0)
-       
+        neurite_mip = np.max(a_norm[0, neurites_channel], axis=0)   # (Y, X)
+        cilia_mip   = np.max(a_norm[0, cilia_channel],   axis=0)    # (Y, X)
+        nuclei_mip  = np.max(a_norm[0, nuclei_channel],  axis=0)    # (Y, X)
+
+        # Persist MIPs so the app overlay tab can regenerate figures without
+        # reloading raw .ims data.
+        _mip_out = os.path.join(output_path, "figures", "mips")
+        os.makedirs(_mip_out, exist_ok=True)
+        _fstem = os.path.splitext(file)[0]
+        np.save(os.path.join(_mip_out, f"{_fstem}_neurite_mip.npy"), neurite_mip)
+        np.save(os.path.join(_mip_out, f"{_fstem}_cilia_mip.npy"),   cilia_mip)
+        np.save(os.path.join(_mip_out, f"{_fstem}_nuclei_mip.npy"),  nuclei_mip)
+        np.save(os.path.join(_mip_out, f"{_fstem}_ratio_mid.npy"),
+                map_ratio[map_ratio.shape[0] // 2])
+
         fig, axes = plt.subplots(2,2, figsize=(14,10))
 
         # Base layer: neurites
@@ -173,7 +199,9 @@ def run_pipeline3(
         axes[0,0].set_title('Neurites MIP')
         axes[1,1].imshow(cilia_mip,cmap='gray')
         axes[1,1].set_title('Cilia MIP')
-        axes[0,1].imshow( np.log(map_ratio[map_ratio.shape[0] // 2]),cmap='coolwarm')
+        with np.errstate(divide="ignore", invalid="ignore"):
+            _ratio_log_mid = np.log(map_ratio[map_ratio.shape[0] // 2])
+        axes[0,1].imshow(_ratio_log_mid, cmap='coolwarm')
         axes[0,1].set_title('log(ratio) overlay')
         axes[1,0].imshow(nuclei_mip,cmap='gray')
         axes[1,0].set_title('Nuclei MIP')
@@ -267,9 +295,9 @@ def run_pipeline3(
     
     # Classification
     def classify(score):
-        if score > 2.5:
+        if score > axon_threshold:
             return "axon"
-        elif score < 1:
+        elif score < soma_threshold:
             return "soma"
         else:
             return "ambiguous"
