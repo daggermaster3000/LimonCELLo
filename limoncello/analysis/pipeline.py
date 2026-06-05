@@ -46,6 +46,7 @@ def run_pipeline3(
     cilia_max_size: int = 0,
     bb_min_size: int = 5,
     bb_max_size: int = 0,
+    ratio_epsilon: float = 1.0,
     progress_callback=None,
 ):
     print(cle.available_device_names(dev_type="gpu"))
@@ -95,6 +96,7 @@ def run_pipeline3(
         "distance_thresholds": {
             "max_cilia_um": max_cilia_dist_cutoff_um,
             "max_basal_body_um": max_basal_body_cutoff_um,
+            "ratio_epsilon": ratio_epsilon,
         },
         "classification": {
             "axon_threshold": axon_threshold,
@@ -187,10 +189,14 @@ def run_pipeline3(
             neurite_mask, sampling=voxel_size
         )
 
-        # Ratio
-        map_ratio = np.where(distance_map_neurites > 0,
-                     distance_map_nuclei / distance_map_neurites,
-                     0)
+        # Regularised ratio: (dt_nuclei + ε) / (dt_neurite + ε)
+        # NaN outside the neurite mask so overlays show true background
+        with np.errstate(divide="ignore", invalid="ignore"):
+            map_ratio = np.where(
+                neurite_mask,
+                (distance_map_nuclei + ratio_epsilon) / (distance_map_neurites + ratio_epsilon),
+                np.nan,
+            )
         map_ratio[~np.isfinite(map_ratio)] = np.nan
 
         # Distance to neurites
@@ -269,23 +275,31 @@ def run_pipeline3(
         _mip_out = os.path.join(output_path, "figures", "mips")
         os.makedirs(_mip_out, exist_ok=True)
         _fstem = os.path.splitext(file)[0]
-        np.save(os.path.join(_mip_out, f"{_fstem}_neurite_mip.npy"), neurite_mip)
-        np.save(os.path.join(_mip_out, f"{_fstem}_cilia_mip.npy"),   cilia_mip)
-        np.save(os.path.join(_mip_out, f"{_fstem}_nuclei_mip.npy"),  nuclei_mip)
+        _neurite_mask_mip = np.max(neurite_mask, axis=0).astype(np.uint8)   # (Y,X) binary
+        np.save(os.path.join(_mip_out, f"{_fstem}_neurite_mip.npy"),      neurite_mip)
+        np.save(os.path.join(_mip_out, f"{_fstem}_cilia_mip.npy"),        cilia_mip)
+        np.save(os.path.join(_mip_out, f"{_fstem}_nuclei_mip.npy"),       nuclei_mip)
+        np.save(os.path.join(_mip_out, f"{_fstem}_neurite_mask_mip.npy"), _neurite_mask_mip)
         np.save(os.path.join(_mip_out, f"{_fstem}_ratio_mid.npy"),
                 map_ratio[map_ratio.shape[0] // 2])
 
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-        axes[0, 0].imshow(neurite_mip, cmap="gray")
-        axes[0, 0].set_title("Neurites MIP")
-        axes[1, 1].imshow(cilia_mip, cmap="gray")
-        axes[1, 1].set_title("Cilia MIP")
+        # Mask grayscale panels to neurite footprint; ratio panel uses NaN=black
+        _mask2d = _neurite_mask_mip.astype(bool)
+        _cmap_ratio = plt.cm.coolwarm.copy()
+        _cmap_ratio.set_bad("black")
+
         with np.errstate(divide="ignore", invalid="ignore"):
             _ratio_log_mid = np.log(map_ratio[map_ratio.shape[0] // 2])
-        axes[0, 1].imshow(_ratio_log_mid, cmap="coolwarm")
-        axes[0, 1].set_title("log(ratio) overlay")
-        axes[1, 0].imshow(nuclei_mip, cmap="gray")
+
+        axes[0, 0].imshow(np.where(_mask2d, neurite_mip, 0.0), cmap="gray")
+        axes[0, 0].set_title("Neurites MIP")
+        axes[1, 1].imshow(np.where(_mask2d, cilia_mip, 0.0), cmap="gray")
+        axes[1, 1].set_title("Cilia MIP")
+        axes[0, 1].imshow(_ratio_log_mid, cmap=_cmap_ratio)
+        axes[0, 1].set_title("log(ratio) — background masked")
+        axes[1, 0].imshow(np.where(_mask2d, nuclei_mip, 0.0), cmap="gray")
         axes[1, 0].set_title("Nuclei MIP")
 
         scores = df_cilia["log_ratio"].values

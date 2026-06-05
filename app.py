@@ -267,6 +267,10 @@ def _load_mips(mip_dir: str, stem: str, mtime: float) -> dict | None:
         if not os.path.exists(path):
             return None
         result[key] = np.load(path)
+    # Neurite mask MIP is optional (saved by newer pipeline runs)
+    _mask_path = os.path.join(mip_dir, f"{stem}_neurite_mask_mip.npy")
+    if os.path.exists(_mask_path):
+        result["neurite_mask"] = np.load(_mask_path).astype(bool)
     return result
 
 
@@ -434,6 +438,7 @@ _JSON_SS_MAP = [
     (("basal_bodies", "max_size"),                         "bb_max_size",          int),
     (("distance_thresholds", "max_cilia_um"),              "max_cilia",            float),
     (("distance_thresholds", "max_basal_body_um"),         "max_basal",            float),
+    (("distance_thresholds", "ratio_epsilon"),             "ratio_epsilon",        float),
     (("classification", "axon_threshold"),                 "pf_axon_thr",          float),
     (("classification", "soma_threshold"),                 "pf_soma_thr",          float),
 ]
@@ -498,6 +503,7 @@ _SS_DEFAULTS: dict = {
     "bb_max_size":         0,
     "max_cilia":           2.0,
     "max_basal":           2.0,
+    "ratio_epsilon":       1.0,
     "use_mip":             False,
     **_PF_DEFAULTS,
 }
@@ -781,6 +787,12 @@ with st.sidebar:
         "Max basal body distance (µm)", 0.5, 10.0, step=0.1, key="max_basal",
         help="🔄 Max centroid→neurite distance to include a basal body"
     )
+    ratio_epsilon = st.slider(
+        "Ratio epsilon (µm)", 0.0, 10.0, step=0.1, key="ratio_epsilon",
+        help="🔄 Constant ε added to both numerator and denominator: "
+             "ratio = (dt_nuclei + ε) / (dt_neurite + ε). "
+             "Prevents division by zero and log(0). Larger ε → smoother ratio."
+    )
 
     st.markdown("---")
 
@@ -891,6 +903,7 @@ if run_clicked:
             bb_gaussian_sigma=(float(bb_gauss_z), float(bb_gauss_y), float(bb_gauss_x)),
             bb_min_size=int(bb_min_size),
             bb_max_size=int(bb_max_size),
+            ratio_epsilon=float(ratio_epsilon),
         )
 
         _save_to_path_history("input", input_path)
@@ -1357,6 +1370,43 @@ with tab_graphs:
                         )
                 plt.close(_fig_g)
 
+        # ── Ratio Distribution per Sample ─────────────────────────────────────
+        if "ratio" in _df_kept.columns and not _df_kept.empty:
+            st.markdown("---")
+            st.subheader("📊 Ratio Distribution per Sample")
+            st.caption(
+                "Raw ratio = (dt_nuclei + ε) / (dt_neurite + ε) — no log transform applied."
+            )
+            _fig_ratio, _ax_ratio = plt.subplots(figsize=(10, 4))
+            try:
+                _ratio_data = _df_kept[["ratio", _x_col]].dropna()
+                sns.violinplot(
+                    data=_ratio_data, x=_x_col, y="ratio",
+                    hue=_x_col, legend=False, ax=_ax_ratio,
+                    palette="Set2", width=0.6, linewidth=0.8,
+                )
+                _ax_ratio.set_xlabel(_x_col, fontsize=9, labelpad=6)
+                _ax_ratio.set_ylabel("Ratio", fontsize=9, labelpad=6)
+                _ax_ratio.tick_params(axis="x", rotation=45, labelsize=8)
+                _ax_ratio.spines["top"].set_visible(False)
+                _ax_ratio.spines["right"].set_visible(False)
+                _ax_ratio.yaxis.grid(True, linestyle="--", linewidth=0.5,
+                                     color="#CCCCCC", alpha=0.7, zorder=0)
+                _ax_ratio.set_axisbelow(True)
+                _ax_ratio.set_title(
+                    "Ratio per Sample", fontsize=10, fontweight="bold", pad=8, loc="left"
+                )
+                plt.tight_layout()
+                _png_ratio = _fig_to_png(_fig_ratio)
+                st.pyplot(_fig_ratio, width="stretch")
+                st.download_button(
+                    "⬇️ Ratio Distribution per Sample (PNG)", _png_ratio,
+                    "ratio_per_sample.png", "image/png", key="dl_ratio_violin",
+                )
+            except Exception as _re:
+                st.warning(f"Could not render ratio distribution: {_re}")
+            plt.close(_fig_ratio)
+
         st.markdown("---")
 
         # ── Custom Plot Builder ───────────────────────────────────────────────
@@ -1551,16 +1601,25 @@ with tab_overlays:
 
                 with np.errstate(divide="ignore", invalid="ignore"):
                     _ratio_log = np.where(
-                        _mips["ratio"] > 0, np.log(_mips["ratio"]), np.nan
+                        np.isfinite(_mips["ratio"]), np.log(_mips["ratio"]), np.nan
                     )
 
-                _axes_ov[0, 0].imshow(_mips["neurite"], cmap="gray")
+                # Neurite mask: use saved binary mask if available, else full image
+                _nmask2d = _mips.get("neurite_mask")  # (Y,X) bool or None
+
+                def _mask_gray(img):
+                    return np.where(_nmask2d, img, 0.0) if _nmask2d is not None else img
+
+                _cmap_ratio = plt.cm.coolwarm.copy()
+                _cmap_ratio.set_bad("black")
+
+                _axes_ov[0, 0].imshow(_mask_gray(_mips["neurite"]), cmap="gray")
                 _axes_ov[0, 0].set_title("Neurites MIP")
-                _axes_ov[1, 1].imshow(_mips["cilia"], cmap="gray")
+                _axes_ov[1, 1].imshow(_mask_gray(_mips["cilia"]), cmap="gray")
                 _axes_ov[1, 1].set_title("Cilia MIP")
-                _axes_ov[0, 1].imshow(_ratio_log, cmap="coolwarm")
-                _axes_ov[0, 1].set_title("log(ratio) overlay")
-                _axes_ov[1, 0].imshow(_mips["nuclei"], cmap="gray")
+                _axes_ov[0, 1].imshow(_ratio_log, cmap=_cmap_ratio)
+                _axes_ov[0, 1].set_title("log(ratio) — background masked")
+                _axes_ov[1, 0].imshow(_mask_gray(_mips["nuclei"]), cmap="gray")
                 _axes_ov[1, 0].set_title("Nuclei MIP")
 
                 # Colour scale from kept-cilia log_ratio (5th–95th percentile of finite values)
