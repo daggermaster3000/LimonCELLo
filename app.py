@@ -756,8 +756,22 @@ if run_clicked:
 # ─────────────────────────────────────────────────────────────────────────────
 # DERIVED PATHS
 # ─────────────────────────────────────────────────────────────────────────────
-_csv_dir = os.path.join(output_path, "csv")
-_fig_dir = os.path.join(output_path, "figures")
+# DERIVED PATHS — resolve latest lc-analysis-* run directory automatically
+# ─────────────────────────────────────────────────────────────────────────────
+def _find_latest_run_dir(base: str) -> str | None:
+    """Return the most recent lc-analysis-YYYY-MM-DD_HH-MM-SS subfolder."""
+    if not base or not os.path.isdir(base):
+        return None
+    runs = sorted(
+        d for d in os.listdir(base)
+        if d.startswith("lc-analysis-") and os.path.isdir(os.path.join(base, d))
+    )
+    return os.path.join(base, runs[-1]) if runs else None
+
+
+_run_dir = _find_latest_run_dir(output_path) or output_path
+_csv_dir = os.path.join(_run_dir, "csv")
+_fig_dir = os.path.join(_run_dir, "figures")
 _overlay_dir = os.path.join(_fig_dir, "overlays")
 _mip_dir = os.path.join(_fig_dir, "mips")
 _excel_path = os.path.join(_csv_dir, "all_cilia_features.xlsx")
@@ -822,6 +836,8 @@ with tab_run:
             st.empty()
 
     st.subheader("Output Summary")
+    if _run_dir != output_path:
+        st.caption(f"Active run: `{os.path.basename(_run_dir)}`")
     _m1, _m2, _m3 = st.columns(3)
     with _m1:
         if os.path.exists(_excel_path):

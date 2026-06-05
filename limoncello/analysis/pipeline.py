@@ -48,7 +48,13 @@ def run_pipeline3(
     if gpu_device:
         cle.select_device(gpu_device)
     print(cle.get_device())
+
+    # Each run gets its own timestamped subfolder inside output_path
+    _run_stamp = datetime.now().strftime("lc-analysis-%Y-%m-%d_%H-%M-%S")
+    output_path = os.path.join(output_path, _run_stamp)
     os.makedirs(output_path, exist_ok=True)
+    print(f"Run directory: {output_path}")
+
     csv_dir = os.path.join(output_path, "csv")
     os.makedirs(csv_dir, exist_ok=True)
 
