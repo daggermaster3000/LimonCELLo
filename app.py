@@ -158,27 +158,99 @@ def _load_channel_preview(input_path: str, filename: str) -> np.ndarray | None:
         return None
 
 
-@st.dialog("🔭 Channel Preview", width="large")
-def _channel_preview_dialog(input_path: str, filename: str, ch_labels: list[str]):
-    st.caption(
-        f"Mid-Z slice · **{filename}**  "
-        f"— each panel shows one raw channel with its current assignment."
-    )
+_DIALOG_ROLES: list[tuple[str, str, int]] = [
+    ("Cilia",         "ch_cilia",    0),
+    ("Neurites",      "ch_neurites", 1),
+    ("Basal bodies",  "ch_bb",       2),
+    ("Nuclei (DAPI)", "ch_nuclei",   3),
+]
+
+
+@st.dialog("🔭 Channel Viewer & Assignment", width="large")
+def _channel_assignment_dialog(input_path: str, filename: str, n_channels: int):
+    """Interactive channel browser with arrow navigation and role assignment."""
+    # ── Navigation state ──────────────────────────────────────────────────────
+    if "dialog_ch_idx" not in st.session_state:
+        st.session_state.dialog_ch_idx = 0
+    ch = max(0, min(int(st.session_state.dialog_ch_idx), n_channels - 1))
+
     previews = _load_channel_preview(input_path, filename)
-    if previews is None:
-        st.error("Could not load image data. Check that the file is accessible.")
-        return
-    n = len(previews)
-    cols = st.columns(min(n, 4))
-    for i, preview in enumerate(previews):
-        with cols[i % 4]:
-            fig, ax = plt.subplots(figsize=(3, 3))
-            ax.imshow(preview, cmap="gray", aspect="equal")
-            ax.set_title(f"Ch {i} — {ch_labels[i]}", fontsize=8, pad=3)
-            ax.axis("off")
-            plt.tight_layout(pad=0.3)
-            st.pyplot(fig, width="stretch")
-            plt.close(fig)
+
+    # Build channel → role label map from current sidebar state
+    _ch_role: dict[int, str] = {}
+    for _lbl, _sk, _df in _DIALOG_ROLES:
+        _ch_role[int(st.session_state.get(_sk, _df))] = _lbl
+
+    # ── Thumbnail strip ───────────────────────────────────────────────────────
+    st.caption(f"Mid-Z slice — **{filename}**   |   click a thumbnail or use arrows to navigate")
+    _tcols = st.columns(n_channels)
+    for i in range(n_channels):
+        with _tcols[i]:
+            if previews is not None:
+                _tfig, _tax = plt.subplots(figsize=(2, 2))
+                _tax.imshow(previews[i], cmap="gray")
+                _tax.axis("off")
+                if i == ch:
+                    for _sp in _tax.spines.values():
+                        _sp.set_visible(True)
+                        _sp.set_edgecolor("#F5A623")
+                        _sp.set_linewidth(3)
+                plt.tight_layout(pad=0.1)
+                st.pyplot(_tfig, use_container_width=True)
+                plt.close(_tfig)
+            _rlbl = _ch_role.get(i, "—")
+            st.caption(f"Ch {i}" + (f" · {_rlbl}" if _rlbl != "—" else ""))
+            # Button click triggers a rerun WITHOUT st.rerun() so dialog stays open
+            if st.button("Select", key=f"_dsel_{i}", use_container_width=True,
+                         type="primary" if i == ch else "secondary"):
+                st.session_state.dialog_ch_idx = i
+
+    st.divider()
+
+    # ── Large view + arrow navigation ─────────────────────────────────────────
+    _nl, _nc, _nr = st.columns([1, 6, 1])
+    with _nl:
+        if st.button("◀", key="_dprev", disabled=(ch == 0), use_container_width=True):
+            st.session_state.dialog_ch_idx = ch - 1
+    with _nc:
+        _current_role = _ch_role.get(ch, "unassigned")
+        st.markdown(f"#### Channel {ch} — *{_current_role}*")
+    with _nr:
+        if st.button("▶", key="_dnext", disabled=(ch == n_channels - 1), use_container_width=True):
+            st.session_state.dialog_ch_idx = ch + 1
+
+    if previews is not None:
+        _mfig, _max = plt.subplots(figsize=(9, 5))
+        _max.imshow(previews[ch], cmap="gray", aspect="equal")
+        _max.axis("off")
+        plt.tight_layout(pad=0.1)
+        st.pyplot(_mfig, use_container_width=True)
+        plt.close(_mfig)
+    else:
+        st.error("Could not load image data.")
+
+    st.divider()
+
+    # ── Assignment row ────────────────────────────────────────────────────────
+    st.subheader("Assign structures to channels")
+    _acols = st.columns(len(_DIALOG_ROLES))
+    for _col, (_lbl, _sk, _df) in zip(_acols, _DIALOG_ROLES):
+        with _col:
+            st.selectbox(
+                _lbl,
+                options=list(range(n_channels)),
+                index=int(st.session_state.get(f"_dassign_{_sk}",
+                                                st.session_state.get(_sk, _df))),
+                key=f"_dassign_{_sk}",
+                format_func=lambda x: f"Channel {x}",
+            )
+
+    if st.button("✅ Apply Assignments", type="primary", use_container_width=True):
+        st.session_state["_pending_channels"] = {
+            _sk: int(st.session_state[f"_dassign_{_sk}"])
+            for _, _sk, _ in _DIALOG_ROLES
+        }
+        st.rerun()  # closes the dialog and triggers early-apply block
 
 
 @st.cache_data(show_spinner=False)
@@ -433,6 +505,11 @@ for _k, _v in _SS_DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
+# Apply queued channel assignments from the channel viewer dialog
+if "_pending_channels" in st.session_state:
+    for _sk, _cv in st.session_state.pop("_pending_channels").items():
+        st.session_state[_sk] = int(_cv)
+
 # Apply any queued JSON parameter reload — must happen here, before widgets are
 # instantiated, so Streamlit allows writing to widget-bound session-state keys.
 if "_pending_params" in st.session_state:
@@ -541,7 +618,26 @@ with st.sidebar:
     _n_ch = _file_info["n_channels"] if _file_info else 4
     _ch_opts = list(range(_n_ch))
 
-    with st.expander("Assign channels", expanded=True):
+    # Current assignment summary
+    _asum = "  ·  ".join(
+        f"{lbl}: Ch {st.session_state.get(sk, df)}"
+        for lbl, sk, df in _DIALOG_ROLES
+    )
+    st.caption(_asum)
+
+    # Primary: full visual viewer
+    if _file_info:
+        if st.button("🔭 Open Channel Viewer", key="ch_viewer_btn",
+                     use_container_width=True, type="primary"):
+            # Clear dialog assignment state so it initialises from current sidebar values
+            for _, _sk, _ in _DIALOG_ROLES:
+                st.session_state.pop(f"_dassign_{_sk}", None)
+            _channel_assignment_dialog(input_path, _file_info["filename"], _n_ch)
+    else:
+        st.info("Enter a valid input folder to open the channel viewer.")
+
+    # Fallback: compact selectboxes for quick edits without opening the dialog
+    with st.expander("⚙️ Manual override", expanded=False):
         cilia_channel = st.selectbox(
             "Cilia", _ch_opts, index=min(0, _n_ch - 1), key="ch_cilia",
             help="🔄 Raw channel fed to the ML cilia segmenter",
@@ -558,19 +654,6 @@ with st.sidebar:
             "Nuclei (DAPI)", _ch_opts, index=min(3, _n_ch - 1), key="ch_nuclei",
             help="🔄 Normalised channel used for nucleus segmentation",
         )
-
-        if _file_info:
-            _role = {
-                cilia_channel: "cilia",
-                neurites_channel: "neurites",
-                basal_bodies_channel: "basal bodies",
-                nuclei_channel: "nuclei (DAPI)",
-            }
-            _ch_labels = [_role.get(i, "unassigned") for i in _ch_opts]
-            if st.button("🔭 Preview channels", key="ch_preview_btn"):
-                _channel_preview_dialog(input_path, _file_info["filename"], _ch_labels)
-        else:
-            st.caption("Enter a valid input folder to enable channel preview.")
 
     st.markdown("---")
 
