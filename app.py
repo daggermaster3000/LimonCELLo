@@ -341,40 +341,37 @@ def _save_to_path_history(key: str, value: str) -> None:
         pass
 
 
+_JSON_SS_MAP = [
+    # (json_path_tuple,                                    ss_key,                 cast)
+    (("use_mip",),                                         "use_mip",              bool),
+    (("channels", "cilia"),                                "ch_cilia",             int),
+    (("channels", "neurites"),                             "ch_neurites",          int),
+    (("channels", "basal_bodies"),                         "ch_bb",                int),
+    (("channels", "nuclei"),                               "ch_nuclei",            int),
+    (("intensity_normalization", "p_low"),                 "p_low",                int),
+    (("intensity_normalization", "p_high"),                "p_high",               int),
+    (("nuclei", "spot_sigma"),                             "nuclei_sigma",         int),
+    (("nuclei", "tophat_radius"),                          "tophat_radius",        int),
+    (("nuclei", "outline_sigma"),                          "nuclei_outline_sigma", int),
+    (("neurites", "spot_sigma"),                           "neurite_sigma",        int),
+    (("basal_bodies", "spot_sigma"),                       "bb_spot_sigma",        float),
+    (("basal_bodies", "outline_sigma"),                    "bb_outline_sigma",     float),
+    (("distance_thresholds", "max_cilia_um"),              "max_cilia",            float),
+    (("distance_thresholds", "max_basal_body_um"),         "max_basal",            float),
+    (("classification", "axon_threshold"),                 "pf_axon_thr",          float),
+    (("classification", "soma_threshold"),                 "pf_soma_thr",          float),
+]
+
+
 def _apply_json_params(data: dict) -> None:
-    """Load run_parameters.json content into session state so sliders update."""
-    _flat_map = [
-        # (json_path_tuple,                                    ss_key,              cast)
-        (("use_mip",),                                         "use_mip",           bool),
-        (("channels", "cilia"),                                "ch_cilia",          int),
-        (("channels", "neurites"),                             "ch_neurites",       int),
-        (("channels", "basal_bodies"),                         "ch_bb",             int),
-        (("channels", "nuclei"),                               "ch_nuclei",         int),
-        (("intensity_normalization", "p_low"),                 "p_low",             int),
-        (("intensity_normalization", "p_high"),                "p_high",            int),
-        (("nuclei", "spot_sigma"),                             "nuclei_sigma",      int),
-        (("nuclei", "tophat_radius"),                          "tophat_radius",     int),
-        (("nuclei", "outline_sigma"),                          "nuclei_outline_sigma", int),
-        (("neurites", "spot_sigma"),                           "neurite_sigma",     int),
-        (("basal_bodies", "spot_sigma"),                       "bb_spot_sigma",     float),
-        (("basal_bodies", "outline_sigma"),                    "bb_outline_sigma",  float),
-        (("distance_thresholds", "max_cilia_um"),              "max_cilia",         float),
-        (("distance_thresholds", "max_basal_body_um"),         "max_basal",         float),
-        (("classification", "axon_threshold"),                 "pf_axon_thr",       float),
-        (("classification", "soma_threshold"),                 "pf_soma_thr",       float),
-    ]
-    for path, ss_key, cast in _flat_map:
-        node = data
-        for k in path:
-            node = node.get(k) if isinstance(node, dict) else None
-        if node is not None:
-            st.session_state[ss_key] = cast(node)
-    # Gaussian sigma stored as list [z, y, x]
-    gs = data.get("basal_bodies", {}).get("gaussian_sigma")
-    if gs and len(gs) >= 3:
-        st.session_state["bb_gauss_z"] = float(gs[0])
-        st.session_state["bb_gauss_y"] = float(gs[1])
-        st.session_state["bb_gauss_x"] = float(gs[2])
+    """Queue parameters to be applied at the top of the next rerun.
+
+    Streamlit forbids writing to widget-bound session-state keys after those
+    widgets have been instantiated.  We store the payload in a staging key;
+    the early-apply block (just after _SS_DEFAULTS init) consumes it before
+    any widget is created.
+    """
+    st.session_state["_pending_params"] = data
 
 
 def _path_input(label: str, history_key: str, help_text: str = "",
@@ -427,6 +424,22 @@ _SS_DEFAULTS: dict = {
 for _k, _v in _SS_DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
+
+# Apply any queued JSON parameter reload — must happen here, before widgets are
+# instantiated, so Streamlit allows writing to widget-bound session-state keys.
+if "_pending_params" in st.session_state:
+    _qd = st.session_state.pop("_pending_params")
+    for _path, _ss_key, _cast in _JSON_SS_MAP:
+        _node = _qd
+        for _k in _path:
+            _node = _node.get(_k) if isinstance(_node, dict) else None
+        if _node is not None:
+            st.session_state[_ss_key] = _cast(_node)
+    _gs = _qd.get("basal_bodies", {}).get("gaussian_sigma")
+    if _gs and len(_gs) >= 3:
+        st.session_state["bb_gauss_z"] = float(_gs[0])
+        st.session_state["bb_gauss_y"] = float(_gs[1])
+        st.session_state["bb_gauss_x"] = float(_gs[2])
 
 # Sync completed thread result → session_state (thread cannot write session_state directly)
 if st.session_state.pipeline_running:
