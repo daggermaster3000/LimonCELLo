@@ -238,6 +238,7 @@ def run_pipeline3(
             map_ratio,
             max_cilia_dist_cutoff_um,
             file,
+            ratio_epsilon=ratio_epsilon,
         )
 
         if df_cilia.empty:
@@ -256,6 +257,7 @@ def run_pipeline3(
             max_basal_body_cutoff_um,
             file,
             "basal_body",
+            ratio_epsilon=ratio_epsilon,
         )
 
         all_dfs.append(df_basal_bodies)

@@ -13,7 +13,8 @@ def assign_label_features(
     map_ratio: np.ndarray,
     max_cilia_dist_cutoff_um: float,
     file: str,
-    object_type: str = "cilia"
+    object_type: str = "cilia",
+    ratio_epsilon: float = 1.0,
 ) -> pd.DataFrame:
     """
     Assign features to cilia objects based on centroids and distance maps.
@@ -33,20 +34,21 @@ def assign_label_features(
     distance_map_nuclei : np.ndarray
         Distance transform of nuclei.
     map_ratio : np.ndarray
-        Ratio map.
+        Regularised ratio map (dt_nuclei + ε) / (dt_neurite + ε).
     max_cilia_dist_cutoff_um : float
         Maximum distance allowed to consider assignment.
     file : str
         Filename for this set of cilia (used in DataFrame).
-    cilia_labels_shape : tuple
-        Shape of the cilia label volume (for clipping coordinates).
     object_type : str, optional
         Type of object, by default "cilia".
+    ratio_epsilon : float, optional
+        Constant added before log transforms of dt_neurite and dt_nuclei
+        to avoid log(0). Should match the epsilon used to build map_ratio.
 
     Returns
     -------
     pd.DataFrame
-        DataFrame with one row per cilium that passed the distance threshold.
+        DataFrame with one row per object that passed the distance threshold.
     """
     rows = []
 
@@ -68,22 +70,22 @@ def assign_label_features(
         sz, sy, sx = nearest_skel_idx[:, z, y, x]
 
         dt_neurite = distance_map_neurites[sz, sy, sx]
-        dt_nuclei = distance_map_nuclei[sz, sy, sx]
-        ratio = map_ratio[sz, sy, sx]
+        dt_nuclei  = distance_map_nuclei[sz, sy, sx]
+        ratio      = map_ratio[sz, sy, sx]  # already regularised in pipeline
 
         rows.append(
             {
-                "filename": file,
-                "cilia_id": cid,
-                "coords": [float(centroid[0]), float(centroid[1]), float(centroid[2])],
+                "filename":             file,
+                "cilia_id":             cid,
+                "coords":               [float(centroid[0]), float(centroid[1]), float(centroid[2])],
                 "distance_to_neurite_um": d,
-                "ratio": ratio,
-                "log_ratio": np.log(ratio),
-                "dt_neurite": dt_neurite,
-                "dt_nuclei": dt_nuclei,
-                "log_dt_neurite": np.log(dt_neurite),
-                "log_dt_nuclei": np.log(dt_nuclei),
-                "object_type": object_type,
+                "ratio":                ratio,
+                "log_ratio":            np.log(ratio),
+                "dt_neurite":           dt_neurite,
+                "dt_nuclei":            dt_nuclei,
+                "log_dt_neurite":       np.log(dt_neurite + ratio_epsilon),
+                "log_dt_nuclei":        np.log(dt_nuclei  + ratio_epsilon),
+                "object_type":          object_type,
             }
         )
 
