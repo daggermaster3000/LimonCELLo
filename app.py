@@ -342,7 +342,7 @@ def _path_input(label: str, history_key: str, help_text: str = "",
         sel = st.selectbox(label, [_NEW_PATH_SENTINEL] + recent,
                            key=f"_sel_{history_key}", help=help_text)
         if sel == _NEW_PATH_SENTINEL:
-            return st.text_input("", key=f"_new_{history_key}",
+            return st.text_input(label, key=f"_new_{history_key}",
                                  label_visibility="collapsed",
                                  placeholder="Paste or type path…")
         return sel
@@ -830,7 +830,8 @@ with tab_tables:
                     ("distance_to_neurite_um", "max",  "max_distance_um"),
                 ]:
                     if _col in _cilia_s.columns:
-                        _val = getattr(_cilia_s[_col], _stat)()
+                        _series = _cilia_s[_col].replace([np.inf, -np.inf], np.nan)
+                        _val = getattr(_series, _stat)()
                         _row[_key] = round(float(_val), 4) if pd.notna(_val) else None
                     else:
                         _row[_key] = None
