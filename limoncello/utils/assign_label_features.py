@@ -78,11 +78,11 @@ def assign_label_features(
                 "coords": [float(centroid[0]), float(centroid[1]), float(centroid[2])],
                 "distance_to_neurite_um": d,
                 "ratio": ratio,
-                "log_ratio": np.log1p(ratio),
+                "log_ratio": np.log(ratio),
                 "dt_neurite": dt_neurite,
                 "dt_nuclei": dt_nuclei,
-                "log_dt_neurite": np.log1p(dt_neurite),
-                "log_dt_nuclei": np.log1p(dt_nuclei),
+                "log_dt_neurite": np.log(dt_neurite),
+                "log_dt_nuclei": np.log(dt_nuclei),
                 "object_type": object_type,
             }
         )

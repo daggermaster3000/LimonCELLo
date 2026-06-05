@@ -281,7 +281,8 @@ def run_pipeline3(
         axes[0, 0].set_title("Neurites MIP")
         axes[1, 1].imshow(cilia_mip, cmap="gray")
         axes[1, 1].set_title("Cilia MIP")
-        _ratio_log_mid = np.log1p(map_ratio[map_ratio.shape[0] // 2])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            _ratio_log_mid = np.log(map_ratio[map_ratio.shape[0] // 2])
         axes[0, 1].imshow(_ratio_log_mid, cmap="coolwarm")
         axes[0, 1].set_title("log(ratio) overlay")
         axes[1, 0].imshow(nuclei_mip, cmap="gray")

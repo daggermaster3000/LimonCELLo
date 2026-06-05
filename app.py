@@ -1549,9 +1549,10 @@ with tab_overlays:
                 # ── 2×2 MIP-backed figure (identical layout to pipeline.py) ──
                 _fig_ov, _axes_ov = plt.subplots(2, 2, figsize=(14, 10))
 
-                _ratio_log = np.log1p(
-                    np.where(np.isfinite(_mips["ratio"]), _mips["ratio"], np.nan)
-                )
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    _ratio_log = np.where(
+                        _mips["ratio"] > 0, np.log(_mips["ratio"]), np.nan
+                    )
 
                 _axes_ov[0, 0].imshow(_mips["neurite"], cmap="gray")
                 _axes_ov[0, 0].set_title("Neurites MIP")
