@@ -1604,23 +1604,20 @@ with tab_overlays:
                         np.isfinite(_mips["ratio"]), np.log(_mips["ratio"]), np.nan
                     )
 
-                # Neurite mask: use saved binary mask if available, else full image
-                _nmask2d = _mips.get("neurite_mask")  # (Y,X) bool or None
-
-                def _mask_gray(img):
-                    return np.where(_nmask2d, img, 0.0) if _nmask2d is not None else img
-
+                # Ratio panel only: NaN outside neurites → black background
                 _cmap_ratio = plt.cm.coolwarm.copy()
                 _cmap_ratio.set_bad("black")
 
-                _axes_ov[0, 0].imshow(_mask_gray(_mips["neurite"]), cmap="gray")
-                _axes_ov[0, 0].set_title("Neurites MIP")
-                _axes_ov[1, 1].imshow(_mask_gray(_mips["cilia"]), cmap="gray")
-                _axes_ov[1, 1].set_title("Cilia MIP")
+                # [0,0] Cilia MIP  [0,1] log(ratio) masked
+                # [1,0] Nuclei MIP [1,1] Cilia MIP
+                _axes_ov[0, 0].imshow(_mips["cilia"], cmap="gray")
+                _axes_ov[0, 0].set_title("Cilia MIP")
                 _axes_ov[0, 1].imshow(_ratio_log, cmap=_cmap_ratio)
-                _axes_ov[0, 1].set_title("log(ratio) — background masked")
-                _axes_ov[1, 0].imshow(_mask_gray(_mips["nuclei"]), cmap="gray")
+                _axes_ov[0, 1].set_title("log(ratio) — neurite masked")
+                _axes_ov[1, 0].imshow(_mips["nuclei"], cmap="gray")
                 _axes_ov[1, 0].set_title("Nuclei MIP")
+                _axes_ov[1, 1].imshow(_mips["cilia"], cmap="gray")
+                _axes_ov[1, 1].set_title("Cilia MIP")
 
                 # Colour scale from kept-cilia log_ratio (5th–95th percentile of finite values)
                 _scores_ov = (
@@ -1632,25 +1629,19 @@ with tab_overlays:
                     (float(np.percentile(_valid_ov, 5)), float(np.percentile(_valid_ov, 95)))
                     if len(_valid_ov) > 0 else (0.0, 1.0)
                 )
-                # Clamp ±inf so every cilium gets a visible colour:
-                # -inf (ratio=0, nucleus-adjacent) → vmin (blue); +inf → vmax (red)
-                _scores_plot = np.nan_to_num(
-                    _scores_ov, nan=(_vmin_ov + _vmax_ov) / 2,
-                    posinf=_vmax_ov, neginf=_vmin_ov,
-                )
 
-                # Kept cilia — circles coloured by log_ratio
-                if not _fk.empty and "coords" in _fk.columns and len(_scores_plot) > 0:
+                # Kept cilia — dots on all four panels, no score clamping
+                if not _fk.empty and "coords" in _fk.columns and len(_scores_ov) > 0:
                     try:
                         _coords_k = np.array([_parse_coords(c) for c in _fk["coords"]])
                         _ys_k, _xs_k = _coords_k[:, 1], _coords_k[:, 2]
                         for _ax_ov in _axes_ov.flat:
                             _ax_ov.scatter(
                                 _xs_k, _ys_k,
-                                c=_scores_plot, cmap="coolwarm",
+                                c=_scores_ov, cmap="coolwarm",
                                 vmin=_vmin_ov, vmax=_vmax_ov,
                                 s=_dot_size, edgecolor="black", linewidth=0.3,
-                                zorder=3, label="cilia",
+                                zorder=3,
                             )
                     except Exception as _esc:
                         st.warning(f"Could not plot kept cilia: {_esc}")

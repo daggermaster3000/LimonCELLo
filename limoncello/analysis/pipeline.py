@@ -287,38 +287,39 @@ def run_pipeline3(
 
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-        # Mask grayscale panels to neurite footprint; ratio panel uses NaN=black
-        _mask2d = _neurite_mask_mip.astype(bool)
+        # Ratio panel: NaN outside neurites → black background
         _cmap_ratio = plt.cm.coolwarm.copy()
         _cmap_ratio.set_bad("black")
 
         with np.errstate(divide="ignore", invalid="ignore"):
             _ratio_log_mid = np.log(map_ratio[map_ratio.shape[0] // 2])
 
-        axes[0, 0].imshow(np.where(_mask2d, neurite_mip, 0.0), cmap="gray")
-        axes[0, 0].set_title("Neurites MIP")
-        axes[1, 1].imshow(np.where(_mask2d, cilia_mip, 0.0), cmap="gray")
-        axes[1, 1].set_title("Cilia MIP")
+        # [0,0] Cilia MIP  [0,1] log(ratio) masked
+        # [1,0] Nuclei MIP [1,1] Cilia MIP
+        axes[0, 0].imshow(cilia_mip, cmap="gray")
+        axes[0, 0].set_title("Cilia MIP")
         axes[0, 1].imshow(_ratio_log_mid, cmap=_cmap_ratio)
-        axes[0, 1].set_title("log(ratio) — background masked")
-        axes[1, 0].imshow(np.where(_mask2d, nuclei_mip, 0.0), cmap="gray")
+        axes[0, 1].set_title("log(ratio) — neurite masked")
+        axes[1, 0].imshow(nuclei_mip, cmap="gray")
         axes[1, 0].set_title("Nuclei MIP")
+        axes[1, 1].imshow(cilia_mip, cmap="gray")
+        axes[1, 1].set_title("Cilia MIP")
 
         scores = df_cilia["log_ratio"].values
         valid_scores = scores[np.isfinite(scores)]
         vmin, vmax = (np.percentile(valid_scores, [5, 95]) if len(valid_scores) > 0 else (0, 1))
 
         norm = plt.Normalize(vmin=vmin, vmax=vmax)
-        cmap = plt.cm.coolwarm
+        cmap_dots = plt.cm.coolwarm
         coords = np.vstack(df_cilia["coords"].values)
         ys = coords[:, 1]
         xs = coords[:, 2]
-        colors = cmap(norm(np.clip(scores, vmin, vmax)))
+        colors = cmap_dots(norm(scores))  # no clipping
 
         for ax in axes.flat:
             ax.scatter(xs, ys, c=colors, s=10, edgecolor="black", linewidth=0.3)
 
-        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm = plt.cm.ScalarMappable(cmap=cmap_dots, norm=norm)
         sm.set_array([])
         for ax in axes.flat:
             plt.colorbar(sm, ax=ax, label="log_ratio")
