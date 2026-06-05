@@ -267,10 +267,16 @@ def run_pipeline3(
         overlay_dir = os.path.join(output_path, "figures", "overlays")
         os.makedirs(overlay_dir, exist_ok=True)
 
-        # MIP of visualisation channels (max along Z; already 2-D in MIP mode)
-        neurite_mip = np.max(a_norm[0, neurites_channel], axis=0)   # (Y, X)
-        cilia_mip   = np.max(a_norm[0, cilia_channel],   axis=0)    # (Y, X)
-        nuclei_mip  = np.max(a_norm[0, nuclei_channel],  axis=0)    # (Y, X)
+        # Display MIPs: computed from raw data with gentle per-MIP normalisation
+        # (avoids double-clipping caused by using the already-normalised a_norm)
+        def _disp_mip(vol):
+            mip = np.max(np.asarray(vol).astype(np.float32), axis=0)
+            lo, hi = np.percentile(mip, 0), np.percentile(mip, 99.9)
+            return (mip - lo) / (hi - lo + 1e-8)  # no hard clip
+
+        neurite_mip = _disp_mip(a[0, neurites_channel])
+        cilia_mip   = _disp_mip(a[0, cilia_channel])
+        nuclei_mip  = _disp_mip(a[0, nuclei_channel])
 
         # Persist MIPs so the app overlay tab can regenerate figures without
         # reloading raw .ims data.

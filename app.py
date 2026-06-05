@@ -150,8 +150,9 @@ def _load_channel_preview(input_path: str, filename: str) -> np.ndarray | None:
         slices = []
         for ch in range(c):
             sl = np.array(img[0, ch, mid_z]).astype(np.float32)
-            p1, p99 = np.percentile(sl, [1, 99])
-            sl = np.clip((sl - p1) / (p99 - p1 + 1e-8), 0.0, 1.0)
+            p_lo = np.percentile(sl, 0)
+            p_hi = np.percentile(sl, 99.9)
+            sl = (sl - p_lo) / (p_hi - p_lo + 1e-8)  # no hard clip; imshow clamps
             slices.append(sl)
         return np.stack(slices)
     except Exception:
