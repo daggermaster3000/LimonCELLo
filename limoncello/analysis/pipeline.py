@@ -2,7 +2,6 @@
 import json
 import os
 from datetime import datetime
-from tqdm import tqdm
 from scipy.ndimage import distance_transform_edt, center_of_mass
 import numpy as np
 import matplotlib.pyplot as plt
@@ -43,6 +42,7 @@ def run_pipeline3(
     bb_spot_sigma: float = 2.0,
     bb_outline_sigma: float = 2.0,
     bb_gaussian_sigma: tuple = (1.0, 1.0, 0.0),
+    progress_callback=None,
 ):
     print(cle.available_device_names(dev_type="gpu"))
     if gpu_device:
@@ -98,11 +98,14 @@ def run_pipeline3(
 
     all_dfs = []
 
-    for file in tqdm(os.listdir(input_path)):
-        if not file.endswith(".ims"):
-            continue
+    all_files = sorted(f for f in os.listdir(input_path) if f.endswith(".ims"))
+    n_files = len(all_files)
+    print(f"Found {n_files} .ims file(s) to process.")
 
-        print(f"Processing {file}...")
+    for file_idx, file in enumerate(all_files):
+        if progress_callback is not None:
+            progress_callback(file_idx, n_files, file)
+        print(f"[{file_idx + 1}/{n_files}] Processing {file}...")
 
         # Load data
         try:

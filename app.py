@@ -88,10 +88,17 @@ class _LogCapture:
 def _run_pipeline_thread(params: dict, log_list: list, result: dict):
     """Runs in a background thread — must NOT access st.session_state."""
     _orig_out, _orig_err = sys.stdout, sys.stderr
+
+    def _progress_cb(file_idx: int, n_files: int, filename: str):
+        result["n_files"] = n_files
+        result["file_idx"] = file_idx
+        result["current_file"] = filename
+        result["progress"] = file_idx / n_files if n_files > 0 else 0.0
+
     try:
         sys.stdout = _LogCapture(log_list, _orig_out)
         sys.stderr = _LogCapture(log_list, _orig_err)
-        run_pipeline3(**params)
+        run_pipeline3(**params, progress_callback=_progress_cb)
         result["status"] = "completed"
     except Exception as exc:
         import traceback
@@ -832,8 +839,18 @@ tab_run, tab_tables, tab_graphs, tab_overlays, tab_logs = st.tabs(
 # ═════════════════════════════════════════════════════════════════════════════
 with tab_run:
     if st.session_state.pipeline_running:
-        with st.spinner("Pipeline running — check **Live Logs** for real-time output…"):
-            st.empty()
+        _tr = st.session_state.thread_result
+        _n = _tr.get("n_files", 0)
+        _idx = _tr.get("file_idx", 0)
+        _curr = _tr.get("current_file", "")
+        _prog = _tr.get("progress", 0.0)
+        if _n > 0:
+            st.progress(
+                _prog,
+                text=f"Processing file **{_idx + 1} / {_n}** — `{_curr}`",
+            )
+        else:
+            st.progress(0.0, text="Initializing…")
 
     st.subheader("Output Summary")
     if _run_dir != output_path:
