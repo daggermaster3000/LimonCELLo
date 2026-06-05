@@ -1192,7 +1192,6 @@ with tab_overlays:
 
             _fk = _sub(_df_kept, _sel_file)
             _fr = _sub(_df_removed, _sel_file)
-            _fb = _sub(_df_bb, _sel_file)
 
             # Optional Z-slice filter
             if "coords" in _fk.columns and len(_fk) > 0:
@@ -1278,31 +1277,6 @@ with tab_overlays:
                     except Exception as _esc:
                         st.warning(f"Could not plot kept cilia: {_esc}")
 
-                # Basal bodies — diamonds coloured by log_ratio
-                if not _fb.empty and "coords" in _fb.columns:
-                    try:
-                        _scores_bb = (
-                            _fb["log_ratio"].values.astype(float)
-                            if "log_ratio" in _fb.columns else np.zeros(len(_fb))
-                        )
-                        _scores_bb = np.nan_to_num(
-                            _scores_bb, nan=(_vmin_ov + _vmax_ov) / 2,
-                            posinf=_vmax_ov, neginf=_vmin_ov,
-                        )
-                        _coords_b = np.array([_parse_coords(c) for c in _fb["coords"]])
-                        _ys_b, _xs_b = _coords_b[:, 1], _coords_b[:, 2]
-                        for _ax_ov in _axes_ov.flat:
-                            _ax_ov.scatter(
-                                _xs_b, _ys_b,
-                                c=_scores_bb, cmap="coolwarm",
-                                vmin=_vmin_ov, vmax=_vmax_ov,
-                                s=_dot_size * 1.4, marker="D",
-                                edgecolor="white", linewidth=0.4,
-                                zorder=4, label="basal body",
-                            )
-                    except Exception as _esb:
-                        st.warning(f"Could not plot basal bodies: {_esb}")
-
                 # NN-removed cilia — red × on all 4 panels
                 if _show_removed and not _fr.empty and "coords" in _fr.columns:
                     try:
@@ -1344,11 +1318,7 @@ with tab_overlays:
                         _ov_png, _ov_fname, "image/png", key="dl_overlay",
                     )
                 with _cov2:
-                    st.caption(
-                        f"● {len(_fk)} cilia  ·  "
-                        f"◆ {len(_fb)} basal bodies  ·  "
-                        f"✕ {len(_fr)} NN-removed"
-                    )
+                    st.caption(f"{len(_fk)} kept  ·  {len(_fr)} NN-removed")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
