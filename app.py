@@ -334,6 +334,42 @@ def _save_to_path_history(key: str, value: str) -> None:
         pass
 
 
+def _apply_json_params(data: dict) -> None:
+    """Load run_parameters.json content into session state so sliders update."""
+    _flat_map = [
+        # (json_path_tuple,                                    ss_key,              cast)
+        (("use_mip",),                                         "use_mip",           bool),
+        (("channels", "cilia"),                                "ch_cilia",          int),
+        (("channels", "neurites"),                             "ch_neurites",       int),
+        (("channels", "basal_bodies"),                         "ch_bb",             int),
+        (("channels", "nuclei"),                               "ch_nuclei",         int),
+        (("intensity_normalization", "p_low"),                 "p_low",             int),
+        (("intensity_normalization", "p_high"),                "p_high",            int),
+        (("nuclei", "spot_sigma"),                             "nuclei_sigma",      int),
+        (("nuclei", "tophat_radius"),                          "tophat_radius",     int),
+        (("nuclei", "outline_sigma"),                          "nuclei_outline_sigma", int),
+        (("neurites", "spot_sigma"),                           "neurite_sigma",     int),
+        (("basal_bodies", "spot_sigma"),                       "bb_spot_sigma",     float),
+        (("basal_bodies", "outline_sigma"),                    "bb_outline_sigma",  float),
+        (("distance_thresholds", "max_cilia_um"),              "max_cilia",         float),
+        (("distance_thresholds", "max_basal_body_um"),         "max_basal",         float),
+        (("classification", "axon_threshold"),                 "pf_axon_thr",       float),
+        (("classification", "soma_threshold"),                 "pf_soma_thr",       float),
+    ]
+    for path, ss_key, cast in _flat_map:
+        node = data
+        for k in path:
+            node = node.get(k) if isinstance(node, dict) else None
+        if node is not None:
+            st.session_state[ss_key] = cast(node)
+    # Gaussian sigma stored as list [z, y, x]
+    gs = data.get("basal_bodies", {}).get("gaussian_sigma")
+    if gs and len(gs) >= 3:
+        st.session_state["bb_gauss_z"] = float(gs[0])
+        st.session_state["bb_gauss_y"] = float(gs[1])
+        st.session_state["bb_gauss_x"] = float(gs[2])
+
+
 def _path_input(label: str, history_key: str, help_text: str = "",
                 default: str = "") -> str:
     """Selectbox of recent paths; falls back to a text input when empty."""
@@ -364,6 +400,21 @@ _SS_DEFAULTS: dict = {
     "logs_paused":         False,
     "custom_plot_png":     None,
     "thread_result":       {},
+    # Segmentation parameters (keyed so JSON reload works)
+    "p_low":               2,
+    "p_high":              98,
+    "nuclei_sigma":        15,
+    "tophat_radius":       12,
+    "nuclei_outline_sigma": 3,
+    "neurite_sigma":       5,
+    "bb_spot_sigma":       2.0,
+    "bb_outline_sigma":    2.0,
+    "bb_gauss_z":          1.0,
+    "bb_gauss_y":          1.0,
+    "bb_gauss_x":          0.0,
+    "max_cilia":           2.0,
+    "max_basal":           2.0,
+    "use_mip":             False,
     **_PF_DEFAULTS,
 }
 for _k, _v in _SS_DEFAULTS.items():
@@ -509,34 +560,64 @@ with st.sidebar:
         help="Changing any parameter in this section requires re-running the full pipeline."
     )
 
+    use_mip = st.checkbox(
+        "MIP mode (project Z → 2-D before segmentation)",
+        key="use_mip",
+        help="🔄 Use pyclesperanto maximum_z_projection on each channel before segmentation. "
+             "Useful for thin samples or when Z resolution is poor.",
+    )
+
     with st.expander("🔆 Intensity Normalization", expanded=False):
         p_low = st.slider(
-            "Percentile low", 0, 10, 2, 1,
+            "Percentile low", 0, 10, step=1, key="p_low",
             help="🔄 Lower percentile for min-max intensity clipping"
         )
         p_high = st.slider(
-            "Percentile high", 90, 100, 98, 1,
+            "Percentile high", 90, 100, step=1, key="p_high",
             help="🔄 Upper percentile for min-max intensity clipping"
         )
 
     with st.expander("🟡 Nuclei", expanded=True):
         nuclei_sigma = st.slider(
-            "Spot sigma", 1, 50, 15, 1,
+            "Spot sigma", 1, 50, step=1, key="nuclei_sigma",
             help="🔄 Voronoi-Otsu object-separation scale for nuclei"
         )
         tophat_radius = st.slider(
-            "Tophat radius", 1, 50, 12, 1,
+            "Tophat radius", 1, 50, step=1, key="tophat_radius",
             help="🔄 Morphological top-hat background subtraction radius (voxels)"
         )
         outline_sigma = st.slider(
-            "Outline sigma", 0, 10, 3, 1,
+            "Outline sigma", 0, 10, step=1, key="nuclei_outline_sigma",
             help="🔄 Boundary-precision smoothing for nuclei labeling"
         )
 
     with st.expander("🧵 Neurites", expanded=True):
         neurite_sigma = st.slider(
-            "Spot sigma", 1, 20, 5, 1,
+            "Spot sigma", 1, 20, step=1, key="neurite_sigma",
             help="🔄 Voronoi-Otsu object-separation scale for neurite detection"
+        )
+
+    with st.expander("🔵 Basal Bodies", expanded=True):
+        bb_spot_sigma = st.slider(
+            "Spot sigma", 0.5, 10.0, step=0.5, key="bb_spot_sigma",
+            help="🔄 Voronoi-Otsu object-separation scale for basal body detection"
+        )
+        bb_outline_sigma = st.slider(
+            "Outline sigma", 0.5, 10.0, step=0.5, key="bb_outline_sigma",
+            help="🔄 Boundary-precision smoothing for basal body labeling"
+        )
+        st.caption("Gaussian pre-blur (applied before Voronoi-Otsu)")
+        bb_gauss_z = st.slider(
+            "Gaussian σ_z", 0.0, 5.0, step=0.5, key="bb_gauss_z",
+            help="🔄 Gaussian blur sigma along Z before basal body segmentation"
+        )
+        bb_gauss_y = st.slider(
+            "Gaussian σ_y", 0.0, 5.0, step=0.5, key="bb_gauss_y",
+            help="🔄 Gaussian blur sigma along Y before basal body segmentation"
+        )
+        bb_gauss_x = st.slider(
+            "Gaussian σ_x", 0.0, 5.0, step=0.5, key="bb_gauss_x",
+            help="🔄 Gaussian blur sigma along X before basal body segmentation"
         )
 
     st.markdown("---")
@@ -546,11 +627,11 @@ with st.sidebar:
         help="🔄 Require re-running the pipeline."
     )
     max_cilia = st.slider(
-        "Max cilia distance (µm)", 0.5, 10.0, 2.0, 0.1,
+        "Max cilia distance (µm)", 0.5, 10.0, step=0.1, key="max_cilia",
         help="🔄 Max centroid→neurite distance to include a cilium"
     )
     max_basal = st.slider(
-        "Max basal body distance (µm)", 0.5, 10.0, 2.0, 0.1,
+        "Max basal body distance (µm)", 0.5, 10.0, step=0.1, key="max_basal",
         help="🔄 Max centroid→neurite distance to include a basal body"
     )
 
@@ -655,6 +736,10 @@ if run_clicked:
             neurites_channel=int(neurites_channel),
             basal_bodies_channel=int(basal_bodies_channel),
             nuclei_channel=int(nuclei_channel),
+            use_mip=bool(use_mip),
+            bb_spot_sigma=float(bb_spot_sigma),
+            bb_outline_sigma=float(bb_outline_sigma),
+            bb_gaussian_sigma=(float(bb_gauss_z), float(bb_gauss_y), float(bb_gauss_x)),
         )
 
         _save_to_path_history("input", input_path)
@@ -676,6 +761,7 @@ _fig_dir = os.path.join(output_path, "figures")
 _overlay_dir = os.path.join(_fig_dir, "overlays")
 _mip_dir = os.path.join(_fig_dir, "mips")
 _excel_path = os.path.join(_csv_dir, "all_cilia_features.xlsx")
+_params_json_path = os.path.join(_csv_dir, "run_parameters.json")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOAD DATA + APPLY POST-FILTERS (central — used by every result tab)
@@ -763,6 +849,56 @@ with tab_run:
             "No data yet — configure parameters in the sidebar and click **Run Pipeline**. "
             "Results will appear in the **Data Tables**, **Graphs**, and **Overlays** tabs."
         )
+
+    st.markdown("---")
+
+    # ── Run Parameters JSON ───────────────────────────────────────────────────
+    st.subheader("📄 Run Parameters")
+
+    _json_exists = os.path.exists(_params_json_path)
+    if _json_exists:
+        with open(_params_json_path) as _jf:
+            _json_data = json.load(_jf)
+        _json_ts = _json_data.get("timestamp", "unknown")
+        st.caption(f"Last run: **{_json_ts}**  ·  `{_params_json_path}`")
+
+        with st.expander("View parameters", expanded=False):
+            st.json(_json_data)
+
+        _jr1, _jr2 = st.columns(2)
+        with _jr1:
+            st.download_button(
+                "⬇️ Download parameters (JSON)",
+                json.dumps(_json_data, indent=2).encode(),
+                "run_parameters.json", "application/json",
+                key="dl_params_json",
+            )
+        with _jr2:
+            if st.button("↩️ Reload these parameters into sidebar", key="reload_params"):
+                _apply_json_params(_json_data)
+                st.success("Parameters loaded — sidebar controls updated.")
+                st.rerun()
+    else:
+        st.info("No parameter file found yet. Run the pipeline to generate one.")
+
+    st.markdown("---")
+    st.subheader("📂 Load Parameters from File")
+    st.caption("Load a previously saved `run_parameters.json` to restore any run's settings.")
+    _load_json_path = st.text_input(
+        "Path to run_parameters.json", placeholder="Paste path here…", key="_load_json_path"
+    )
+    if _load_json_path and os.path.exists(_load_json_path):
+        if st.button("↩️ Load parameters", key="load_params_btn"):
+            try:
+                with open(_load_json_path) as _lf:
+                    _load_data = json.load(_lf)
+                _apply_json_params(_load_data)
+                st.success(f"Loaded parameters from `{_load_json_path}`.")
+                st.rerun()
+            except Exception as _le:
+                st.error(f"Could not load file: {_le}")
+    elif _load_json_path:
+        st.warning("File not found.")
 
 
 # ═════════════════════════════════════════════════════════════════════════════

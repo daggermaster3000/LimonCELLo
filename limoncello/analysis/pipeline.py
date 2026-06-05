@@ -1,4 +1,7 @@
 # pipeline.py
+import json
+import os
+from datetime import datetime
 from tqdm import tqdm
 from scipy.ndimage import distance_transform_edt, center_of_mass
 import numpy as np
@@ -6,17 +9,16 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 from ..utils.reader import load_image, load_ims_metadata
-from ..preprocessing.preprocessing import normalize_intensity,percentile_minmax_normalize
+from ..preprocessing.preprocessing import normalize_intensity, percentile_minmax_normalize
 from ..segmentation.nuclei import segment_nuclei
 from ..segmentation.neurites import segment_neurites
 from ..segmentation.cilia import segment_cilia_ml
 from ..segmentation.basal_bodies import segment_basal_bodies
-from ..utils.reader import load_image,load_ims_metadata
-from ..qc.qc import run_qc,save_qc_excel,scatter_plot
+from ..qc.qc import run_qc, save_qc_excel, scatter_plot
 from ..analysis.pair_cilia_to_bb import pair_from_mixed_df
 from ..utils.assign_label_features import assign_label_features
 import pyclesperanto_prototype as cle
-import os
+
 
 def run_pipeline3(
     input_path,
@@ -37,6 +39,10 @@ def run_pipeline3(
     neurites_channel: int = 1,
     basal_bodies_channel: int = 2,
     nuclei_channel: int = 3,
+    use_mip: bool = False,
+    bb_spot_sigma: float = 2.0,
+    bb_outline_sigma: float = 2.0,
+    bb_gaussian_sigma: tuple = (1.0, 1.0, 0.0),
 ):
     print(cle.available_device_names(dev_type="gpu"))
     if gpu_device:
@@ -45,6 +51,44 @@ def run_pipeline3(
     os.makedirs(output_path, exist_ok=True)
     csv_dir = os.path.join(output_path, "csv")
     os.makedirs(csv_dir, exist_ok=True)
+
+    # ── Save run parameters for reproducibility / GUI reload ──────────────────
+    params_log = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "input_path": str(input_path),
+        "output_path": str(output_path),
+        "use_mip": use_mip,
+        "channels": {
+            "cilia": cilia_channel,
+            "neurites": neurites_channel,
+            "basal_bodies": basal_bodies_channel,
+            "nuclei": nuclei_channel,
+        },
+        "intensity_normalization": {"p_low": p_low, "p_high": p_high},
+        "nuclei": {
+            "spot_sigma": nuclei_spot_sigma,
+            "tophat_radius": tophat_radius,
+            "outline_sigma": outline_sigma,
+        },
+        "neurites": {"spot_sigma": neurite_spot_sigma},
+        "basal_bodies": {
+            "spot_sigma": bb_spot_sigma,
+            "outline_sigma": bb_outline_sigma,
+            "gaussian_sigma": list(bb_gaussian_sigma),
+        },
+        "distance_thresholds": {
+            "max_cilia_um": max_cilia_dist_cutoff_um,
+            "max_basal_body_um": max_basal_body_cutoff_um,
+        },
+        "classification": {
+            "axon_threshold": axon_threshold,
+            "soma_threshold": soma_threshold,
+        },
+    }
+    _json_path = os.path.join(csv_dir, "run_parameters.json")
+    with open(_json_path, "w") as _f:
+        json.dump(params_log, _f, indent=2)
+    print(f"Saved parameters: {_json_path}")
 
     all_dfs = []
 
@@ -61,10 +105,27 @@ def run_pipeline3(
             print(f"  ✗ Could not open {file}: {exc} — skipping.")
             continue
         voxel_size = meta["voxel_size"]
-        
+
         a_norm = normalize_intensity(a, p_low=p_low, p_high=p_high)
-        
-        # Segmentation
+
+        # ── MIP mode: project each channel to 2-D then treat as single-Z 3-D ─
+        if use_mip:
+            print("  [MIP mode] projecting channels along Z…")
+            n_ch = a.shape[1]
+
+            def _z_project(vol3d):
+                """(Z,Y,X) → GPU MIP → (1,Y,X) numpy."""
+                proj = np.asarray(cle.maximum_z_projection(cle.push(vol3d)))
+                return proj[np.newaxis] if proj.ndim == 2 else proj  # (1,Y,X)
+
+            a = np.stack(
+                [_z_project(a[0, ch]) for ch in range(n_ch)], axis=0
+            )[np.newaxis]                     # (1, C, 1, Y, X)
+            a_norm = np.stack(
+                [_z_project(a_norm[0, ch]) for ch in range(n_ch)], axis=0
+            )[np.newaxis]
+
+        # ── Segmentation ──────────────────────────────────────────────────────
         cilia_labels = segment_cilia_ml(
             a[0, cilia_channel],
             classifier_path=cilia_classifier_path,
@@ -83,7 +144,10 @@ def run_pipeline3(
         )
 
         basal_bodies_labels = segment_basal_bodies(
-            a[0, basal_bodies_channel]
+            a[0, basal_bodies_channel],
+            spot_sigma=bb_spot_sigma,
+            outline_sigma=bb_outline_sigma,
+            gaussian_sigma=bb_gaussian_sigma,
         )
 
         # get neurites masks
@@ -103,16 +167,16 @@ def run_pipeline3(
         # Ratio
         map_ratio = np.where(distance_map_neurites > 0,
                      distance_map_nuclei / distance_map_neurites,
-                     0)  # or np.nan
+                     0)
         map_ratio[~np.isfinite(map_ratio)] = np.nan
 
-        # Distance to neurites 
+        # Distance to neurites
         dist_to_neurite = distance_transform_edt(
             ~neurite_mask,
             sampling=voxel_size
         )
 
-        # Nearest SKELETON mapping 
+        # Nearest SKELETON mapping
         _, nearest_skel_idx = distance_transform_edt(
             ~skeleton_mask,
             return_indices=True,
@@ -129,11 +193,10 @@ def run_pipeline3(
 
         # Basal bodies centroids
         basal_bodies_ids = np.unique(basal_bodies_labels)
-        basal_bodies_ids = basal_bodies_ids[basal_bodies_ids != 0] # remove background
+        basal_bodies_ids = basal_bodies_ids[basal_bodies_ids != 0]
         basal_bodies_centroids = center_of_mass(
-            basal_bodies_labels > 0, labels = basal_bodies_labels, index=basal_bodies_ids
+            basal_bodies_labels > 0, labels=basal_bodies_labels, index=basal_bodies_ids
         )
-
 
         df_cilia = assign_label_features(
             cilia_labels,
@@ -146,13 +209,11 @@ def run_pipeline3(
             map_ratio,
             max_cilia_dist_cutoff_um,
             file,
-            )
-        
+        )
+
         if df_cilia.empty:
             print(f"No valid cilia found in {file}")
             continue
-
-        
 
         df_basal_bodies = assign_label_features(
             basal_bodies_labels,
@@ -165,18 +226,17 @@ def run_pipeline3(
             map_ratio,
             max_basal_body_cutoff_um,
             file,
-            "basal_body"
+            "basal_body",
         )
 
-        #paired_df = pair_cilia_basal_bidirectional(df_cilia,df_basal_bodies)
         all_dfs.append(df_basal_bodies)
         all_dfs.append(df_cilia)
 
-        # Overlay visualization (MIP)
+        # ── Overlay visualization (MIP) ───────────────────────────────────────
         overlay_dir = os.path.join(output_path, "figures", "overlays")
         os.makedirs(overlay_dir, exist_ok=True)
 
-        # MIP of neurite + cilia channels
+        # MIP of visualisation channels (max along Z; already 2-D in MIP mode)
         neurite_mip = np.max(a_norm[0, neurites_channel], axis=0)   # (Y, X)
         cilia_mip   = np.max(a_norm[0, cilia_channel],   axis=0)    # (Y, X)
         nuclei_mip  = np.max(a_norm[0, nuclei_channel],  axis=0)    # (Y, X)
@@ -192,93 +252,43 @@ def run_pipeline3(
         np.save(os.path.join(_mip_out, f"{_fstem}_ratio_mid.npy"),
                 map_ratio[map_ratio.shape[0] // 2])
 
-        fig, axes = plt.subplots(2,2, figsize=(14,10))
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-        # Base layer: neurites
-        axes[0,0].imshow(neurite_mip, cmap="gray")
-        axes[0,0].set_title('Neurites MIP')
-        axes[1,1].imshow(cilia_mip,cmap='gray')
-        axes[1,1].set_title('Cilia MIP')
+        axes[0, 0].imshow(neurite_mip, cmap="gray")
+        axes[0, 0].set_title("Neurites MIP")
+        axes[1, 1].imshow(cilia_mip, cmap="gray")
+        axes[1, 1].set_title("Cilia MIP")
         with np.errstate(divide="ignore", invalid="ignore"):
             _ratio_log_mid = np.log(map_ratio[map_ratio.shape[0] // 2])
-        axes[0,1].imshow(_ratio_log_mid, cmap='coolwarm')
-        axes[0,1].set_title('log(ratio) overlay')
-        axes[1,0].imshow(nuclei_mip,cmap='gray')
-        axes[1,0].set_title('Nuclei MIP')
+        axes[0, 1].imshow(_ratio_log_mid, cmap="coolwarm")
+        axes[0, 1].set_title("log(ratio) overlay")
+        axes[1, 0].imshow(nuclei_mip, cmap="gray")
+        axes[1, 0].set_title("Nuclei MIP")
 
-        # Normalize scores for coloring (robust)
         scores = df_cilia["log_ratio"].values
         valid_scores = scores[np.isfinite(scores)]
-
-        if len(valid_scores) > 0:
-            vmin, vmax = np.percentile(valid_scores, [5, 95])
-        else:
-            vmin, vmax = 0, 1
+        vmin, vmax = (np.percentile(valid_scores, [5, 95]) if len(valid_scores) > 0 else (0, 1))
 
         norm = plt.Normalize(vmin=vmin, vmax=vmax)
         cmap = plt.cm.coolwarm
-
-        # Overlay cilia centroids
-        coords = np.vstack(df_cilia["coords"].values)  # shape (n, 3)
-
-        
+        coords = np.vstack(df_cilia["coords"].values)
         ys = coords[:, 1]
         xs = coords[:, 2]
-        colors = cmap(norm(scores))
+        colors = cmap(norm(np.clip(scores, vmin, vmax)))
 
-        axes[0,0].scatter(
-            xs,
-            ys,
-            c=colors,
-            s=10,
-            edgecolor="black",
-            linewidth=0.3,
-            
-        )
-        axes[1,1].scatter(
-            xs,
-            ys,
-            c=colors,
-            s=10,
-            edgecolor="black",
-            linewidth=0.3,
-            
-        )
-        axes[0,1].scatter(
-            xs,
-            ys,
-            c=colors,
-            s=10,
-            edgecolor="black",
-            linewidth=0.3,
-            
-        )
-        axes[1,0].scatter(
-            xs,
-            ys,
-            c=colors,
-            s=10,
-            edgecolor="black",
-            linewidth=0.3,
-            
-        )
+        for ax in axes.flat:
+            ax.scatter(xs, ys, c=colors, s=10, edgecolor="black", linewidth=0.3)
 
-        # Colorbar
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])
-        plt.colorbar(sm, ax=axes[1,0], label="log_ratio")
-        plt.colorbar(sm, ax=axes[1,1], label="log_ratio")
-        plt.colorbar(sm, ax=axes[0,0], label="log_ratio")
-        plt.colorbar(sm, ax=axes[0,1], label="log_ratio")
+        for ax in axes.flat:
+            plt.colorbar(sm, ax=ax, label="log_ratio")
 
-        plt.axis("off")
-
-        save_path = os.path.join(
-            overlay_dir,
-            f"{os.path.splitext(file)[0]}_overlay.png"
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(overlay_dir, f"{_fstem}_overlay.png"),
+            dpi=300, bbox_inches="tight",
         )
-
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close()
 
     if len(all_dfs) == 0:
@@ -292,7 +302,6 @@ def run_pipeline3(
     file_map = {f: f"S{i+1}" for i, f in enumerate(unique_files)}
     final_df["file_short"] = final_df["filename"].map(file_map)
 
-    
     # Classification
     def classify(score):
         if score > axon_threshold:
@@ -304,59 +313,39 @@ def run_pipeline3(
 
     final_df["class"] = final_df["log_ratio"].apply(classify)
 
-    # Figures 
+    # ── Summary figures ───────────────────────────────────────────────────────
     fig_dir = os.path.join(output_path, "figures")
     os.makedirs(fig_dir, exist_ok=True)
 
-    
-    # 1. Multi-panel (ratio + log-ratio)
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
-    # Ratio
     final_cilia_df = final_df[final_df["object_type"] == "cilia"]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     sns.histplot(final_cilia_df["ratio"], kde=True, ax=axes[0, 0])
     axes[0, 0].set_title("Raw Ratio Distribution")
-
-    # Log ratio
     sns.histplot(final_cilia_df["log_ratio"], kde=True, ax=axes[0, 1])
     axes[0, 1].set_title("Log Ratio Distribution")
-
-    # Log ratio per sample (boxplot)
     sns.boxplot(data=final_cilia_df, x="file_short", y="log_ratio", ax=axes[1, 0])
     axes[1, 0].set_title("Log Ratio per Sample")
-    axes[1, 0].tick_params(axis='x', rotation=45)
-
-    # Class distribution per sample
+    axes[1, 0].tick_params(axis="x", rotation=45)
     sns.countplot(data=final_cilia_df, x="file_short", hue="class", ax=axes[1, 1])
     axes[1, 1].set_title("Class Distribution per Sample")
-    axes[1, 1].tick_params(axis='x', rotation=45)
-
+    axes[1, 1].tick_params(axis="x", rotation=45)
     plt.tight_layout()
     plt.savefig(os.path.join(fig_dir, "overview_panels.png"), dpi=300)
     plt.close()
 
-    # 2. KDE per sample
     plt.figure(figsize=(10, 6))
-
-    sns.kdeplot(
-        data=final_cilia_df,
-        x="log_ratio",
-        hue="file_short",
-        common_norm=False,
-    )
-
+    sns.kdeplot(data=final_cilia_df, x="log_ratio", hue="file_short", common_norm=False)
     plt.title("Log Ratio Distribution per Sample")
     plt.xlabel("Log Ratio")
-
     plt.savefig(os.path.join(fig_dir, "logratio_kde_per_sample.png"), dpi=300)
     plt.close()
 
-    # QC + Excel
+    # ── QC + Excel ────────────────────────────────────────────────────────────
     excel_path = os.path.join(csv_dir, "all_cilia_features.xlsx")
 
     qc_sample = final_cilia_df.groupby("file_short").agg(
         n_cilia=("cilia_id", "count"),
-        #n_basal_bodies=("basal_body_id", "count"),
         mean_ratio=("ratio", "mean"),
         std_ratio=("ratio", "std"),
         mean_log_ratio=("log_ratio", "mean"),
@@ -366,20 +355,14 @@ def run_pipeline3(
     ).reset_index()
 
     qc_global = pd.DataFrame({
-        "metric": [
-            "n_total_cilia",
-            "mean_ratio",
-            "std_ratio",
-            "mean_log_ratio",
-            "std_log_ratio"
-        ],
+        "metric": ["n_total_cilia", "mean_ratio", "std_ratio", "mean_log_ratio", "std_log_ratio"],
         "value": [
             len(final_cilia_df),
             final_cilia_df["ratio"].mean(),
             final_cilia_df["ratio"].std(),
             final_cilia_df["log_ratio"].mean(),
             final_cilia_df["log_ratio"].std(),
-        ]
+        ],
     })
 
     with pd.ExcelWriter(excel_path) as writer:
@@ -389,51 +372,25 @@ def run_pipeline3(
 
     print(f"Saved QC Excel: {excel_path}")
 
-
-    # Scatter plot (the moment of truth)
     plt.figure(figsize=(10, 6))
-
-    sns.scatterplot(
-        x='dt_neurite',
-        y='dt_nuclei',
-        hue='file_short',
-        data=final_cilia_df,
-        palette='tab10'
-    )
-
+    sns.scatterplot(x="dt_neurite", y="dt_nuclei", hue="file_short",
+                    data=final_cilia_df, palette="tab10")
     plt.xlabel("Assigned Neurite Voxel thickness (um)")
     plt.ylabel("Assigned Neurite Voxel Distance to nuclei (um)")
     plt.title("DT Comparison per Sample")
-    plt.legend(bbox_to_anchor=(0.5, 1), loc='upper left')
-
-    fig_dir = os.path.join(output_path, "figures")
-    os.makedirs(fig_dir, exist_ok=True)
-
+    plt.legend(bbox_to_anchor=(0.5, 1), loc="upper left")
     plt.savefig(os.path.join(fig_dir, "dt_scatterplot.png"), dpi=300)
     plt.close()
 
-    # Scatter plot (the moment of truth)
     plt.figure(figsize=(10, 6))
-
-    sns.scatterplot(
-        x='log_dt_neurite',
-        y='log_dt_nuclei',
-        hue='file_short',
-        data=final_cilia_df,
-        palette='tab10'
-    )
-
+    sns.scatterplot(x="log_dt_neurite", y="log_dt_nuclei", hue="file_short",
+                    data=final_cilia_df, palette="tab10")
     plt.xlabel("Log of Assigned Neurite Voxel thickness (um)")
     plt.ylabel("Log of Assigned Neurite Voxel Distance to nuclei (um)")
     plt.title("Log DT Comparison per Sample")
-    plt.legend(bbox_to_anchor=(0.5, 1), loc='upper left')
-
-    fig_dir = os.path.join(output_path, "figures")
-    os.makedirs(fig_dir, exist_ok=True)
-
+    plt.legend(bbox_to_anchor=(0.5, 1), loc="upper left")
     plt.savefig(os.path.join(fig_dir, "log_dt_scatterplot.png"), dpi=300)
     plt.close()
-
 
     print(f"Figures saved in: {fig_dir}")
     print("Pipeline complete.")
