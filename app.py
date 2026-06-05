@@ -484,6 +484,24 @@ with st.sidebar:
         help_text="Results (figures, CSVs, Excel) saved here",
         default="tutorial/output",
     )
+
+    # ── Run selector ──────────────────────────────────────────────────────────
+    _sidebar_runs = sorted(
+        (d for d in (os.listdir(output_path) if output_path and os.path.isdir(output_path) else [])
+         if d.startswith("lc-analysis-") and os.path.isdir(os.path.join(output_path, d))),
+        reverse=True,
+    )
+    if _sidebar_runs:
+        st.selectbox(
+            "Analysis run to explore",
+            options=_sidebar_runs,
+            key="_sel_run",
+            format_func=lambda d: d.replace("lc-analysis-", "").replace("_", "  "),
+            help="Which lc-analysis run to show in Data Tables, Graphs, and Overlays",
+        )
+    elif output_path:
+        st.caption("No runs found in output folder yet.")
+
     classifier_path = _path_input(
         "Cilia classifier", "classifier",
         help_text="Path to the trained .cl cilia segmentation model",
@@ -776,7 +794,12 @@ def _find_latest_run_dir(base: str) -> str | None:
     return os.path.join(base, runs[-1]) if runs else None
 
 
-_run_dir = _find_latest_run_dir(output_path) or output_path
+_sel_run_name = st.session_state.get("_sel_run")
+_run_dir = (
+    os.path.join(output_path, _sel_run_name)
+    if _sel_run_name and os.path.isdir(os.path.join(output_path, str(_sel_run_name)))
+    else _find_latest_run_dir(output_path) or output_path
+)
 _csv_dir = os.path.join(_run_dir, "csv")
 _fig_dir = os.path.join(_run_dir, "figures")
 _overlay_dir = os.path.join(_fig_dir, "overlays")
@@ -1400,9 +1423,9 @@ with tab_overlays:
                 # ── 2×2 MIP-backed figure (identical layout to pipeline.py) ──
                 _fig_ov, _axes_ov = plt.subplots(2, 2, figsize=(14, 10))
 
-                # np.where still evaluates log() for all elements before masking — suppress
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    _ratio_log = np.where(_mips["ratio"] > 0, np.log(_mips["ratio"]), np.nan)
+                _ratio_log = np.log1p(
+                    np.where(np.isfinite(_mips["ratio"]), _mips["ratio"], np.nan)
+                )
 
                 _axes_ov[0, 0].imshow(_mips["neurite"], cmap="gray")
                 _axes_ov[0, 0].set_title("Neurites MIP")

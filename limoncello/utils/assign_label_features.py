@@ -71,22 +71,21 @@ def assign_label_features(
         dt_nuclei = distance_map_nuclei[sz, sy, sx]
         ratio = map_ratio[sz, sy, sx]
 
-        with np.errstate(divide="ignore", invalid="ignore"):
-            rows.append(
-                {
-                    "filename": file,
-                    "cilia_id": cid,
-                    "coords": [float(centroid[0]), float(centroid[1]), float(centroid[2])],  # z,y,x pixels
-                    "distance_to_neurite_um": d,
-                    "ratio": ratio,
-                    "log_ratio": np.log(ratio),
-                    "dt_neurite": dt_neurite,
-                    "dt_nuclei": dt_nuclei,
-                    "log_dt_neurite": np.log(dt_neurite),
-                    "log_dt_nuclei": np.log(dt_nuclei),
-                    "object_type": object_type,
-                }
-            )
+        rows.append(
+            {
+                "filename": file,
+                "cilia_id": cid,
+                "coords": [float(centroid[0]), float(centroid[1]), float(centroid[2])],
+                "distance_to_neurite_um": d,
+                "ratio": ratio,
+                "log_ratio": np.log1p(ratio),
+                "dt_neurite": dt_neurite,
+                "dt_nuclei": dt_nuclei,
+                "log_dt_neurite": np.log1p(dt_neurite),
+                "log_dt_nuclei": np.log1p(dt_nuclei),
+                "object_type": object_type,
+            }
+        )
 
     df = pd.DataFrame(rows)
 
