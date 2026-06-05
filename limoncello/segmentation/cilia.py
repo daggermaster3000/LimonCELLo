@@ -6,10 +6,26 @@ from apoc import ObjectSegmenter
 from ..utils.gpu import to_gpu
 
 
+def _size_filter(labels_gpu, min_size: int, max_size: int):
+    """Remove labels smaller than min_size or larger than max_size (0 = disabled)."""
+    if min_size > 0:
+        labels_gpu = cle.exclude_small_labels(labels_gpu, maximum_size=min_size)
+    if max_size > 0:
+        arr = np.asarray(labels_gpu).astype(np.int32)
+        if arr.max() > 0:
+            counts = np.bincount(arr.ravel())
+            too_large = np.zeros(len(counts), dtype=bool)
+            too_large[1:] = counts[1:] > max_size
+            arr[too_large[arr]] = 0
+            labels_gpu = cle.push(arr)
+    return labels_gpu
+
+
 def segment_cilia_ml(
     volume,
     classifier_path: str,
     min_size: int = 20,
+    max_size: int = 0,
     **kwargs,
 ):
     """
@@ -19,12 +35,14 @@ def segment_cilia_ml(
     ----------
     volume : np.ndarray
         3D image (Z, Y, X) or 2D image (Y, X).
-        If Z == 1, the volume is squeezed to 2-D before prediction
+        If Z == 1, squeezed to 2-D before prediction
         (APOC requires at least 2 Z-slices for 3-D feature extraction).
     classifier_path : str
-        Path to APOC classifier
+        Path to APOC classifier.
     min_size : int
-        Minimum object size
+        Remove objects smaller than this (voxels). 0 = disabled.
+    max_size : int
+        Remove objects larger than this (voxels). 0 = disabled.
 
     Returns
     -------
@@ -40,11 +58,9 @@ def segment_cilia_ml(
 
     segmenter = ObjectSegmenter(opencl_filename=classifier_path)
     labels = segmenter.predict(image=vol)
-    labels_gpu = to_gpu(labels)
-    labels_gpu = cle.exclude_small_labels(labels_gpu, maximum_size=min_size)
+    labels_gpu = _size_filter(to_gpu(labels), min_size, max_size)
 
     if single_z:
-        # Restore Z dimension so downstream 3-D code works unchanged
         labels_gpu = cle.push(np.asarray(labels_gpu)[np.newaxis])  # (1, Y, X)
 
     return labels_gpu

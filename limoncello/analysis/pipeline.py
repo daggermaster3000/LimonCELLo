@@ -42,6 +42,10 @@ def run_pipeline3(
     bb_spot_sigma: float = 2.0,
     bb_outline_sigma: float = 2.0,
     bb_gaussian_sigma: tuple = (1.0, 1.0, 0.0),
+    cilia_min_size: int = 20,
+    cilia_max_size: int = 0,
+    bb_min_size: int = 5,
+    bb_max_size: int = 0,
     progress_callback=None,
 ):
     print(cle.available_device_names(dev_type="gpu"))
@@ -77,10 +81,16 @@ def run_pipeline3(
             "outline_sigma": outline_sigma,
         },
         "neurites": {"spot_sigma": neurite_spot_sigma},
+        "cilia": {
+            "min_size": cilia_min_size,
+            "max_size": cilia_max_size,
+        },
         "basal_bodies": {
             "spot_sigma": bb_spot_sigma,
             "outline_sigma": bb_outline_sigma,
             "gaussian_sigma": list(bb_gaussian_sigma),
+            "min_size": bb_min_size,
+            "max_size": bb_max_size,
         },
         "distance_thresholds": {
             "max_cilia_um": max_cilia_dist_cutoff_um,
@@ -138,6 +148,8 @@ def run_pipeline3(
         cilia_labels = segment_cilia_ml(
             a[0, cilia_channel],
             classifier_path=cilia_classifier_path,
+            min_size=cilia_min_size,
+            max_size=cilia_max_size,
         )
 
         nuclei_labels_otsu = segment_nuclei(
@@ -157,6 +169,8 @@ def run_pipeline3(
             spot_sigma=bb_spot_sigma,
             outline_sigma=bb_outline_sigma,
             gaussian_sigma=bb_gaussian_sigma,
+            min_size=bb_min_size,
+            max_size=bb_max_size,
         )
 
         # get neurites masks

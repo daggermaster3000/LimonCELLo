@@ -354,8 +354,12 @@ _JSON_SS_MAP = [
     (("nuclei", "tophat_radius"),                          "tophat_radius",        int),
     (("nuclei", "outline_sigma"),                          "nuclei_outline_sigma", int),
     (("neurites", "spot_sigma"),                           "neurite_sigma",        int),
+    (("cilia", "min_size"),                                "cilia_min_size",       int),
+    (("cilia", "max_size"),                                "cilia_max_size",       int),
     (("basal_bodies", "spot_sigma"),                       "bb_spot_sigma",        float),
     (("basal_bodies", "outline_sigma"),                    "bb_outline_sigma",     float),
+    (("basal_bodies", "min_size"),                         "bb_min_size",          int),
+    (("basal_bodies", "max_size"),                         "bb_max_size",          int),
     (("distance_thresholds", "max_cilia_um"),              "max_cilia",            float),
     (("distance_thresholds", "max_basal_body_um"),         "max_basal",            float),
     (("classification", "axon_threshold"),                 "pf_axon_thr",          float),
@@ -411,11 +415,15 @@ _SS_DEFAULTS: dict = {
     "tophat_radius":       12,
     "nuclei_outline_sigma": 3,
     "neurite_sigma":       5,
+    "cilia_min_size":      20,
+    "cilia_max_size":      0,
     "bb_spot_sigma":       2.0,
     "bb_outline_sigma":    2.0,
     "bb_gauss_z":          1.0,
     "bb_gauss_y":          1.0,
     "bb_gauss_x":          0.0,
+    "bb_min_size":         5,
+    "bb_max_size":         0,
     "max_cilia":           2.0,
     "max_basal":           2.0,
     "use_mip":             False,
@@ -635,6 +643,16 @@ with st.sidebar:
             help="🔄 Voronoi-Otsu object-separation scale for neurite detection"
         )
 
+    with st.expander("🎯 Cilia", expanded=True):
+        cilia_min_size = st.number_input(
+            "Min size (voxels)", min_value=0, step=1, key="cilia_min_size",
+            help="🔄 Remove cilia smaller than this many voxels (noise filter). 0 = disabled."
+        )
+        cilia_max_size = st.number_input(
+            "Max size (voxels)", min_value=0, step=10, key="cilia_max_size",
+            help="🔄 Remove cilia larger than this many voxels (cluster filter). 0 = disabled."
+        )
+
     with st.expander("🔵 Basal Bodies", expanded=True):
         bb_spot_sigma = st.slider(
             "Spot sigma", 0.5, 10.0, step=0.5, key="bb_spot_sigma",
@@ -656,6 +674,14 @@ with st.sidebar:
         bb_gauss_x = st.slider(
             "Gaussian σ_x", 0.0, 5.0, step=0.5, key="bb_gauss_x",
             help="🔄 Gaussian blur sigma along X before basal body segmentation"
+        )
+        bb_min_size = st.number_input(
+            "Min size (voxels)", min_value=0, step=1, key="bb_min_size",
+            help="🔄 Remove basal bodies smaller than this many voxels. 0 = disabled."
+        )
+        bb_max_size = st.number_input(
+            "Max size (voxels)", min_value=0, step=10, key="bb_max_size",
+            help="🔄 Remove basal bodies larger than this many voxels. 0 = disabled."
         )
 
     st.markdown("---")
@@ -775,9 +801,13 @@ if run_clicked:
             basal_bodies_channel=int(basal_bodies_channel),
             nuclei_channel=int(nuclei_channel),
             use_mip=bool(use_mip),
+            cilia_min_size=int(cilia_min_size),
+            cilia_max_size=int(cilia_max_size),
             bb_spot_sigma=float(bb_spot_sigma),
             bb_outline_sigma=float(bb_outline_sigma),
             bb_gaussian_sigma=(float(bb_gauss_z), float(bb_gauss_y), float(bb_gauss_x)),
+            bb_min_size=int(bb_min_size),
+            bb_max_size=int(bb_max_size),
         )
 
         _save_to_path_history("input", input_path)
