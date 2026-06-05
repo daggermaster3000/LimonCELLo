@@ -715,8 +715,8 @@ else:
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN TABS
 # ─────────────────────────────────────────────────────────────────────────────
-tab_run, tab_results, tab_overlays, tab_logs = st.tabs(
-    ["▶ Run Pipeline", "📊 Results & Graphs", "🎨 Custom Overlays", "📋 Live Logs"]
+tab_run, tab_tables, tab_graphs, tab_overlays, tab_logs = st.tabs(
+    ["▶ Run Pipeline", "📋 Data Tables", "📊 Graphs", "🔬 Overlays", "📋 Live Logs"]
 )
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -742,108 +742,192 @@ with tab_run:
         _n_ovl = len(glob.glob(os.path.join(_overlay_dir, "*.png"))) if os.path.exists(_overlay_dir) else 0
         st.metric("Overlays", _n_ovl)
 
-    st.markdown("---")
-
-    _sub_data, _sub_figs, _sub_ovl = st.tabs(["📄 Raw Data", "📈 Figures", "🔬 Overlays"])
-
-    with _sub_data:
-        if _data_ready:
-            _sheet = st.selectbox("Sheet", ["all_data", "qc_per_sample", "qc_global"], key="run_sheet")
-            _df_raw = _load_excel(_excel_path, _mtime, _sheet)
-            st.dataframe(_df_raw, width="stretch")
-            with open(_excel_path, "rb") as _fh:
-                st.download_button(
-                    "⬇️ Download Excel", _fh.read(), "results.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl_run_excel",
-                )
-        else:
-            st.info("No data yet — run the pipeline to generate results.")
-
-    with _sub_figs:
-        _figs = sorted(glob.glob(os.path.join(_fig_dir, "*.png")))
-        if _figs:
-            _sel = st.selectbox("Figure", _figs, format_func=os.path.basename, key="run_fig_sel")
-            st.image(_sel, width="stretch")
-        else:
-            st.info("No figures found.")
-
-    with _sub_ovl:
-        _ovls = sorted(glob.glob(os.path.join(_overlay_dir, "*.png")))
-        if _ovls:
-            _sel = st.selectbox("Overlay", _ovls, format_func=os.path.basename, key="run_ovl_sel")
-            st.image(_sel, width="stretch")
-        else:
-            st.info("No overlays found.")
+    if _data_ready:
+        st.markdown("---")
+        with open(_excel_path, "rb") as _fh:
+            st.download_button(
+                "⬇️ Download Full Results (Excel)", _fh.read(), "results.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_run_excel",
+            )
+    else:
+        st.info(
+            "No data yet — configure parameters in the sidebar and click **Run Pipeline**. "
+            "Results will appear in the **Data Tables**, **Graphs**, and **Overlays** tabs."
+        )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 2 — RESULTS & GRAPHS
+# TAB 2 — DATA TABLES
 # ═════════════════════════════════════════════════════════════════════════════
-with tab_results:
+with tab_tables:
     if not _data_ready:
         st.info("No results found — run the pipeline first.")
     else:
-        # NN filter banner
         if _nn_active:
             st.info(
                 f"🔵 NN filter active — **{len(_df_kept):,}** cilia kept, "
-                f"**{_nn_removed}** removed"
+                f"**{_nn_removed}** removed. Cilia counts and stats in both tables reflect this filter."
             )
 
-        # ── Data Table ────────────────────────────────────────────────────────
-        st.subheader("📋 Data Table")
+        # ── Prepare combined per-object dataframe ─────────────────────────────
+        _df_bb = (
+            _df_all[_df_all["object_type"] == "basal_body"].copy()
+            if "object_type" in _df_all.columns else pd.DataFrame()
+        )
+        # Reclassify basal bodies using current sidebar thresholds
+        if not _df_bb.empty and "log_ratio" in _df_bb.columns:
+            _df_bb["class"] = _reclassify(
+                _df_bb["log_ratio"], float(pf_axon_thr), float(pf_soma_thr)
+            )
+
+        _df_objects = (
+            pd.concat([_df_kept, _df_bb], ignore_index=True)
+            if not _df_bb.empty else _df_kept.copy()
+        )
+
+        # Promote key columns to the front
+        _obj_priority = [
+            "file_short", "filename", "object_type", "cilia_id", "class",
+            "distance_to_neurite_um", "ratio", "log_ratio",
+            "dt_neurite", "dt_nuclei", "log_dt_neurite", "log_dt_nuclei", "coords",
+        ]
+        _obj_cols = [c for c in _obj_priority if c in _df_objects.columns]
+        _obj_extra = [c for c in _df_objects.columns if c not in _obj_cols]
+        _df_objects = _df_objects[_obj_cols + _obj_extra]
+
+        # ── Prepare per-sample dataframe ──────────────────────────────────────
+        _sample_rows = []
+        for _fname in sorted(_df_all["filename"].dropna().unique()):
+            _short = (
+                _df_all.loc[_df_all["filename"] == _fname, "file_short"].iloc[0]
+                if "file_short" in _df_all.columns else _fname
+            )
+            _cilia_s = (
+                _df_kept[_df_kept["filename"] == _fname]
+                if not _df_kept.empty and "filename" in _df_kept.columns
+                else pd.DataFrame()
+            )
+            _bb_s = (
+                _df_bb[_df_bb["filename"] == _fname]
+                if not _df_bb.empty and "filename" in _df_bb.columns
+                else pd.DataFrame()
+            )
+            _row: dict = {
+                "file_short": _short,
+                "filename": _fname,
+                "n_cilia": len(_cilia_s),
+                "n_basal_bodies": len(_bb_s),
+                "n_nuclei": "—",  # not tracked by current pipeline
+            }
+            if len(_cilia_s) > 0:
+                for _col, _stat, _key in [
+                    ("ratio",                  "mean", "mean_ratio"),
+                    ("ratio",                  "std",  "std_ratio"),
+                    ("log_ratio",              "mean", "mean_log_ratio"),
+                    ("log_ratio",              "std",  "std_log_ratio"),
+                    ("distance_to_neurite_um", "mean", "mean_distance_um"),
+                    ("distance_to_neurite_um", "max",  "max_distance_um"),
+                ]:
+                    if _col in _cilia_s.columns:
+                        _val = getattr(_cilia_s[_col], _stat)()
+                        _row[_key] = round(float(_val), 4) if pd.notna(_val) else None
+                    else:
+                        _row[_key] = None
+            else:
+                for _key in ["mean_ratio", "std_ratio", "mean_log_ratio",
+                             "std_log_ratio", "mean_distance_um", "max_distance_um"]:
+                    _row[_key] = None
+            _sample_rows.append(_row)
+        _df_per_sample = pd.DataFrame(_sample_rows) if _sample_rows else pd.DataFrame()
+
+        # ── Table 1: Per Object ───────────────────────────────────────────────
+        st.subheader("🔬 Per-Object Table (Cilia & Basal Bodies)")
+        st.caption(
+            f"**{len(_df_kept):,}** cilia (post-filter) · "
+            f"**{len(_df_bb):,}** basal bodies (unfiltered) · "
+            f"**{_nn_removed}** cilia excluded by NN filter"
+        )
 
         with st.expander("🔍 Filters", expanded=False):
             _fc1, _fc2, _fc3 = st.columns(3)
             with _fc1:
                 _otypes = (
-                    ["All"] + sorted(_df_all["object_type"].dropna().unique().tolist())
-                    if "object_type" in _df_all.columns else ["All"]
+                    ["All"] + sorted(_df_objects["object_type"].dropna().unique().tolist())
+                    if "object_type" in _df_objects.columns else ["All"]
                 )
-                _obj_f = st.selectbox("Object type", _otypes, key="r_obj")
+                _obj_f = st.selectbox("Object type", _otypes, key="t_obj")
             with _fc2:
-                _files = (
-                    ["All"] + sorted(_df_all["filename"].dropna().unique().tolist())
-                    if "filename" in _df_all.columns else ["All"]
+                _files_t = (
+                    ["All"] + sorted(_df_objects["filename"].dropna().unique().tolist())
+                    if "filename" in _df_objects.columns else ["All"]
                 )
-                _file_f = st.selectbox("File", _files, key="r_file")
+                _file_f = st.selectbox("Sample", _files_t, key="t_file")
             with _fc3:
-                _classes = (
-                    ["All"] + sorted(_df_kept["class"].dropna().unique().tolist())
-                    if "class" in _df_kept.columns else ["All"]
+                _classes_t = (
+                    ["All"] + sorted(_df_objects["class"].dropna().unique().tolist())
+                    if "class" in _df_objects.columns else ["All"]
                 )
-                _class_f = st.selectbox("Class", _classes, key="r_class")
+                _class_f = st.selectbox("Class", _classes_t, key="t_class")
 
-        _df_table = _df_kept.copy()
-        if _obj_f != "All" and "object_type" in _df_table.columns:
-            _df_table = _df_table[_df_table["object_type"] == _obj_f]
-        if _file_f != "All" and "filename" in _df_table.columns:
-            _df_table = _df_table[_df_table["filename"] == _file_f]
-        if _class_f != "All" and "class" in _df_table.columns:
-            _df_table = _df_table[_df_table["class"] == _class_f]
+        _df_obj_filt = _df_objects.copy()
+        if _obj_f != "All" and "object_type" in _df_obj_filt.columns:
+            _df_obj_filt = _df_obj_filt[_df_obj_filt["object_type"] == _obj_f]
+        if _file_f != "All" and "filename" in _df_obj_filt.columns:
+            _df_obj_filt = _df_obj_filt[_df_obj_filt["filename"] == _file_f]
+        if _class_f != "All" and "class" in _df_obj_filt.columns:
+            _df_obj_filt = _df_obj_filt[_df_obj_filt["class"] == _class_f]
 
-        st.caption(
-            f"Showing {len(_df_table):,} of {len(_df_kept):,} kept rows "
-            f"({_nn_removed} excluded by NN filter)"
-        )
-        st.dataframe(_df_table, width="stretch", height=300)
+        st.caption(f"Showing {len(_df_obj_filt):,} of {len(_df_objects):,} objects")
+        st.dataframe(_df_obj_filt, width="stretch", height=320)
 
-        _dl1, _dl2 = st.columns(2)
-        with _dl1:
+        _dlo1, _dlo2 = st.columns(2)
+        with _dlo1:
             st.download_button(
                 "⬇️ Download filtered (CSV)",
-                _df_table.to_csv(index=False).encode(),
-                "filtered_data.csv", "text/csv", key="dl_csv",
+                _df_obj_filt.to_csv(index=False).encode(),
+                "objects_filtered.csv", "text/csv", key="dl_obj_filt",
             )
-        with _dl2:
-            with open(_excel_path, "rb") as _fh2:
-                st.download_button(
-                    "⬇️ Download full (Excel)", _fh2.read(),
-                    "all_cilia_features.xlsx", key="dl_excel_r",
-                )
+        with _dlo2:
+            st.download_button(
+                "⬇️ Download all objects (CSV)",
+                _df_objects.to_csv(index=False).encode(),
+                "objects_all.csv", "text/csv", key="dl_obj_all",
+            )
 
         st.markdown("---")
+
+        # ── Table 2: Per Sample ───────────────────────────────────────────────
+        st.subheader("🧫 Per-Sample Summary")
+        st.caption(
+            "Cilia counts and stats reflect current ⚡ Post-Segmentation Filters. "
+            "Basal body counts are unfiltered. "
+            "Nuclei count (—) is not currently saved by the pipeline."
+        )
+
+        if _df_per_sample.empty:
+            st.info("No sample data available.")
+        else:
+            st.dataframe(_df_per_sample, width="stretch")
+            st.download_button(
+                "⬇️ Download per-sample summary (CSV)",
+                _df_per_sample.to_csv(index=False).encode(),
+                "per_sample_summary.csv", "text/csv", key="dl_sample",
+            )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 3 — GRAPHS
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_graphs:
+    if not _data_ready:
+        st.info("No results found — run the pipeline first.")
+    else:
+        if _nn_active:
+            st.info(
+                f"🔵 NN filter active — **{len(_df_kept):,}** cilia kept, "
+                f"**{_nn_removed}** removed"
+            )
 
         # ── Key Metrics 2×2 Grid ──────────────────────────────────────────────
         st.subheader("📊 Key Metrics Overview")
@@ -1063,13 +1147,14 @@ with tab_results:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 3 — OVERLAYS
+# TAB 4 — OVERLAYS
 # ═════════════════════════════════════════════════════════════════════════════
 with tab_overlays:
     st.subheader("🔬 Overlays")
     st.caption(
-        "2×2 MIP overlay identical to the pipeline output — updates live as you "
-        "adjust ⚡ Post-Segmentation Filters in the sidebar."
+        "2×2 MIP overlay — updates live as you adjust ⚡ Post-Segmentation Filters. "
+        "The pipeline-saved PNG (in the output folder) shows **all** detected cilia before "
+        "any NN filter; the interactive overlay below reflects your current filter settings."
     )
 
     if not _data_ready or (_df_kept.empty and _df_removed.empty):
@@ -1231,7 +1316,7 @@ with tab_overlays:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 4 — LIVE LOGS
+# TAB 5 — LIVE LOGS
 # ═════════════════════════════════════════════════════════════════════════════
 with tab_logs:
     st.subheader("📋 Live Logs")
