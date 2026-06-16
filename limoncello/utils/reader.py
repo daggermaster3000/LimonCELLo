@@ -45,10 +45,10 @@ def load_image(ims_path):
         "xy_resolution": None,
     }
 
-    print("Shape (T, C, Z, Y, X):", img.shape)
-    print("Number of timepoints:", t)
-    print("Number of channels:", c)
-    print("Image dimensions (Z, Y, X):", (z, y, x))
+    # print("Shape (T, C, Z, Y, X):", img.shape)
+    # print("Number of timepoints:", t)
+    # print("Number of channels:", c)
+    # print("Image dimensions (Z, Y, X):", (z, y, x))
 
     # Resolution metadata
     try:
@@ -61,8 +61,8 @@ def load_image(ims_path):
         metadata["z_resolution"] = z_res
         metadata["xy_resolution"] = xy_res
 
-        print("Z Resolution:", z_res)
-        print("XY Resolution:", xy_res)
+        # print("Z Resolution:", z_res)
+        # print("XY Resolution:", xy_res)
 
     except Exception:
         print("Resolution metadata not found.")

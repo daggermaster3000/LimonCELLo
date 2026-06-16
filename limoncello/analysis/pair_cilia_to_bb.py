@@ -8,16 +8,20 @@ import numpy as np
 
 def parse_coords_string(series):
     """
-    Convert a pandas series of strings like
-    '[np.float64(10.52), np.float64(428.1), np.float64(11.57)]'
-    into a proper numeric array (n_objects, 3)
+    Convert a pandas series of coordinate values into a numeric array
+    (n_objects, 3). Handles already-parsed lists/arrays as well as string
+    reprs in either clean ('[10.5, 428.1, 11.57]') or numpy-wrapped
+    ('[np.float64(10.52), ...]') form.
     """
+    num_pattern = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
     coords_list = []
-    float_pattern = re.compile(r"np\.float64\((.*?)\)")
     for s in series:
-        # Find all numbers inside np.float64()
-        numbers = float_pattern.findall(s)
-        coords_list.append([float(x) for x in numbers])
+        if isinstance(s, (list, tuple, np.ndarray)):
+            coords_list.append([float(x) for x in s])
+            continue
+        # Strip numpy wrappers then pull out every number
+        numbers = num_pattern.findall(str(s))
+        coords_list.append([float(x) for x in numbers[:3]])
     return np.array(coords_list, dtype=np.float64)
 
 

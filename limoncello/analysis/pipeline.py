@@ -1,8 +1,11 @@
 # pipeline.py
+import gc
 import json
 import os
 from datetime import datetime
-from scipy.ndimage import distance_transform_edt, center_of_mass
+from scipy.ndimage import center_of_mass
+from ..utils.gpu_distance import distance_transform_edt
+from skimage.measure import regionprops_table
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -17,6 +20,52 @@ from ..qc.qc import run_qc, save_qc_excel, scatter_plot
 from ..analysis.pair_cilia_to_bb import pair_from_mixed_df
 from ..utils.assign_label_features import assign_label_features
 import pyclesperanto_prototype as cle
+
+
+# Max per-channel voxel count (Z*Y*X) attempted in 3-D GPU mode. Larger volumes
+# would exhaust typical GPU VRAM during segmentation; they are skipped in batch
+# with guidance to downsample or use MIP. Tune for your GPU if needed.
+_MAX_3D_VOXELS = 4e8
+
+
+def _flush_gpu():
+    """Finish the OpenCL queue and force a collection so GPU buffers released in
+    the current batch iteration are actually freed before the next file starts."""
+    try:
+        cle.get_device().queue.finish()
+    except Exception:
+        pass
+    gc.collect()
+
+
+def _region_props_3d(labels, voxel_size):
+    """Per-label 3-D region properties from a label volume (Z, Y, X).
+
+    Returns {label_id: (volume_voxels, volume_um3, length_um)} where the
+    physical quantities use the anisotropic ``voxel_size`` (z, y, x in µm).
+    """
+    lab = np.asarray(labels).astype(np.int32)
+    if lab.size == 0 or lab.max() == 0:
+        return {}
+    spacing = tuple(float(s) for s in voxel_size)
+    vox_um3 = float(np.prod(spacing))
+    out = {}
+    try:
+        rp = regionprops_table(
+            lab, spacing=spacing,
+            properties=("label", "num_pixels", "axis_major_length"),
+        )
+        for i, lid in enumerate(rp["label"]):
+            n_vox = int(rp["num_pixels"][i])
+            out[int(lid)] = (n_vox, n_vox * vox_um3, float(rp["axis_major_length"][i]))
+    except Exception as exc:
+        # Fall back to voxel counts only (no physical length) if regionprops fails
+        print(f"  ⚠ 3-D region props failed ({exc}); using voxel counts only.")
+        counts = np.bincount(lab.ravel())
+        for lid in range(1, len(counts)):
+            if counts[lid]:
+                out[int(lid)] = (int(counts[lid]), counts[lid] * vox_um3, float("nan"))
+    return out
 
 
 def run_pipeline3(
@@ -42,23 +91,35 @@ def run_pipeline3(
     bb_spot_sigma: float = 2.0,
     bb_outline_sigma: float = 2.0,
     bb_gaussian_sigma: tuple = (1.0, 1.0, 0.0),
+    cilia_gaussian_sigma: tuple = (1.0, 1.0, 1.0),
+    nuclei_gaussian_sigma: tuple = (0.0, 0.0, 0.0),
+    neurite_gaussian_sigma: tuple = (0.0, 0.0, 0.0),
+    cilia_log: bool = False,
+    nuclei_log: bool = False,
+    neurite_log: bool = False,
+    bb_log: bool = False,
     cilia_min_size: int = 20,
     cilia_max_size: int = 0,
     bb_min_size: int = 5,
     bb_max_size: int = 0,
     ratio_epsilon: float = 1.0,
+    per_channel_norm: dict | None = None,
     progress_callback=None,
 ):
-    print(cle.available_device_names(dev_type="gpu"))
     if gpu_device:
         cle.select_device(gpu_device)
-    print(cle.get_device())
+    _dev = cle.get_device()
+    print("═" * 60)
+    print("  LimonCELLo pipeline")
+    print("═" * 60)
+    print(f"  GPU device : {getattr(_dev, 'name', _dev)}")
+    print(f"  Mode       : {'MIP (2-D projection)' if use_mip else '3-D volume'}")
 
     # Each run gets its own timestamped subfolder inside output_path
     _run_stamp = datetime.now().strftime("lc-analysis-%Y-%m-%d_%H-%M-%S")
     output_path = os.path.join(output_path, _run_stamp)
     os.makedirs(output_path, exist_ok=True)
-    print(f"Run directory: {output_path}")
+    print(f"  Run folder : {output_path}")
 
     csv_dir = os.path.join(output_path, "csv")
     os.makedirs(csv_dir, exist_ok=True)
@@ -75,14 +136,28 @@ def run_pipeline3(
             "basal_bodies": basal_bodies_channel,
             "nuclei": nuclei_channel,
         },
-        "intensity_normalization": {"p_low": p_low, "p_high": p_high},
+        "intensity_normalization": {
+            "p_low": p_low, "p_high": p_high,
+            "per_channel": (
+                {str(k): list(v) for k, v in per_channel_norm.items()}
+                if per_channel_norm else None
+            ),
+        },
         "nuclei": {
             "spot_sigma": nuclei_spot_sigma,
             "tophat_radius": tophat_radius,
             "outline_sigma": outline_sigma,
+            "gaussian_sigma": list(nuclei_gaussian_sigma),
+            "log_transform": nuclei_log,
         },
-        "neurites": {"spot_sigma": neurite_spot_sigma},
+        "neurites": {
+            "spot_sigma": neurite_spot_sigma,
+            "gaussian_sigma": list(neurite_gaussian_sigma),
+            "log_transform": neurite_log,
+        },
         "cilia": {
+            "gaussian_sigma": list(cilia_gaussian_sigma),
+            "log_transform": cilia_log,
             "min_size": cilia_min_size,
             "max_size": cilia_max_size,
         },
@@ -90,6 +165,7 @@ def run_pipeline3(
             "spot_sigma": bb_spot_sigma,
             "outline_sigma": bb_outline_sigma,
             "gaussian_sigma": list(bb_gaussian_sigma),
+            "log_transform": bb_log,
             "min_size": bb_min_size,
             "max_size": bb_max_size,
         },
@@ -106,18 +182,19 @@ def run_pipeline3(
     _json_path = os.path.join(csv_dir, "run_parameters.json")
     with open(_json_path, "w") as _f:
         json.dump(params_log, _f, indent=2)
-    print(f"Saved parameters: {_json_path}")
 
     all_dfs = []
 
     all_files = sorted(f for f in os.listdir(input_path) if f.endswith(".ims"))
     n_files = len(all_files)
-    print(f"Found {n_files} .ims file(s) to process.")
+    print(f"  Input      : {input_path}")
+    print(f"  Files      : {n_files} .ims file(s)")
+    print("─" * 60)
 
     for file_idx, file in enumerate(all_files):
         if progress_callback is not None:
             progress_callback(file_idx, n_files, file)
-        print(f"[{file_idx + 1}/{n_files}] Processing {file}...")
+        print(f"[{file_idx + 1}/{n_files}] {file}")
 
         # Load data
         try:
@@ -127,7 +204,26 @@ def run_pipeline3(
             continue
         voxel_size = meta["voxel_size"]
 
-        a_norm = normalize_intensity(a, p_low=p_low, p_high=p_high)
+        # ── Guard against volumes too large for the GPU in 3-D mode ─────────────
+        # (T, C, Z, Y, X) → per-channel voxel count Z*Y*X. Large stitched images
+        # would otherwise trigger a GPU MEM_OBJECT_ALLOCATION_FAILURE and abort
+        # the whole batch; skip them with guidance and continue.
+        _z, _y, _x = int(a.shape[2]), int(a.shape[3]), int(a.shape[4])
+        _n_vox = _z * _y * _x
+        if not use_mip and _n_vox > _MAX_3D_VOXELS:
+            print(f"  ✗ {file}: volume {_z}×{_y}×{_x} = {_n_vox / 1e9:.2f} Gvox is "
+                  f"too large for 3-D GPU segmentation and would exhaust VRAM. "
+                  f"Downsample the image or enable MIP mode. Skipping.")
+            continue
+
+        if per_channel_norm:
+            # Per-channel percentile normalisation (override or global default)
+            a_norm = {}
+            for c in range(a.shape[1]):
+                _lo, _hi = per_channel_norm.get(c, (p_low, p_high))
+                a_norm[0, c] = percentile_minmax_normalize(a[0, c], p_low=_lo, p_high=_hi)
+        else:
+            a_norm = normalize_intensity(a, p_low=p_low, p_high=p_high)
 
         # ── MIP mode: project each channel to 2-D then treat as single-Z 3-D ─
         if use_mip:
@@ -150,6 +246,8 @@ def run_pipeline3(
         cilia_labels = segment_cilia_ml(
             a[0, cilia_channel],
             classifier_path=cilia_classifier_path,
+            gaussian_sigma=cilia_gaussian_sigma,
+            log_transform=cilia_log,
             min_size=cilia_min_size,
             max_size=cilia_max_size,
         )
@@ -159,11 +257,15 @@ def run_pipeline3(
             tophat_radius=(tophat_radius, tophat_radius, tophat_radius),
             spot_sigma=nuclei_spot_sigma,
             outline_sigma=outline_sigma,
+            gaussian_sigma=nuclei_gaussian_sigma,
+            log_transform=nuclei_log,
         )
 
         skeleton, neurites_label = segment_neurites(
             a_norm[0, neurites_channel],
             spot_sigma=neurite_spot_sigma,
+            gaussian_sigma=neurite_gaussian_sigma,
+            log_transform=neurite_log,
         )
 
         basal_bodies_labels = segment_basal_bodies(
@@ -171,6 +273,7 @@ def run_pipeline3(
             spot_sigma=bb_spot_sigma,
             outline_sigma=bb_outline_sigma,
             gaussian_sigma=bb_gaussian_sigma,
+            log_transform=bb_log,
             min_size=bb_min_size,
             max_size=bb_max_size,
         )
@@ -243,7 +346,27 @@ def run_pipeline3(
 
         if df_cilia.empty:
             print(f"No valid cilia found in {file}")
+            try:
+                del cilia_labels, nuclei_labels_otsu, skeleton, neurites_label, \
+                    basal_bodies_labels, neurite_mask, skeleton_mask, \
+                    distance_map_nuclei, distance_map_neurites, map_ratio, \
+                    dist_to_neurite, nearest_skel_idx, a_norm, a
+            except NameError:
+                pass
+            _flush_gpu()
             continue
+
+        # 3-D region properties per cilium (volume, length) from the label volume
+        _cprops = _region_props_3d(np.asarray(cilia_labels), voxel_size)
+        df_cilia["volume_voxels"] = [
+            _cprops.get(int(i), (np.nan, np.nan, np.nan))[0] for i in df_cilia["cilia_id"]
+        ]
+        df_cilia["volume_um3"] = [
+            _cprops.get(int(i), (np.nan, np.nan, np.nan))[1] for i in df_cilia["cilia_id"]
+        ]
+        df_cilia["length_um"] = [
+            _cprops.get(int(i), (np.nan, np.nan, np.nan))[2] for i in df_cilia["cilia_id"]
+        ]
 
         df_basal_bodies = assign_label_features(
             basal_bodies_labels,
@@ -290,6 +413,17 @@ def run_pipeline3(
         np.save(os.path.join(_mip_out, f"{_fstem}_neurite_mask_mip.npy"), _neurite_mask_mip)
         np.save(os.path.join(_mip_out, f"{_fstem}_ratio_mid.npy"),
                 map_ratio[map_ratio.shape[0] // 2])
+        # Additional MIPs for interactive overlay in app (saved by new runs only)
+        np.save(os.path.join(_mip_out, f"{_fstem}_bb_mip.npy"),
+                _disp_mip(a[0, basal_bodies_channel]))
+        np.save(os.path.join(_mip_out, f"{_fstem}_cilia_labels_mip.npy"),
+                np.max(np.asarray(cilia_labels).astype(np.uint16), axis=0))
+        np.save(os.path.join(_mip_out, f"{_fstem}_nuclei_labels_mip.npy"),
+                np.max(nuclei_labels_otsu.astype(np.uint16), axis=0))
+        np.save(os.path.join(_mip_out, f"{_fstem}_bb_labels_mip.npy"),
+                np.max(np.asarray(basal_bodies_labels).astype(np.uint16), axis=0))
+        np.save(os.path.join(_mip_out, f"{_fstem}_neurite_labels_mip.npy"),
+                np.max(np.asarray(neurites_label).astype(np.uint16), axis=0))
 
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
@@ -335,7 +469,20 @@ def run_pipeline3(
             os.path.join(overlay_dir, f"{_fstem}_overlay.png"),
             dpi=300, bbox_inches="tight",
         )
-        plt.close()
+        plt.close("all")
+
+        # ── Release GPU label buffers + large CPU arrays before the next file ───
+        # Without this the previous file's buffers stay alive while the next
+        # file's (GPU-heavy) segmentation allocates, exhausting VRAM after a few
+        # files even for normal-sized images.
+        try:
+            del cilia_labels, nuclei_labels_otsu, skeleton, neurites_label, \
+                basal_bodies_labels, neurite_mask, skeleton_mask, \
+                distance_map_nuclei, distance_map_neurites, map_ratio, \
+                dist_to_neurite, nearest_skel_idx, a_norm, a
+        except NameError:
+            pass
+        _flush_gpu()
 
     if len(all_dfs) == 0:
         print("No data processed.")
@@ -416,7 +563,8 @@ def run_pipeline3(
         qc_sample.to_excel(writer, sheet_name="qc_per_sample", index=False)
         qc_global.to_excel(writer, sheet_name="qc_global", index=False)
 
-    print(f"Saved QC Excel: {excel_path}")
+    print("─" * 60)
+    print(f"  QC Excel   : {excel_path}")
 
     plt.figure(figsize=(10, 6))
     sns.scatterplot(x="dt_neurite", y="dt_nuclei", hue="file_short",
@@ -438,5 +586,7 @@ def run_pipeline3(
     plt.savefig(os.path.join(fig_dir, "log_dt_scatterplot.png"), dpi=300)
     plt.close()
 
-    print(f"Figures saved in: {fig_dir}")
-    print("Pipeline complete.")
+    print(f"  Figures    : {fig_dir}")
+    print("═" * 60)
+    print("  ✓ Pipeline complete")
+    print("═" * 60)

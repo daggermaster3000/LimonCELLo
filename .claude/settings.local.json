@@ -1,7 +1,16 @@
 {
   "permissions": {
     "allow": [
-      "Bash('C:\\\\Users\\\\qfavey\\\\.conda\\\\envs\\\\napari-env-q\\\\python.exe' -c ' *)"
+      "Bash('C:\\\\Users\\\\qfavey\\\\.conda\\\\envs\\\\napari-env-q\\\\python.exe' -c ' *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "PowerShell($envroot=\"C:/Users/qfavey/.conda/envs/napari-env-q\"; $env:PATH=\"$envroot;$envroot/Library/bin;$envroot/Library/mingw-w64/bin;$envroot/DLLs;$envroot/Scripts;\"+$env:PATH; Set-Location \"c:/Users/qfavey/Documents/Code-Thomas-Test/LimonCELLo\"; & \"$envroot/python.exe\" -u _qc_test.py 2>&1 | Select-String -NotMatch \"ScriptRunContext|Session state does not|streamlit run|Thread 'MainThread'|missing ScriptRunContext|warnings.warn|bare mode\" | Out-String -Width 200; \"EXIT=$LASTEXITCODE\")",
+      "PowerShell($envroot=\"C:/Users/qfavey/.conda/envs/napari-env-q\"; $env:PATH=\"$envroot;$envroot/Library/bin;$envroot/Library/mingw-w64/bin;$envroot/DLLs;$envroot/Scripts;\"+$env:PATH; Set-Location \"c:/Users/qfavey/Documents/Code-Thomas-Test/LimonCELLo\"; & \"$envroot/python.exe\" -u _qc_vis.py 2>&1 | Select-String \"rendered|Error|Traceback|Exception\" | Out-String -Width 200; \"EXIT=$LASTEXITCODE\")",
+      "Bash(cd \"C:/Users/qfavey/.conda/envs/napari-env-q/Lib/site-packages\" 2>/dev/null; echo \"=== apoc all .py with size print ===\"; grep -rni \"print\\(.*size\" apoc/ 2>&1; echo \"=== apoc feature/predict files ===\"; ls apoc/; echo \"=== grep 'size' literal in apoc generate feature ===\"; grep -rni \"size\" apoc/_feature_stack* 2>&1 | grep -i print | head)",
+      "Read(//c/Users/qfavey/.conda/envs/napari-env-q/Lib/site-packages/**)",
+      "PowerShell($envroot=\"C:/Users/qfavey/.conda/envs/napari-env-q\"; $env:PATH=\"$envroot;$envroot/Library/bin;$envroot/Library/mingw-w64/bin;$envroot/DLLs;$envroot/Scripts;\"+$env:PATH; Set-Location \"c:/Users/qfavey/Documents/Code-Thomas-Test/LimonCELLo\"; & \"$envroot/python.exe\" -u _probe_log.py 2>&1 | Select-String -Pattern \"size\" -Context 1 | Out-String -Width 200; \"EXIT=$LASTEXITCODE\")",
+      "PowerShell($envroot=\"C:/Users/qfavey/.conda/envs/napari-env-q\"; Set-Location \"c:/Users/qfavey/Documents/Code-Thomas-Test/LimonCELLo\"; & \"$envroot/python.exe\" -c \"import ast; [ast.parse\\(open\\(f,encoding='utf-8'\\).read\\(\\)\\) for f in ['app.py','napari_plugin.py','limoncello/analysis/pipeline.py','limoncello/segmentation/nuclei.py','limoncello/segmentation/neurites.py','limoncello/segmentation/basal_bodies.py','limoncello/segmentation/cilia.py']]; print\\('SYNTAX OK'\\)\")"
     ]
   }
 }

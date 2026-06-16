@@ -13,6 +13,7 @@ def segment_basal_bodies(
     gaussian_sigma=(1.0, 1.0, 0.0),
     min_size: int = 5,
     max_size: int = 0,
+    log_transform: bool = False,
     **kwargs,
 ):
     """
@@ -32,20 +33,29 @@ def segment_basal_bodies(
         Remove objects smaller than this (voxels). 0 = disabled.
     max_size : int
         Remove objects larger than this (voxels). 0 = disabled.
+    log_transform : bool
+        If True, apply a log1p intensity transform before all other
+        processing (compresses dynamic range). Default False.
 
     Returns
     -------
     labels_gpu : cle.Image
         Labeled basal bodies (GPU).
     """
-    volume_gpu = to_gpu(volume)
+    vol = np.asarray(volume)
+    if log_transform:
+        vol = np.log1p(vol.astype(np.float32))
+    volume_gpu = to_gpu(vol)
 
-    blurred_gpu = cle.gaussian_blur(
-        volume_gpu,
-        sigma_x=gaussian_sigma[2],
-        sigma_y=gaussian_sigma[1],
-        sigma_z=gaussian_sigma[0],
-    )
+    if any(s > 0 for s in gaussian_sigma):
+        blurred_gpu = cle.gaussian_blur(
+            volume_gpu,
+            sigma_x=gaussian_sigma[2],
+            sigma_y=gaussian_sigma[1],
+            sigma_z=gaussian_sigma[0],
+        )
+    else:
+        blurred_gpu = volume_gpu
 
     labels_gpu = cle.voronoi_otsu_labeling(
         blurred_gpu,

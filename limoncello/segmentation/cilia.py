@@ -26,6 +26,8 @@ def segment_cilia_ml(
     classifier_path: str,
     min_size: int = 20,
     max_size: int = 0,
+    gaussian_sigma=(1.0, 1.0, 1.0),
+    log_transform: bool = False,
     **kwargs,
 ):
     """
@@ -43,13 +45,34 @@ def segment_cilia_ml(
         Remove objects smaller than this (voxels). 0 = disabled.
     max_size : int
         Remove objects larger than this (voxels). 0 = disabled.
+    gaussian_sigma : tuple
+        Gaussian blur sigma (sz, sy, sx) applied before APOC prediction.
+        Set to (0, 0, 0) to disable.
+    log_transform : bool
+        If True, apply a log1p intensity transform before blur/prediction.
+        Note: APOC classifiers are trained on specific intensities — enabling
+        this changes the feature space and may degrade a model trained on
+        raw data. Default False.
 
     Returns
     -------
     labels_gpu : cle.Image
         Labeled cilia image (GPU), same dimensionality as input.
     """
-    vol = np.asarray(volume)
+    _vol_in = np.asarray(volume)
+    if log_transform:
+        _vol_in = np.log1p(_vol_in.astype(np.float32))
+    volume_gpu = to_gpu(_vol_in)
+
+    if any(s > 0 for s in gaussian_sigma):
+        volume_gpu = cle.gaussian_blur(
+            volume_gpu,
+            sigma_x=gaussian_sigma[2],
+            sigma_y=gaussian_sigma[1],
+            sigma_z=gaussian_sigma[0],
+        )
+
+    vol = np.asarray(volume_gpu)
 
     # APOC 3-D feature extraction needs >= 2 Z-slices; squeeze single-Z to 2-D
     single_z = vol.ndim == 3 and vol.shape[0] == 1

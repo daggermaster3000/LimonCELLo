@@ -8,18 +8,34 @@ import sys
 import time
 import glob
 import threading
+import warnings
 from io import BytesIO
+
+# Silence noisy GPU/OpenCL warnings that otherwise flood the in-app log stream.
+warnings.filterwarnings("ignore", message=r".*PyOpenCL compiler caching failed.*")
+warnings.filterwarnings("ignore", message=r".*Cannot deduce a name.*")
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import streamlit as st
 from scipy.spatial import KDTree
+from scipy.ndimage import center_of_mass
+from skimage.measure import regionprops_table
 
 from limoncello.analysis.pipeline import run_pipeline3
+from limoncello.utils.app_helpers import find_latest_run_dir as _find_latest_run_dir
+
+try:
+    import plotly.express as _px
+    import plotly.figure_factory as _ff
+    _PLOTLY_AVAILABLE = True
+except ImportError:
+    _PLOTLY_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -48,6 +64,24 @@ _PF_DEFAULTS = {
 # ─────────────────────────────────────────────────────────────────────────────
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\r")
 
+# Lines matching this are GPU/OpenCL plumbing noise — hidden from the app log
+# stream so users see only meaningful pipeline messages.
+_LOG_NOISE_RE = re.compile(
+    r"PyOpenCL compiler caching failed"
+    r"|\[begin exception\]|\[end exception\]"
+    r"|Traceback \(most recent call last\)"
+    r"|create_built_program_from_source_cached"
+    r"|pyopencl_defeat_cache"
+    r"|%b requires a bytes-like object"
+    r"|^\s*src = src \+ b"
+    r"|^\s*lambda: create_built_program"
+    r"|^\s*File \".*[\\/](pyopencl|pyclesperanto)"
+    r"|UserWarning"
+    r"|^\s*warnings\.warn"
+    r"|^size:\s*\d+"
+    r"|cl_amd_printf"
+)
+
 
 def _strip_ansi(s: str) -> str:
     return _ANSI_RE.sub("", s)
@@ -70,6 +104,10 @@ class _LogCapture:
         self._buf += text
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
+            if _LOG_NOISE_RE.search(line):
+                continue                       # drop GPU/OpenCL plumbing noise
+            if not line.strip() and self._list and not self._list[-1].strip():
+                continue                       # collapse consecutive blank lines
             self._list.append(line)
 
     def flush(self):
@@ -197,12 +235,12 @@ def _channel_assignment_dialog(input_path: str, filename: str, n_channels: int):
                         _sp.set_edgecolor("#F5A623")
                         _sp.set_linewidth(3)
                 plt.tight_layout(pad=0.1)
-                st.pyplot(_tfig, use_container_width=True)
+                st.pyplot(_tfig, width="stretch")
                 plt.close(_tfig)
             _rlbl = _ch_role.get(i, "—")
             st.caption(f"Ch {i}" + (f" · {_rlbl}" if _rlbl != "—" else ""))
             # Button click triggers a rerun WITHOUT st.rerun() so dialog stays open
-            if st.button("Select", key=f"_dsel_{i}", use_container_width=True,
+            if st.button("Select", key=f"_dsel_{i}", width="stretch",
                          type="primary" if i == ch else "secondary"):
                 st.session_state.dialog_ch_idx = i
 
@@ -211,13 +249,13 @@ def _channel_assignment_dialog(input_path: str, filename: str, n_channels: int):
     # ── Large view + arrow navigation ─────────────────────────────────────────
     _nl, _nc, _nr = st.columns([1, 6, 1])
     with _nl:
-        if st.button("◀", key="_dprev", disabled=(ch == 0), use_container_width=True):
+        if st.button("◀", key="_dprev", disabled=(ch == 0), width="stretch"):
             st.session_state.dialog_ch_idx = ch - 1
     with _nc:
         _current_role = _ch_role.get(ch, "unassigned")
         st.markdown(f"#### Channel {ch} — *{_current_role}*")
     with _nr:
-        if st.button("▶", key="_dnext", disabled=(ch == n_channels - 1), use_container_width=True):
+        if st.button("▶", key="_dnext", disabled=(ch == n_channels - 1), width="stretch"):
             st.session_state.dialog_ch_idx = ch + 1
 
     if previews is not None:
@@ -225,7 +263,7 @@ def _channel_assignment_dialog(input_path: str, filename: str, n_channels: int):
         _max.imshow(previews[ch], cmap="gray", aspect="equal")
         _max.axis("off")
         plt.tight_layout(pad=0.1)
-        st.pyplot(_mfig, use_container_width=True)
+        st.pyplot(_mfig, width="stretch")
         plt.close(_mfig)
     else:
         st.error("Could not load image data.")
@@ -246,7 +284,7 @@ def _channel_assignment_dialog(input_path: str, filename: str, n_channels: int):
                 format_func=lambda x: f"Channel {x}",
             )
 
-    if st.button("✅ Apply Assignments", type="primary", use_container_width=True):
+    if st.button("✅ Apply Assignments", type="primary", width="stretch"):
         st.session_state["_pending_channels"] = {
             _sk: int(st.session_state[f"_dassign_{_sk}"])
             for _, _sk, _ in _DIALOG_ROLES
@@ -268,16 +306,526 @@ def _load_mips(mip_dir: str, stem: str, mtime: float) -> dict | None:
         if not os.path.exists(path):
             return None
         result[key] = np.load(path)
-    # Neurite mask MIP is optional (saved by newer pipeline runs)
-    _mask_path = os.path.join(mip_dir, f"{stem}_neurite_mask_mip.npy")
-    if os.path.exists(_mask_path):
-        result["neurite_mask"] = np.load(_mask_path).astype(bool)
+    # Optional MIPs — present only in runs produced after the label-MIP update
+    for key, suffix, cast in [
+        ("neurite_mask",   "neurite_mask_mip",   lambda a: a.astype(bool)),
+        ("bb",             "bb_mip",             None),
+        ("cilia_labels",   "cilia_labels_mip",   None),
+        ("nuclei_labels",  "nuclei_labels_mip",  None),
+        ("bb_labels",      "bb_labels_mip",      None),
+        ("neurite_labels", "neurite_labels_mip", None),
+    ]:
+        _p = os.path.join(mip_dir, f"{stem}_{suffix}.npy")
+        if os.path.exists(_p):
+            arr = np.load(_p)
+            result[key] = cast(arr) if cast else arr
     return result
 
 
 def _fig_to_png(fig: plt.Figure) -> bytes:
     buf = BytesIO()
     fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    return buf.getvalue()
+
+
+def _fig_to_pdf(fig: plt.Figure) -> bytes:
+    buf = BytesIO()
+    fig.savefig(buf, format="pdf", bbox_inches="tight")
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QC PDF REPORT
+# ─────────────────────────────────────────────────────────────────────────────
+def _label_stats(label_mip):
+    """For a 2-D label MIP return (n_objects, mean_area_px, centroids_yx, ids)."""
+    if label_mip is None:
+        return 0, float("nan"), np.empty((0, 2)), np.empty((0,), dtype=int)
+    lab = np.asarray(label_mip)
+    ids = np.unique(lab)
+    ids = ids[ids != 0]
+    if ids.size == 0:
+        return 0, float("nan"), np.empty((0, 2)), np.empty((0,), dtype=int)
+    areas = np.bincount(lab.ravel())[ids]
+    cents = np.atleast_2d(np.array(center_of_mass(lab > 0, labels=lab, index=ids)))
+    return int(ids.size), float(areas.mean()), cents, ids.astype(int)  # cents = (y, x)
+
+
+def _qc_show_gray(ax, img, title):
+    if img is None:
+        ax.text(0.5, 0.5, "not available", ha="center", va="center", color="#999")
+    else:
+        _lo, _hi = np.percentile(img, (1, 99.5))
+        ax.imshow(img, cmap="gray", vmin=_lo, vmax=_hi + 1e-8)
+    ax.set_title(title, fontsize=9)
+    ax.axis("off")
+
+
+def _qc_show_labels(ax, lab, title, mask=None):
+    if lab is None and mask is None:
+        ax.text(0.5, 0.5, "not available", ha="center", va="center", color="#999")
+    elif lab is not None:
+        _disp = np.ma.masked_where(np.asarray(lab) == 0, np.asarray(lab))
+        ax.imshow(_disp, cmap="nipy_spectral", interpolation="nearest")
+    else:
+        ax.imshow(np.asarray(mask).astype(float), cmap="gray")
+    ax.set_title(title, fontsize=9)
+    ax.axis("off")
+
+
+def _render_cilia_roi_pages(pdf, label, mips, kept_ids=None, props3d=None,
+                            roi_half=26, cols=3, rows=3, max_rois=360,
+                            max_window=70):
+    """Large close-up ROI of every detected cilium drawn on the raw cilia channel
+    with its outline, plus its **nearest basal body** (the spatially-associated
+    one) outlined and marked, with the cilium→BB distance annotated. Each tile is
+    labelled with region properties — true 3-D volume/length when available
+    (``props3d``), otherwise 2-D projected area/length. Cilia are split into kept
+    and non-kept groups."""
+    chan = mips.get("cilia")
+    labmip = mips.get("cilia_labels")
+    if chan is None or labmip is None:
+        return
+    chan = np.asarray(chan, dtype=float)
+    labmip = np.asarray(labmip)
+    if chan.shape != labmip.shape:
+        return
+    bb_labmip = mips.get("bb_labels")
+    if bb_labmip is not None:
+        bb_labmip = np.asarray(bb_labmip)
+        if bb_labmip.shape != labmip.shape:
+            bb_labmip = None
+    props3d = props3d or {}
+
+    ids = np.unique(labmip)
+    ids = ids[ids != 0]
+    if ids.size == 0:
+        return
+
+    # Per-cilium 2-D props + centroids
+    try:
+        rp = regionprops_table(
+            labmip.astype(np.int32),
+            properties=("label", "area", "major_axis_length",
+                        "eccentricity", "centroid"),
+        )
+    except Exception:
+        rp = {"label": ids, "area": np.full(len(ids), np.nan),
+              "major_axis_length": np.full(len(ids), np.nan),
+              "eccentricity": np.full(len(ids), np.nan),
+              "centroid-0": np.zeros(len(ids)), "centroid-1": np.zeros(len(ids))}
+    prop_of = {}
+    for _i, _lab in enumerate(rp["label"]):
+        prop_of[int(_lab)] = {
+            "area": float(rp["area"][_i]),
+            "length": float(rp["major_axis_length"][_i]),
+            "ecc": float(rp["eccentricity"][_i]),
+            "cent": (float(rp["centroid-0"][_i]), float(rp["centroid-1"][_i])),
+        }
+
+    # Basal-body centroids (for nearest-BB association)
+    bb_cents = np.empty((0, 2))
+    if bb_labmip is not None:
+        bb_ids = np.unique(bb_labmip)
+        bb_ids = bb_ids[bb_ids != 0]
+        if bb_ids.size:
+            bb_cents = np.atleast_2d(np.array(
+                center_of_mass(bb_labmip > 0, labels=bb_labmip, index=bb_ids)))
+
+    H, W = labmip.shape
+    lo, hi = np.percentile(chan, (1, 99.5))
+    hi = hi + 1e-8
+    per_page = cols * rows
+
+    if kept_ids is None:
+        groups = [("Detected cilia", [int(i) for i in ids], "#00FF88")]
+    else:
+        kept_set = {int(k) for k in kept_ids}
+        kept = [int(i) for i in ids if int(i) in kept_set]
+        nonkept = [int(i) for i in ids if int(i) not in kept_set]
+        groups = [("Kept cilia", kept, "#00FF88"),
+                  ("Non-kept cilia", nonkept, "#FF5555")]
+
+    def _metric_str(cid):
+        if cid in props3d:
+            _v, _l = props3d[cid]
+            _vs = f"vol {_v:.2f} µm³" if np.isfinite(_v) else "vol —"
+            _ls = f"len {_l:.2f} µm" if np.isfinite(_l) else "len —"
+            return f"{_vs} · {_ls}"
+        p = prop_of.get(cid, {})
+        _a = f"area {p.get('area', float('nan')):.0f} px²"
+        _l = f"len {p.get('length', float('nan')):.1f} px"
+        _e = f"ecc {p['ecc']:.2f}" if np.isfinite(p.get("ecc", np.nan)) else "ecc —"
+        return f"{_a} · {_l} · {_e}"
+
+    def _draw_roi(ax, cid, accent):
+        cy, cx = prop_of.get(cid, {}).get("cent", (H / 2, W / 2))
+        # nearest basal body
+        bb_d, bb_yx = None, None
+        if bb_cents.size:
+            _d = np.hypot(bb_cents[:, 0] - cy, bb_cents[:, 1] - cx)
+            _j = int(np.argmin(_d))
+            bb_d, bb_yx = float(_d[_j]), bb_cents[_j]
+        # window large enough to include the nearest BB (capped)
+        half = roi_half
+        if bb_d is not None:
+            half = int(min(max_window, max(roi_half, bb_d + 10)))
+        y0 = max(0, int(round(cy)) - half)
+        x0 = max(0, int(round(cx)) - half)
+        y1 = min(H, y0 + 2 * half)
+        x1 = min(W, x0 + 2 * half)
+        ax.imshow(chan[y0:y1, x0:x1], cmap="gray", vmin=lo, vmax=hi)
+        _cil = labmip[y0:y1, x0:x1] == cid
+        if _cil.any():
+            ax.contour(_cil.astype(float), levels=[0.5], colors=accent, linewidths=1.3)
+        if bb_labmip is not None:
+            _bb = bb_labmip[y0:y1, x0:x1] > 0
+            if _bb.any():
+                ax.contour(_bb.astype(float), levels=[0.5],
+                           colors="#FF8800", linewidths=1.3)
+            # mark the nearest BB centroid so tiny basal bodies stay visible
+            if bb_yx is not None and y0 <= bb_yx[0] < y1 and x0 <= bb_yx[1] < x1:
+                ax.plot(bb_yx[1] - x0, bb_yx[0] - y0, marker="+",
+                        color="#FF8800", markersize=9, markeredgewidth=1.5)
+        _bb_str = f"BB {bb_d:.0f} px" if bb_d is not None else "no BB"
+        ax.set_title(f"#{cid}   {_metric_str(cid)}\nnearest {_bb_str}",
+                     fontsize=8, pad=3)
+
+    for gname, gids, accent in groups:
+        if not gids:
+            continue
+        n_total = len(gids)
+        n_show = min(n_total, max_rois)
+        truncated = n_total > max_rois
+        for start in range(0, n_show, per_page):
+            page = gids[start:min(start + per_page, n_show)]
+            fig, axes = plt.subplots(rows, cols, figsize=(cols * 4.0, rows * 4.5))
+            axes = np.atleast_2d(axes)
+            fig.suptitle(
+                f"{gname} close-ups — {label}   "
+                f"(#{start + 1}–{start + len(page)} of {n_total})\n"
+                "cilium outline coloured · nearest basal body orange (＋ = its centre)",
+                fontsize=13, fontweight="bold",
+            )
+            for slot in range(per_page):
+                ax = axes.flat[slot]
+                ax.axis("off")
+                if slot < len(page):
+                    _draw_roi(ax, page[slot], accent)
+            if truncated and start + per_page >= n_show:
+                fig.text(0.5, 0.005,
+                         f"… showing first {max_rois} of {n_total} {gname.lower()}",
+                         ha="center", fontsize=9, color="#c0392b")
+            fig.tight_layout(rect=[0, 0.01, 1, 0.94])
+            pdf.savefig(fig)
+            plt.close(fig)
+
+
+def _flag_deviant(records, z_thresh=3.5):
+    """Flag samples whose metrics are robust outliers (modified z-score on
+    median/MAD). Returns {fname: [reasons]}. Needs >=4 samples to judge."""
+    flags = {r["fname"]: [] for r in records}
+    if len(records) < 4:
+        return flags
+    metrics = [
+        ("n_cil_det",  "detected cilia"),
+        ("n_cil_kept", "kept cilia"),
+        ("area_cil",   "cilia area"),
+        ("n_bb_det",   "detected BB"),
+        ("mean_lr",    "mean log_ratio"),
+    ]
+    for key, nice in metrics:
+        vals = np.array([r.get(key, np.nan) for r in records], dtype=float)
+        fin = np.isfinite(vals)
+        if fin.sum() < 4:
+            continue
+        med = np.median(vals[fin])
+        mad = np.median(np.abs(vals[fin] - med))
+        if mad > 0:
+            score, thr = 0.6745 * (vals - med) / mad, z_thresh
+        else:
+            sd = vals[fin].std()
+            if sd == 0:
+                continue
+            score, thr = (vals - vals[fin].mean()) / sd, 2.5
+        for i, r in enumerate(records):
+            if fin[i] and abs(score[i]) > thr:
+                flags[r["fname"]].append(f"{nice} {'high' if vals[i] > med else 'low'}")
+    return flags
+
+
+def _render_qc_overview(pdf, records, flags):
+    """First page: aggregate metrics, per-sample kept-cilia bar chart, and the
+    list of flagged deviant samples."""
+    n = len(records)
+    labels = [r["label"] for r in records]
+    kept = np.array([r["n_cil_kept"] for r in records], dtype=float)
+    det = np.array([r["n_cil_det"] for r in records], dtype=float)
+    lr = np.array([r["mean_lr"] for r in records], dtype=float)
+    lr_fin = lr[np.isfinite(lr)]
+    glob_cls = {}
+    for r in records:
+        for k, v in r["cls"].items():
+            glob_cls[k] = glob_cls.get(k, 0) + v
+    flagged = [r for r in records if flags.get(r["fname"])]
+
+    fig = plt.figure(figsize=(16, 11))
+    fig.suptitle("QC Overview — all samples", fontsize=17, fontweight="bold")
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.0], hspace=0.32, wspace=0.18)
+
+    # Aggregate metrics (top-left)
+    ax_txt = fig.add_subplot(gs[0, 0]); ax_txt.axis("off")
+    _kept_ms = f"{kept.mean():.1f} ± {kept.std():.1f}" if n else "—"
+    _det_ms = f"{det[np.isfinite(det)].mean():.1f}" if np.isfinite(det).any() else "—"
+    _lr_ms = f"{lr_fin.mean():.2f} ± {lr_fin.std():.2f}" if lr_fin.size else "—"
+    _cls_txt = "  ".join(f"{k}={glob_cls.get(k, 0)}"
+                         for k in ("axon", "soma", "ambiguous"))
+    ax_txt.text(
+        0.0, 1.0,
+        f"Samples              : {n}\n"
+        f"Flagged samples      : {len(flagged)}\n"
+        f"{'─' * 34}\n"
+        f"Detected cilia (tot) : {int(np.nansum(det))}   (mean {_det_ms}/sample)\n"
+        f"Kept cilia (tot)     : {int(kept.sum())}   (mean {_kept_ms}/sample)\n"
+        f"Detected BB (tot)    : {sum(r['n_bb_det'] for r in records)}\n"
+        f"Kept BB (tot)        : {sum(r['n_bb_kept'] for r in records)}\n"
+        f"{'─' * 34}\n"
+        f"Mean log_ratio       : {_lr_ms}\n"
+        f"Class distribution   : {_cls_txt}",
+        va="top", ha="left", family="monospace", fontsize=11,
+        transform=ax_txt.transAxes,
+    )
+
+    # Per-sample kept-cilia bar chart (top-right), flagged bars in red
+    ax_bar = fig.add_subplot(gs[0, 1])
+    _colors = ["#e74c3c" if flags.get(r["fname"]) else "#34495e" for r in records]
+    ax_bar.bar(range(n), kept, color=_colors)
+    if n:
+        _med = float(np.median(kept))
+        ax_bar.axhline(_med, ls="--", lw=1, color="gray", label=f"median={_med:.0f}")
+        ax_bar.legend(fontsize=8, loc="upper right")
+    ax_bar.set_xticks(range(n))
+    ax_bar.set_xticklabels(labels, rotation=90, fontsize=7)
+    ax_bar.set_ylabel("Kept cilia")
+    ax_bar.set_title("Kept cilia per sample  (red = flagged)", fontsize=10)
+    ax_bar.spines[["top", "right"]].set_visible(False)
+
+    # Flagged-sample list (bottom, full width)
+    ax_flag = fig.add_subplot(gs[1, :]); ax_flag.axis("off")
+    if n < 4:
+        ax_flag.text(0.0, 1.0,
+                     "Too few samples (<4) to flag statistical outliers.",
+                     va="top", ha="left", color="#7f8c8d", fontsize=12,
+                     transform=ax_flag.transAxes)
+    elif flagged:
+        _lines = ["⚠  Deviant samples flagged (robust modified z-score > 3.5):", ""]
+        for r in records:
+            fr = flags.get(r["fname"], [])
+            if fr:
+                _lines.append(f"   • {r['label']:<14s}  →  " + ", ".join(fr))
+        ax_flag.text(0.0, 1.0, "\n".join(_lines),
+                     va="top", ha="left", color="#c0392b",
+                     family="monospace", fontsize=12,
+                     transform=ax_flag.transAxes)
+    else:
+        ax_flag.text(0.0, 1.0,
+                     "✓  No deviant samples detected — all metrics within robust range.",
+                     va="top", ha="left", color="#27ae60", fontsize=13,
+                     transform=ax_flag.transAxes)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def _build_qc_report_pdf(mip_dir, files, df_kept, df_bb, x_col):
+    """Build a multi-page QC PDF: overview/flags page, one page per sample,
+    and a detailed summary table. Returns bytes."""
+    def _sub(df, fname):
+        if df is None or df.empty or "filename" not in df.columns:
+            return pd.DataFrame()
+        return df[df["filename"] == fname].copy()
+
+    def _label_for(fname):
+        sub = _sub(df_kept, fname)
+        if sub.empty:
+            sub = _sub(df_bb, fname)
+        if not sub.empty and x_col in sub.columns:
+            return str(sub[x_col].iloc[0])
+        return os.path.splitext(os.path.basename(fname))[0]
+
+    def _stats_for(fname):
+        stem = os.path.splitext(os.path.basename(fname))[0]
+        probe = os.path.join(mip_dir, f"{stem}_neurite_mip.npy")
+        mips = (
+            _load_mips(mip_dir, stem, os.path.getmtime(probe))
+            if os.path.exists(probe) else None
+        ) or {}
+        fk = _sub(df_kept, fname)
+        bb_sub = _sub(df_bb, fname)
+        n_cil_det, area_cil, cil_cents, cil_ids = _label_stats(mips.get("cilia_labels"))
+        n_bb_det,  area_bb,  bb_cents,  _bb_ids = _label_stats(mips.get("bb_labels"))
+        _lr = fk["log_ratio"].to_numpy(dtype=float) if "log_ratio" in fk else np.array([])
+        _lr = _lr[np.isfinite(_lr)]
+        return dict(
+            fname=fname, label=_label_for(fname), mips=mips, fk=fk, bb_sub=bb_sub,
+            n_cil_det=n_cil_det, area_cil=area_cil, cil_cents=cil_cents, cil_ids=cil_ids,
+            n_bb_det=n_bb_det, area_bb=area_bb, bb_cents=bb_cents,
+            n_cil_kept=len(fk), n_bb_kept=len(bb_sub),
+            mean_lr=float(_lr.mean()) if _lr.size else float("nan"),
+            cls=(fk["class"].value_counts().to_dict() if "class" in fk else {}),
+        )
+
+    # ── Pass 1: gather per-sample numeric stats, then flag outliers ───────────
+    records = [_stats_for(f) for f in files]
+    flags = _flag_deviant(records)
+
+    summary_rows = []
+    buf = BytesIO()
+    with PdfPages(buf) as pdf:
+        # ── Overview / flags page (first) ─────────────────────────────────────
+        _render_qc_overview(pdf, records, flags)
+
+        # ── Per-sample pages ──────────────────────────────────────────────────
+        for rec in records:
+            fname, label, mips = rec["fname"], rec["label"], rec["mips"]
+            fk = rec["fk"]
+            n_cil_det, area_cil, cil_cents = rec["n_cil_det"], rec["area_cil"], rec["cil_cents"]
+            cil_ids = rec["cil_ids"]
+            n_bb_det, area_bb, bb_cents = rec["n_bb_det"], rec["area_bb"], rec["bb_cents"]
+            n_cil_kept, n_bb_kept, mean_lr = rec["n_cil_kept"], rec["n_bb_kept"], rec["mean_lr"]
+            _cls = rec["cls"]
+
+            summary_rows.append({
+                "Sample": label,
+                "Cilia det.": n_cil_det,
+                "Cilia kept": n_cil_kept,
+                "Cilia area": f"{area_cil:.0f}" if np.isfinite(area_cil) else "—",
+                "BB det.": n_bb_det,
+                "BB kept": n_bb_kept,
+                "BB area": f"{area_bb:.0f}" if np.isfinite(area_bb) else "—",
+                "mean log_ratio": f"{mean_lr:.2f}" if np.isfinite(mean_lr) else "—",
+                "axon": _cls.get("axon", 0),
+                "soma": _cls.get("soma", 0),
+                "amb.": _cls.get("ambiguous", 0),
+                "flag": "⚠" if flags.get(fname) else "",
+            })
+
+            fig, axes = plt.subplots(3, 4, figsize=(16, 11))
+            _fr = flags.get(fname, [])
+            _title = f"QC report — {label}\n{os.path.basename(fname)}"
+            if _fr:
+                _title += "\n⚠ FLAGGED: " + ", ".join(_fr)
+            fig.suptitle(_title, fontsize=14, fontweight="bold",
+                         color=("#c0392b" if _fr else "black"))
+
+            # Row 0 — original channels
+            _qc_show_gray(axes[0, 0], mips.get("cilia"),   "Cilia (raw MIP)")
+            _qc_show_gray(axes[0, 1], mips.get("neurite"), "Neurites (raw MIP)")
+            _qc_show_gray(axes[0, 2], mips.get("bb"),      "Basal Bodies (raw MIP)")
+            _qc_show_gray(axes[0, 3], mips.get("nuclei"),  "Nuclei (raw MIP)")
+
+            # Row 1 — segmentations
+            _qc_show_labels(axes[1, 0], mips.get("cilia_labels"),   "Cilia segmentation")
+            _qc_show_labels(axes[1, 1], mips.get("neurite_labels"), "Neurite segmentation",
+                            mask=mips.get("neurite_mask"))
+            _qc_show_labels(axes[1, 2], mips.get("bb_labels"),      "Basal Body segmentation")
+            _qc_show_labels(axes[1, 3], mips.get("nuclei_labels"),  "Nuclei segmentation")
+
+            # Row 2 — detections + stats (cilia annotated with their label IDs)
+            _qc_show_gray(axes[2, 0], mips.get("cilia"), f"All detected cilia (n={n_cil_det})")
+            if cil_cents.size:
+                axes[2, 0].scatter(cil_cents[:, 1], cil_cents[:, 0], s=18,
+                                   facecolors="none", edgecolors="cyan", linewidths=0.8)
+                for _cc, _cid in zip(cil_cents, cil_ids):
+                    axes[2, 0].text(_cc[1] + 4, _cc[0] - 4, str(int(_cid)),
+                                    color="cyan", fontsize=4, ha="left", va="bottom")
+
+            _qc_show_gray(axes[2, 1], mips.get("cilia"), f"Kept cilia (n={n_cil_kept})")
+            if not fk.empty and "coords" in fk.columns:
+                _c = np.vstack([_parse_coords(c) for c in fk["coords"]])
+                _cols = [_CLASS_PALETTE.get(c, "#888") for c in fk["class"]] \
+                    if "class" in fk.columns else "yellow"
+                axes[2, 1].scatter(_c[:, 2], _c[:, 1], s=18, c=_cols,
+                                   edgecolors="black", linewidths=0.3)
+                if "cilia_id" in fk.columns:
+                    for _cc, _cid in zip(_c, fk["cilia_id"].tolist()):
+                        axes[2, 1].text(_cc[2] + 4, _cc[1] - 4, str(int(_cid)),
+                                        color="white", fontsize=4, ha="left", va="bottom")
+
+            _qc_show_gray(axes[2, 2], mips.get("bb"), f"All detected BB (n={n_bb_det})")
+            if bb_cents.size:
+                axes[2, 2].scatter(bb_cents[:, 1], bb_cents[:, 0], s=18,
+                                   facecolors="none", edgecolors="orange", linewidths=0.8)
+
+            axes[2, 3].axis("off")
+            _area_cil_s = f"{area_cil:.1f} px" if np.isfinite(area_cil) else "—"
+            _area_bb_s  = f"{area_bb:.1f} px"  if np.isfinite(area_bb)  else "—"
+            _mean_lr_s  = f"{mean_lr:.2f}"     if np.isfinite(mean_lr)  else "—"
+            _cls_txt = "  ".join(f"{k}={_cls.get(k, 0)}"
+                                 for k in ("axon", "soma", "ambiguous"))
+            _stats_txt = (
+                f"Counts\n{'─' * 24}\n"
+                f"Detected cilia : {n_cil_det}\n"
+                f"Kept cilia     : {n_cil_kept}\n"
+                f"Mean cilia area: {_area_cil_s}\n\n"
+                f"Detected BB    : {n_bb_det}\n"
+                f"Kept BB        : {n_bb_kept}\n"
+                f"Mean BB area   : {_area_bb_s}\n\n"
+                f"Mean log_ratio : {_mean_lr_s}\n"
+                f"Classes        : {_cls_txt}"
+            )
+            axes[2, 3].text(
+                0.0, 1.0, _stats_txt,
+                va="top", ha="left", family="monospace", fontsize=10,
+                transform=axes[2, 3].transAxes,
+            )
+
+            fig.tight_layout(rect=[0, 0, 1, 0.95])
+            pdf.savefig(fig)
+            plt.close(fig)
+
+            # Close-up ROIs of every detected cilium (+ nearest basal body),
+            # split into kept vs non-kept, with 3-D volume/length when available
+            _kept_ids = (
+                fk["cilia_id"].tolist()
+                if not fk.empty and "cilia_id" in fk.columns else []
+            )
+            _props3d = {}
+            if not fk.empty and {"cilia_id", "volume_um3", "length_um"} <= set(fk.columns):
+                for _cid, _v, _l in zip(fk["cilia_id"], fk["volume_um3"], fk["length_um"]):
+                    try:
+                        _props3d[int(_cid)] = (float(_v), float(_l))
+                    except (TypeError, ValueError):
+                        pass
+            _render_cilia_roi_pages(pdf, label, mips, kept_ids=_kept_ids, props3d=_props3d)
+
+        # ── Summary page ──────────────────────────────────────────────────────
+        _sdf = pd.DataFrame(summary_rows)
+        n = max(1, len(_sdf))
+        fig, ax = plt.subplots(figsize=(16, 1.4 + 0.45 * n))
+        ax.axis("off")
+        ax.set_title("Summary — all samples  (⚠ = flagged as deviant)",
+                     fontsize=14, fontweight="bold", loc="left")
+        if not _sdf.empty:
+            tbl = ax.table(cellText=_sdf.values, colLabels=_sdf.columns,
+                           loc="center", cellLoc="center")
+            tbl.auto_set_font_size(False)
+            tbl.set_fontsize(8)
+            tbl.scale(1, 1.4)
+            for _j in range(len(_sdf.columns)):
+                tbl[0, _j].set_facecolor("#34495e")
+                tbl[0, _j].set_text_props(color="white", fontweight="bold")
+            # Tint flagged rows
+            for _i in range(len(_sdf)):
+                if _sdf.iloc[_i]["flag"]:
+                    for _j in range(len(_sdf.columns)):
+                        tbl[_i + 1, _j].set_facecolor("#fdecea")
+                        tbl[_i + 1, _j].set_text_props(color="#c0392b")
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+
     return buf.getvalue()
 
 
@@ -433,6 +981,7 @@ _JSON_SS_MAP = [
     (("neurites", "spot_sigma"),                           "neurite_sigma",        int),
     (("cilia", "min_size"),                                "cilia_min_size",       int),
     (("cilia", "max_size"),                                "cilia_max_size",       int),
+    # cilia/basal_bodies "gaussian_sigma" are 3-element lists handled separately below
     (("basal_bodies", "spot_sigma"),                       "bb_spot_sigma",        float),
     (("basal_bodies", "outline_sigma"),                    "bb_outline_sigma",     float),
     (("basal_bodies", "min_size"),                         "bb_min_size",          int),
@@ -486,17 +1035,37 @@ _SS_DEFAULTS: dict = {
     "logs_paused":         False,
     "custom_plot_png":     None,
     "thread_result":       {},
+    "_custom_ov_bytes":    None,
+    "_custom_ov_ext":      "png",
+    "_custom_ov_mime":     "image/png",
     # Segmentation parameters (keyed so JSON reload works)
     "p_low":               2,
     "p_high":              98,
     "nuclei_sigma":        15,
     "tophat_radius":       12,
     "nuclei_outline_sigma": 3,
+    "nuclei_gauss_on":     False,
+    "nuclei_gauss_z":      1.0,
+    "nuclei_gauss_y":      1.0,
+    "nuclei_gauss_x":      1.0,
+    "nuclei_log":          False,
     "neurite_sigma":       5,
+    "neurite_gauss_on":    False,
+    "neurite_gauss_z":     1.0,
+    "neurite_gauss_y":     1.0,
+    "neurite_gauss_x":     1.0,
+    "neurite_log":         False,
+    "cilia_log":           False,
+    "bb_log":              False,
+    "cilia_gauss_on":      True,
+    "cilia_gauss_z":       1.0,
+    "cilia_gauss_y":       1.0,
+    "cilia_gauss_x":       1.0,
     "cilia_min_size":      20,
     "cilia_max_size":      0,
     "bb_spot_sigma":       2.0,
     "bb_outline_sigma":    2.0,
+    "bb_gauss_on":         True,
     "bb_gauss_z":          1.0,
     "bb_gauss_y":          1.0,
     "bb_gauss_x":          0.0,
@@ -527,11 +1096,18 @@ if "_pending_params" in st.session_state:
             _node = _node.get(_k) if isinstance(_node, dict) else None
         if _node is not None:
             st.session_state[_ss_key] = _cast(_node)
-    _gs = _qd.get("basal_bodies", {}).get("gaussian_sigma")
-    if _gs and len(_gs) >= 3:
-        st.session_state["bb_gauss_z"] = float(_gs[0])
-        st.session_state["bb_gauss_y"] = float(_gs[1])
-        st.session_state["bb_gauss_x"] = float(_gs[2])
+    # Per-channel Gaussian pre-blur + log transform: restore from JSON
+    for _sec, _pre in (("cilia", "cilia"), ("basal_bodies", "bb"),
+                       ("nuclei", "nuclei"), ("neurites", "neurite")):
+        _gs = _qd.get(_sec, {}).get("gaussian_sigma")
+        if _gs and len(_gs) >= 3:
+            st.session_state[f"{_pre}_gauss_z"] = float(_gs[0])
+            st.session_state[f"{_pre}_gauss_y"] = float(_gs[1])
+            st.session_state[f"{_pre}_gauss_x"] = float(_gs[2])
+            st.session_state[f"{_pre}_gauss_on"] = any(float(s) > 0 for s in _gs[:3])
+        _lt = _qd.get(_sec, {}).get("log_transform")
+        if _lt is not None:
+            st.session_state[f"{_pre}_log"] = bool(_lt)
 
 # Sync completed thread result → session_state (thread cannot write session_state directly)
 if st.session_state.pipeline_running:
@@ -613,6 +1189,11 @@ with st.sidebar:
         default=r"segmenters\cilia-segmenter.cl",
     )
 
+    # Expose resolved paths so other pages (e.g. Preview) can reuse them
+    st.session_state["_resolved_input"] = input_path
+    st.session_state["_resolved_output"] = output_path
+    st.session_state["_resolved_classifier"] = classifier_path
+
     st.markdown("---")
 
     # ── Channel Assignment ────────────────────────────────────────────────────
@@ -635,7 +1216,7 @@ with st.sidebar:
     # Primary: full visual viewer
     if _file_info:
         if st.button("🔭 Open Channel Viewer", key="ch_viewer_btn",
-                     use_container_width=True, type="primary"):
+                     width="stretch", type="primary"):
             # Clear dialog assignment state so it initialises from current sidebar values
             for _, _sk, _ in _DIALOG_ROLES:
                 st.session_state.pop(f"_dassign_{_sk}", None)
@@ -646,19 +1227,19 @@ with st.sidebar:
     # Fallback: compact selectboxes for quick edits without opening the dialog
     with st.expander("⚙️ Manual override", expanded=False):
         cilia_channel = st.selectbox(
-            "Cilia", _ch_opts, index=min(0, _n_ch - 1), key="ch_cilia",
+            "Cilia", _ch_opts, key="ch_cilia",
             help="🔄 Raw channel fed to the ML cilia segmenter",
         )
         neurites_channel = st.selectbox(
-            "Neurites", _ch_opts, index=min(1, _n_ch - 1), key="ch_neurites",
+            "Neurites", _ch_opts, key="ch_neurites",
             help="🔄 Normalised channel used for neurite tracing",
         )
         basal_bodies_channel = st.selectbox(
-            "Basal bodies", _ch_opts, index=min(2, _n_ch - 1), key="ch_bb",
+            "Basal bodies", _ch_opts, key="ch_bb",
             help="🔄 Raw channel used for basal body detection",
         )
         nuclei_channel = st.selectbox(
-            "Nuclei (DAPI)", _ch_opts, index=min(3, _n_ch - 1), key="ch_nuclei",
+            "Nuclei (DAPI)", _ch_opts, key="ch_nuclei",
             help="🔄 Normalised channel used for nucleus segmentation",
         )
 
@@ -726,14 +1307,81 @@ with st.sidebar:
             "Outline sigma", 0, 10, step=1, key="nuclei_outline_sigma",
             help="🔄 Boundary-precision smoothing for nuclei labeling"
         )
+        nuclei_log = st.checkbox(
+            "Log-normalize intensities", key="nuclei_log",
+            help="🔄 Apply a log1p transform to the nuclei channel before "
+                 "segmentation (compresses dynamic range)."
+        )
+        nuclei_gauss_on = st.checkbox(
+            "Apply Gaussian blur", key="nuclei_gauss_on",
+            help="🔄 Optional Gaussian pre-blur before nuclei segmentation"
+        )
+        nuclei_gauss_z = st.slider(
+            "Gaussian σ_z", 0.0, 5.0, step=0.5, key="nuclei_gauss_z",
+            disabled=not nuclei_gauss_on, help="🔄 Gaussian blur sigma along Z"
+        )
+        nuclei_gauss_y = st.slider(
+            "Gaussian σ_y", 0.0, 5.0, step=0.5, key="nuclei_gauss_y",
+            disabled=not nuclei_gauss_on, help="🔄 Gaussian blur sigma along Y"
+        )
+        nuclei_gauss_x = st.slider(
+            "Gaussian σ_x", 0.0, 5.0, step=0.5, key="nuclei_gauss_x",
+            disabled=not nuclei_gauss_on, help="🔄 Gaussian blur sigma along X"
+        )
 
     with st.expander("🧵 Neurites", expanded=True):
         neurite_sigma = st.slider(
             "Spot sigma", 1, 20, step=1, key="neurite_sigma",
             help="🔄 Voronoi-Otsu object-separation scale for neurite detection"
         )
+        neurite_log = st.checkbox(
+            "Log-normalize intensities", key="neurite_log",
+            help="🔄 Apply a log1p transform to the neurite channel before "
+                 "segmentation (compresses dynamic range)."
+        )
+        neurite_gauss_on = st.checkbox(
+            "Apply Gaussian blur", key="neurite_gauss_on",
+            help="🔄 Optional Gaussian pre-blur before neurite segmentation"
+        )
+        neurite_gauss_z = st.slider(
+            "Gaussian σ_z", 0.0, 5.0, step=0.5, key="neurite_gauss_z",
+            disabled=not neurite_gauss_on, help="🔄 Gaussian blur sigma along Z"
+        )
+        neurite_gauss_y = st.slider(
+            "Gaussian σ_y", 0.0, 5.0, step=0.5, key="neurite_gauss_y",
+            disabled=not neurite_gauss_on, help="🔄 Gaussian blur sigma along Y"
+        )
+        neurite_gauss_x = st.slider(
+            "Gaussian σ_x", 0.0, 5.0, step=0.5, key="neurite_gauss_x",
+            disabled=not neurite_gauss_on, help="🔄 Gaussian blur sigma along X"
+        )
 
     with st.expander("🎯 Cilia", expanded=True):
+        cilia_log = st.checkbox(
+            "Log-normalize intensities", key="cilia_log",
+            help="🔄 Apply a log1p transform before the APOC classifier. "
+                 "⚠️ The classifier is trained on raw intensities — enabling this "
+                 "changes the feature space and may hurt results."
+        )
+        cilia_gauss_on = st.checkbox(
+            "Apply Gaussian blur", key="cilia_gauss_on",
+            help="🔄 Optional Gaussian pre-blur before the APOC classifier"
+        )
+        cilia_gauss_z = st.slider(
+            "Gaussian σ_z", 0.0, 5.0, step=0.5, key="cilia_gauss_z",
+            disabled=not cilia_gauss_on,
+            help="🔄 Gaussian blur sigma along Z before cilia segmentation"
+        )
+        cilia_gauss_y = st.slider(
+            "Gaussian σ_y", 0.0, 5.0, step=0.5, key="cilia_gauss_y",
+            disabled=not cilia_gauss_on,
+            help="🔄 Gaussian blur sigma along Y before cilia segmentation"
+        )
+        cilia_gauss_x = st.slider(
+            "Gaussian σ_x", 0.0, 5.0, step=0.5, key="cilia_gauss_x",
+            disabled=not cilia_gauss_on,
+            help="🔄 Gaussian blur sigma along X before cilia segmentation"
+        )
         cilia_min_size = st.number_input(
             "Min size (voxels)", min_value=0, step=1, key="cilia_min_size",
             help="🔄 Remove cilia smaller than this many voxels (noise filter). 0 = disabled."
@@ -752,17 +1400,28 @@ with st.sidebar:
             "Outline sigma", 0.5, 10.0, step=0.5, key="bb_outline_sigma",
             help="🔄 Boundary-precision smoothing for basal body labeling"
         )
-        st.caption("Gaussian pre-blur (applied before Voronoi-Otsu)")
+        bb_log = st.checkbox(
+            "Log-normalize intensities", key="bb_log",
+            help="🔄 Apply a log1p transform to the basal-body channel before "
+                 "segmentation (compresses dynamic range)."
+        )
+        bb_gauss_on = st.checkbox(
+            "Apply Gaussian blur", key="bb_gauss_on",
+            help="🔄 Optional Gaussian pre-blur before Voronoi-Otsu"
+        )
         bb_gauss_z = st.slider(
             "Gaussian σ_z", 0.0, 5.0, step=0.5, key="bb_gauss_z",
+            disabled=not bb_gauss_on,
             help="🔄 Gaussian blur sigma along Z before basal body segmentation"
         )
         bb_gauss_y = st.slider(
             "Gaussian σ_y", 0.0, 5.0, step=0.5, key="bb_gauss_y",
+            disabled=not bb_gauss_on,
             help="🔄 Gaussian blur sigma along Y before basal body segmentation"
         )
         bb_gauss_x = st.slider(
             "Gaussian σ_x", 0.0, 5.0, step=0.5, key="bb_gauss_x",
+            disabled=not bb_gauss_on,
             help="🔄 Gaussian blur sigma along X before basal body segmentation"
         )
         bb_min_size = st.number_input(
@@ -897,11 +1556,30 @@ if run_clicked:
             basal_bodies_channel=int(basal_bodies_channel),
             nuclei_channel=int(nuclei_channel),
             use_mip=bool(use_mip),
+            cilia_gaussian_sigma=(
+                (float(cilia_gauss_z), float(cilia_gauss_y), float(cilia_gauss_x))
+                if cilia_gauss_on else (0.0, 0.0, 0.0)
+            ),
+            nuclei_gaussian_sigma=(
+                (float(nuclei_gauss_z), float(nuclei_gauss_y), float(nuclei_gauss_x))
+                if nuclei_gauss_on else (0.0, 0.0, 0.0)
+            ),
+            neurite_gaussian_sigma=(
+                (float(neurite_gauss_z), float(neurite_gauss_y), float(neurite_gauss_x))
+                if neurite_gauss_on else (0.0, 0.0, 0.0)
+            ),
+            cilia_log=bool(cilia_log),
+            nuclei_log=bool(nuclei_log),
+            neurite_log=bool(neurite_log),
+            bb_log=bool(bb_log),
             cilia_min_size=int(cilia_min_size),
             cilia_max_size=int(cilia_max_size),
             bb_spot_sigma=float(bb_spot_sigma),
             bb_outline_sigma=float(bb_outline_sigma),
-            bb_gaussian_sigma=(float(bb_gauss_z), float(bb_gauss_y), float(bb_gauss_x)),
+            bb_gaussian_sigma=(
+                (float(bb_gauss_z), float(bb_gauss_y), float(bb_gauss_x))
+                if bb_gauss_on else (0.0, 0.0, 0.0)
+            ),
             bb_min_size=int(bb_min_size),
             bb_max_size=int(bb_max_size),
             ratio_epsilon=float(ratio_epsilon),
@@ -919,19 +1597,8 @@ if run_clicked:
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DERIVED PATHS
-# ─────────────────────────────────────────────────────────────────────────────
 # DERIVED PATHS — resolve latest lc-analysis-* run directory automatically
 # ─────────────────────────────────────────────────────────────────────────────
-def _find_latest_run_dir(base: str) -> str | None:
-    """Return the most recent lc-analysis-YYYY-MM-DD_HH-MM-SS subfolder."""
-    if not base or not os.path.isdir(base):
-        return None
-    runs = sorted(
-        d for d in os.listdir(base)
-        if d.startswith("lc-analysis-") and os.path.isdir(os.path.join(base, d))
-    )
-    return os.path.join(base, runs[-1]) if runs else None
 
 
 _sel_run_name = st.session_state.get("_sel_run")
@@ -1295,7 +1962,9 @@ with tab_graphs:
                             ax=_ax_g, color="#C0622F", alpha=0.75,
                             line_kws={"linewidth": 1.5, "color": "#7A3A18"},
                             edgecolor="white", linewidth=0.4,
+                            kde_kws={"cut": 0},  # ratio ≥ 0 — don't extend KDE below 0
                         )
+                        _ax_g.set_xlim(left=0)
                         _ax_g.set_xlabel("Ratio", fontsize=9, labelpad=6)
                         _ax_g.set_ylabel("Count", fontsize=9, labelpad=6)
 
@@ -1323,7 +1992,8 @@ with tab_graphs:
                         _ax_g.tick_params(axis="x", rotation=45, labelsize=8)
                         _ax_g.legend(
                             title="Class", title_fontsize=8, fontsize=8,
-                            frameon=False, loc="upper right",
+                            frameon=False,
+                            loc="upper left", bbox_to_anchor=(1.0, 1.0),
                         )
                     else:
                         _ok = False
@@ -1385,7 +2055,9 @@ with tab_graphs:
                     data=_ratio_data, x=_x_col, y="ratio",
                     hue=_x_col, legend=False, ax=_ax_ratio,
                     palette="Set2", width=0.6, linewidth=0.8,
+                    cut=0,  # clip KDE to data range — ratio is strictly ≥ 0
                 )
+                _ax_ratio.set_ylim(bottom=0)  # ratio is ≥ 0 — no negative axis margin
                 _ax_ratio.set_xlabel(_x_col, fontsize=9, labelpad=6)
                 _ax_ratio.set_ylabel("Ratio", fontsize=9, labelpad=6)
                 _ax_ratio.tick_params(axis="x", rotation=45, labelsize=8)
@@ -1407,6 +2079,62 @@ with tab_graphs:
             except Exception as _re:
                 st.warning(f"Could not render ratio distribution: {_re}")
             plt.close(_fig_ratio)
+
+        # ── Log-Ratio KDE per Sample ──────────────────────────────────────────
+        if "log_ratio" in _df_kept.columns and not _df_kept.empty:
+            st.markdown("---")
+            st.subheader("📊 Log-Ratio KDE per Sample")
+            st.caption(
+                "Kernel density estimate per sample — dashed lines show axon (red) "
+                "and soma (blue) classification thresholds."
+            )
+            _kde_samples = sorted(_df_kept[_x_col].dropna().unique())
+            _kde_many = len(_kde_samples) > 12
+            # Wide figure when many samples so the plot area is not squeezed
+            _kde_figw = max(10, min(16, 8 + len(_kde_samples) * 0.15)) if not _kde_many else 10
+            _fig_kde, _ax_kde = plt.subplots(figsize=(_kde_figw, 4))
+            try:
+                _kde_palette = sns.color_palette("tab10", n_colors=len(_kde_samples))
+                for _si, _sname in enumerate(_kde_samples):
+                    _sdata = _df_kept[_df_kept[_x_col] == _sname]["log_ratio"].dropna()
+                    if len(_sdata) > 1:
+                        sns.kdeplot(
+                            _sdata, ax=_ax_kde, color=_kde_palette[_si],
+                            label=None if _kde_many else str(_sname),
+                            linewidth=1.5, fill=False,
+                        )
+                _ax_kde.axvline(float(pf_axon_thr), color="#C0392B", linestyle="--",
+                                linewidth=1.4, label=f"axon > {pf_axon_thr}")
+                _ax_kde.axvline(float(pf_soma_thr), color="#2980B9", linestyle="--",
+                                linewidth=1.4, label=f"soma < {pf_soma_thr}")
+                _ax_kde.set_xlabel("log_ratio", fontsize=9, labelpad=6)
+                _ax_kde.set_ylabel("Density", fontsize=9, labelpad=6)
+                _ax_kde.spines["top"].set_visible(False)
+                _ax_kde.spines["right"].set_visible(False)
+                _ax_kde.yaxis.grid(True, linestyle="--", linewidth=0.5,
+                                   color="#CCCCCC", alpha=0.7, zorder=0)
+                _ax_kde.set_axisbelow(True)
+                _n_lbl = f" ({len(_kde_samples)} samples, colors not labelled)" if _kde_many else ""
+                _ax_kde.set_title(
+                    f"Log-Ratio KDE per Sample{_n_lbl}",
+                    fontsize=10, fontweight="bold", pad=8, loc="left",
+                )
+                if _kde_many:
+                    # Only threshold lines in legend — placed inside the axes (top-right)
+                    _ax_kde.legend(loc="upper right", fontsize=9, frameon=False)
+                else:
+                    _ax_kde.legend(loc="upper left", bbox_to_anchor=(1.0, 1.0),
+                                   fontsize=8, frameon=False)
+                plt.tight_layout()
+                _png_kde = _fig_to_png(_fig_kde)
+                st.pyplot(_fig_kde, width="stretch")
+                st.download_button(
+                    "⬇️ Log-Ratio KDE per Sample (PNG)", _png_kde,
+                    "logratio_kde_per_sample.png", "image/png", key="dl_kde",
+                )
+            except Exception as _kde_e:
+                st.warning(f"Could not render KDE plot: {_kde_e}")
+            plt.close(_fig_kde)
 
         st.markdown("---")
 
@@ -1453,6 +2181,11 @@ with tab_graphs:
                     "Bins", 5, 200, 50, key="cp_bins",
                     disabled=_ptype != "histogram",
                 )
+                _show_points = st.checkbox(
+                    "Overlay sample points", key="cp_points",
+                    help="Overlay individual data points (strip plot) on box/violin plots.",
+                    disabled=_ptype not in ("box", "violin"),
+                )
             with _pp2:
                 _log_x = st.checkbox("Log X scale", key="cp_log_x")
                 _log_y = st.checkbox("Log Y scale", key="cp_log_y")
@@ -1482,10 +2215,17 @@ with tab_graphs:
                     elif _ptype == "box":
                         sns.boxplot(data=_df_kept, x=_cat_x, y=_x_axis,
                                     hue=_cat_x, legend=False, ax=_ax_cp, palette="tab10")
+                        if _show_points:
+                            sns.stripplot(data=_df_kept, x=_cat_x, y=_x_axis, ax=_ax_cp,
+                                          size=3, color="black", alpha=0.45, jitter=True)
                         _ax_cp.tick_params(axis="x", rotation=45)
                     elif _ptype == "violin":
                         sns.violinplot(data=_df_kept, x=_cat_x, y=_x_axis,
-                                       hue=_cat_x, legend=False, ax=_ax_cp, palette="tab10")
+                                       hue=_cat_x, legend=False, ax=_ax_cp, palette="tab10",
+                                       cut=0)  # clip KDE tails to the data range
+                        if _show_points:
+                            sns.stripplot(data=_df_kept, x=_cat_x, y=_x_axis, ax=_ax_cp,
+                                          size=3, color="black", alpha=0.45, jitter=True)
                         _ax_cp.tick_params(axis="x", rotation=45)
                     elif _ptype == "kde":
                         sns.kdeplot(data=_df_kept, x=_x_axis, hue=_hue,
@@ -1514,6 +2254,141 @@ with tab_graphs:
                     "custom_plot.png", "image/png", key="dl_custom",
                 )
 
+        st.markdown("---")
+
+        # ── Interactive Explorer (Plotly) ─────────────────────────────────────
+        st.subheader("⚡ Interactive Explorer")
+
+        if not _PLOTLY_AVAILABLE:
+            st.info("Install `plotly` to enable the interactive explorer: `pip install plotly`")
+        elif _df_kept.empty:
+            st.info("No cilia data available.")
+        else:
+            _num_cols_px = (
+                _df_kept.select_dtypes(include=[np.number]).columns.tolist()
+            )
+            _cat_cols_px = (
+                _df_kept.select_dtypes(exclude=[np.number]).columns.tolist()
+            )
+            _px_kind = st.radio(
+                "Plot type",
+                ["Scatter", "KDE histogram"],
+                horizontal=True,
+                key="px_kind",
+            )
+
+            _ip1, _ip2, _ip3 = st.columns(3)
+            with _ip1:
+                _px_x = st.selectbox(
+                    "X axis" if _px_kind == "Scatter" else "Variable",
+                    _num_cols_px,
+                    index=_num_cols_px.index("log_ratio") if "log_ratio" in _num_cols_px else 0,
+                    key="px_x",
+                )
+            with _ip2:
+                _px_y_opts = _num_cols_px
+                _px_y_def = (
+                    _px_y_opts.index("distance_to_neurite_um")
+                    if "distance_to_neurite_um" in _px_y_opts
+                    else min(1, len(_px_y_opts) - 1)
+                )
+                _px_y = st.selectbox(
+                    "Y axis", _px_y_opts, index=_px_y_def, key="px_y",
+                    disabled=(_px_kind != "Scatter"),
+                )
+            with _ip3:
+                _px_color_opts = ["class", _x_col] + [
+                    c for c in _cat_cols_px if c not in ("class", _x_col)
+                ]
+                _px_color = st.selectbox(
+                    "Color by" if _px_kind == "Scatter" else "Group by",
+                    _px_color_opts, key="px_color",
+                )
+
+            if _px_kind == "KDE histogram":
+                _n_grp = (
+                    int(_df_kept[_px_color].nunique())
+                    if _px_color in _df_kept.columns else 1
+                )
+                _px_hist = st.checkbox(
+                    "Show histogram bars",
+                    value=(_n_grp <= 2),
+                    key="px_hist",
+                    help="With many groups the bars overlap into noise — "
+                         "turn this off to show only the smooth KDE curves.",
+                )
+
+            try:
+                if _px_kind == "Scatter":
+                    _px_hover = [
+                        c for c in ["cilia_id", "filename", "log_ratio",
+                                     "dt_neurite", "dt_nuclei", "coords"]
+                        if c in _df_kept.columns
+                    ]
+                    _px_fig = _px.scatter(
+                        _df_kept,
+                        x=_px_x,
+                        y=_px_y,
+                        color=_px_color if _px_color in _df_kept.columns else None,
+                        hover_data=_px_hover,
+                        opacity=0.65,
+                        color_discrete_map=(_CLASS_PALETTE if _px_color == "class" else None),
+                        height=460,
+                    )
+                    _px_fig.update_traces(marker_size=5)
+                else:
+                    # KDE histogram: one density curve + histogram per group.
+                    # Drop non-finite values (NaN/±inf) — gaussian_kde rejects them.
+                    def _finite(series):
+                        _a = series.to_numpy(dtype=float)
+                        return _a[np.isfinite(_a)]
+
+                    _grp_data, _grp_labels, _grp_colors = [], [], []
+                    if _px_color in _df_kept.columns and _df_kept[_px_color].nunique() > 1:
+                        for _g, _sub in _df_kept.groupby(_px_color):
+                            _vals = _finite(_sub[_px_x])
+                            if _vals.size > 1 and _vals.std() > 0:
+                                _grp_data.append(_vals)
+                                _grp_labels.append(str(_g))
+                                _grp_colors.append(
+                                    _CLASS_PALETTE.get(str(_g)) if _px_color == "class" else None
+                                )
+                    else:
+                        _vals = _finite(_df_kept[_px_x])
+                        if _vals.size > 1 and _vals.std() > 0:
+                            _grp_data.append(_vals)
+                            _grp_labels.append(_px_x)
+                            _grp_colors.append(None)
+
+                    if not _grp_data:
+                        st.info(
+                            "Not enough finite, varying data to build a KDE histogram "
+                            f"for **{_px_x}**."
+                        )
+                        raise StopIteration
+                    _colors_arg = _grp_colors if all(_grp_colors) else None
+                    _px_fig = _ff.create_distplot(
+                        _grp_data, _grp_labels,
+                        colors=_colors_arg,
+                        show_hist=_px_hist,
+                        show_rug=False,
+                    )
+                    _px_fig.update_layout(height=460, xaxis_title=_px_x, yaxis_title="Density")
+
+                _px_fig.update_layout(
+                    plot_bgcolor="white",
+                    paper_bgcolor="white",
+                    margin=dict(l=50, r=160, t=40, b=50),
+                    legend=dict(orientation="v", x=1.02, y=1.0),
+                    xaxis=dict(showgrid=True, gridcolor="#E5E5E5", zeroline=False),
+                    yaxis=dict(showgrid=True, gridcolor="#E5E5E5", zeroline=False),
+                )
+                st.plotly_chart(_px_fig, width="stretch")
+            except StopIteration:
+                pass
+            except Exception as _pxe:
+                st.warning(f"Could not render interactive plot: {_pxe}")
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TAB 4 — OVERLAYS
@@ -1521,14 +2396,52 @@ with tab_graphs:
 with tab_overlays:
     st.subheader("🔬 Overlays")
     st.caption(
-        "2×2 MIP overlay — updates live as you adjust ⚡ Post-Segmentation Filters. "
-        "The pipeline-saved PNG (in the output folder) shows **all** detected cilia before "
-        "any NN filter; the interactive overlay below reflects your current filter settings."
+        "Live overlay — updates with ⚡ Post-Segmentation Filters. "
+        "Channel panels show raw MIPs with segmentation contours. "
+        "Use the **Custom Overlay Builder** to compose and export a custom figure."
     )
 
     if not _data_ready or (_df_kept.empty and _df_removed.empty):
         st.info("Run the pipeline first to generate overlay data.")
     else:
+        # ── QC PDF report (all samples) ───────────────────────────────────────
+        with st.expander("📄 QC PDF Report (all samples)", expanded=False):
+            st.caption(
+                "One document with, per sample: original channels, segmentations, "
+                "all detected cilia/basal bodies, kept cilia, close-up ROIs of every "
+                "detected cilium with its outline (for visual QC of segmentation), "
+                "plus a summary table of counts and mean areas. Requires a run that "
+                "saved channel/label MIPs (older runs show only the channels they stored)."
+            )
+            _rep_files = sorted(
+                set(
+                    (_df_kept["filename"].dropna().unique().tolist()
+                     if "filename" in _df_kept.columns else [])
+                    + (_df_bb["filename"].dropna().unique().tolist()
+                       if not _df_bb.empty and "filename" in _df_bb.columns else [])
+                )
+            )
+            if st.button("🛠 Generate report", key="qc_report_btn"):
+                if not _rep_files:
+                    st.warning("No samples available to report.")
+                else:
+                    with st.spinner(f"Building QC report for {len(_rep_files)} sample(s)…"):
+                        try:
+                            _pdf_bytes = _build_qc_report_pdf(
+                                _mip_dir, _rep_files, _df_kept, _df_bb, _x_col
+                            )
+                            st.session_state["_qc_report_pdf"] = _pdf_bytes
+                        except Exception as _rep_e:
+                            st.error(f"Could not build report: {_rep_e}")
+            if st.session_state.get("_qc_report_pdf"):
+                st.download_button(
+                    "⬇ Download QC report (PDF)",
+                    data=st.session_state["_qc_report_pdf"],
+                    file_name=f"qc_report_{os.path.basename(_run_dir)}.pdf",
+                    mime="application/pdf",
+                    key="qc_report_dl",
+                )
+
         # ── Controls ──────────────────────────────────────────────────────────
         _ovc1, _ovc2 = st.columns([3, 2])
 
@@ -1577,7 +2490,6 @@ with tab_overlays:
                 except Exception:
                     pass
 
-            # Try to load MIP arrays saved by pipeline; fall back to saved PNG
             _mip_probe = os.path.join(_mip_dir, f"{_stem}_neurite_mip.npy")
             _mip_mtime = os.path.getmtime(_mip_probe) if os.path.exists(_mip_probe) else 0.0
             _mips = _load_mips(_mip_dir, _stem, _mip_mtime)
@@ -1597,30 +2509,7 @@ with tab_overlays:
                 else:
                     st.info("No overlay PNG found either.")
             else:
-                # ── 2×2 MIP-backed figure (identical layout to pipeline.py) ──
-                _fig_ov, _axes_ov = plt.subplots(2, 2, figsize=(14, 10))
-
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    _ratio_log = np.where(
-                        np.isfinite(_mips["ratio"]), np.log(_mips["ratio"]), np.nan
-                    )
-
-                # Ratio panel only: NaN outside neurites → black background
-                _cmap_ratio = plt.cm.coolwarm.copy()
-                _cmap_ratio.set_bad("black")
-
-                # [0,0] Cilia MIP  [0,1] log(ratio) masked
-                # [1,0] Nuclei MIP [1,1] Cilia MIP
-                _axes_ov[0, 0].imshow(_mips["cilia"], cmap="gray")
-                _axes_ov[0, 0].set_title("Cilia MIP")
-                _axes_ov[0, 1].imshow(_ratio_log, cmap=_cmap_ratio)
-                _axes_ov[0, 1].set_title("log(ratio) — neurite masked")
-                _axes_ov[1, 0].imshow(_mips["nuclei"], cmap="gray")
-                _axes_ov[1, 0].set_title("Nuclei MIP")
-                _axes_ov[1, 1].imshow(_mips["cilia"], cmap="gray")
-                _axes_ov[1, 1].set_title("Cilia MIP")
-
-                # Colour scale from kept-cilia log_ratio (5th–95th percentile of finite values)
+                # ── Shared scatter data ────────────────────────────────────────
                 _scores_ov = (
                     _fk["log_ratio"].values.astype(float) if "log_ratio" in _fk.columns
                     else np.array([])
@@ -1628,52 +2517,110 @@ with tab_overlays:
                 _valid_ov = _scores_ov[np.isfinite(_scores_ov)] if len(_scores_ov) else np.array([])
                 _vmin_ov, _vmax_ov = (
                     (float(np.percentile(_valid_ov, 5)), float(np.percentile(_valid_ov, 95)))
-                    if len(_valid_ov) > 0 else (0.0, 1.0)
+                    if len(_valid_ov) > 1 else (0.0, 1.0)
                 )
 
-                # Kept cilia — dots on all four panels, no score clamping
-                if not _fk.empty and "coords" in _fk.columns and len(_scores_ov) > 0:
-                    try:
-                        _coords_k = np.array([_parse_coords(c) for c in _fk["coords"]])
-                        _ys_k, _xs_k = _coords_k[:, 1], _coords_k[:, 2]
-                        for _ax_ov in _axes_ov.flat:
-                            _ax_ov.scatter(
-                                _xs_k, _ys_k,
-                                c=_scores_ov, cmap="coolwarm",
-                                vmin=_vmin_ov, vmax=_vmax_ov,
-                                s=_dot_size, edgecolor="black", linewidth=0.3,
-                                zorder=3,
-                            )
-                    except Exception as _esc:
-                        st.warning(f"Could not plot kept cilia: {_esc}")
+                def _scatter_cilia(ax, dot_sz):
+                    if not _fk.empty and "coords" in _fk.columns and len(_scores_ov) > 0:
+                        try:
+                            _ck = np.array([_parse_coords(c) for c in _fk["coords"]])
+                            ax.scatter(_ck[:, 2], _ck[:, 1],
+                                       c=_scores_ov, cmap="coolwarm",
+                                       vmin=_vmin_ov, vmax=_vmax_ov,
+                                       s=dot_sz, edgecolor="black", linewidth=0.3, zorder=4)
+                        except Exception:
+                            pass
+                    if _show_removed and not _fr.empty and "coords" in _fr.columns:
+                        try:
+                            _cr = np.array([_parse_coords(c) for c in _fr["coords"]])
+                            ax.scatter(_cr[:, 2], _cr[:, 1], c="red",
+                                       s=dot_sz, marker="x", linewidth=0.8, alpha=0.7, zorder=4)
+                        except Exception:
+                            pass
 
-                # NN-removed cilia — red × on all 4 panels
-                if _show_removed and not _fr.empty and "coords" in _fr.columns:
-                    try:
-                        _coords_r = np.array([_parse_coords(c) for c in _fr["coords"]])
-                        _ys_r, _xs_r = _coords_r[:, 1], _coords_r[:, 2]
-                        for _ax_ov in _axes_ov.flat:
-                            _ax_ov.scatter(
-                                _xs_r, _ys_r, c="red",
-                                s=_dot_size, marker="x", linewidth=0.8, alpha=0.7,
-                                zorder=3, label="NN-removed",
-                            )
-                    except Exception as _esr:
-                        st.warning(f"Could not plot NN-removed cilia: {_esr}")
+                # ── Section A: Channel MIPs ────────────────────────────────────
+                st.markdown("#### 📡 Channel MIPs")
+                # alpha: fill opacity for the segmentation colour overlay
+                # (higher = more visible; large structures like nuclei use low alpha)
+                _ch_defs = [
+                    ("Cilia",        "cilia",   "cilia_labels",  "#00FF88", 0.55),
+                    ("Neurites",     "neurite",  None,            "#FF44FF", 0.28),
+                    ("Basal Bodies", "bb",       "bb_labels",     "#FF8800", 0.55),
+                    ("Nuclei",       "nuclei",   "nuclei_labels", "#FFFF00", 0.20),
+                ]
+                _ch_avail = [(n, mk, lk, oc, al) for n, mk, lk, oc, al in _ch_defs if mk in _mips]
 
-                # Colorbars on all 4 panels
-                _cmap_ov = plt.cm.coolwarm
-                _norm_ov = plt.Normalize(vmin=_vmin_ov, vmax=_vmax_ov)
-                _sm_ov = plt.cm.ScalarMappable(cmap=_cmap_ov, norm=_norm_ov)
-                _sm_ov.set_array([])
-                for _ax_ov in _axes_ov.flat:
-                    plt.colorbar(_sm_ov, ax=_ax_ov, label="log_ratio")
+                _missing_new = [n for n, mk, *_ in _ch_defs if mk not in _mips]
+                if _missing_new:
+                    st.caption(
+                        f"ℹ️ **{', '.join(_missing_new)}** "
+                        "channel(s) and segmentation outlines require a pipeline re-run "
+                        "with the updated code to generate the extra MIP files."
+                    )
 
+                with st.expander("🔆 Brightness / contrast", expanded=False):
+                    _ch_plo, _ch_phi = st.slider(
+                        "Clip range (percentile)", 0, 100, (0, 100), step=1,
+                        key="ch_br",
+                        help="Clips the display range of all channel panels. "
+                             "Drag left handle up to brighten dim channels.",
+                    )
+
+                def _seg_overlay(ax, mask, hex_color, alpha):
+                    """Draw a coloured semi-transparent fill over segmented pixels."""
+                    if not mask.any():
+                        return
+                    r = int(hex_color[1:3], 16) / 255
+                    g = int(hex_color[3:5], 16) / 255
+                    b = int(hex_color[5:7], 16) / 255
+                    ov = np.zeros((*mask.shape, 4), dtype=np.float32)
+                    ov[mask] = [r, g, b, alpha]
+                    ax.imshow(ov, aspect="equal", zorder=2)
+
+                if _ch_avail:
+                    _ch_cols = st.columns(len(_ch_avail))
+                    for _ci, (_ch_name, _ch_mkey, _lbl_key, _oc, _al) in enumerate(_ch_avail):
+                        with _ch_cols[_ci]:
+                            _arr = _mips[_ch_mkey]
+                            _vlo = np.percentile(_arr, _ch_plo)
+                            _vhi = np.percentile(_arr, _ch_phi)
+                            _fig_ch, _ax_ch = plt.subplots(figsize=(4, 4))
+                            _ax_ch.imshow(_arr, cmap="gray",
+                                          vmin=_vlo, vmax=_vhi, aspect="equal")
+                            _ax_ch.set_title(_ch_name, fontsize=9, pad=4)
+                            _ax_ch.axis("off")
+                            if _lbl_key and _lbl_key in _mips:
+                                _seg_overlay(_ax_ch, _mips[_lbl_key] > 0, _oc, _al)
+                            elif _ch_mkey == "neurite" and "neurite_mask" in _mips:
+                                _seg_overlay(_ax_ch, _mips["neurite_mask"], _oc, _al)
+                            _scatter_cilia(_ax_ch, max(4, _dot_size // 2))
+                            plt.tight_layout(pad=0.2)
+                            st.pyplot(_fig_ch, width="stretch")
+                            plt.close(_fig_ch)
+                else:
+                    st.caption("No channel MIPs available — re-run the pipeline to generate them.")
+
+                # ── Section B: log(ratio) Heatmap ─────────────────────────────
+                st.markdown("#### 🌡️ log(ratio) Heatmap")
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    _ratio_log_ov = np.where(
+                        np.isfinite(_mips["ratio"]), np.log(_mips["ratio"]), np.nan
+                    )
+                _cmap_ratio = plt.cm.coolwarm.copy()
+                _cmap_ratio.set_bad("black")
+                _fig_rat, _ax_rat = plt.subplots(figsize=(8, 6))
+                _im_rat = _ax_rat.imshow(_ratio_log_ov, cmap=_cmap_ratio, aspect="equal")
+                plt.colorbar(_im_rat, ax=_ax_rat, label="log(ratio)", shrink=0.8)
+                _ax_rat.set_title("log(ratio) — neurite masked", fontsize=10)
+                _ax_rat.axis("off")
+                _scatter_cilia(_ax_rat, _dot_size)
+                if "neurite_mask" in _mips:
+                    _ax_rat.contour(_mips["neurite_mask"].astype(float),
+                                    levels=[0.5], colors=["#FF44FF"], linewidths=0.5, alpha=0.5)
                 plt.tight_layout()
-                _ov_png = _fig_to_png(_fig_ov)
-                plt.close(_fig_ov)
-
-                st.image(_ov_png, width="stretch")
+                _rat_png = _fig_to_png(_fig_rat)
+                plt.close(_fig_rat)
+                st.image(_rat_png, width="stretch")
 
                 _ov_fname = (
                     f"{_stem}_overlay"
@@ -1684,11 +2631,202 @@ with tab_overlays:
                 _cov1, _cov2 = st.columns(2)
                 with _cov1:
                     st.download_button(
-                        "⬇️ Download Overlay (PNG)",
-                        _ov_png, _ov_fname, "image/png", key="dl_overlay",
+                        "⬇️ Download Ratio Overlay (PNG)",
+                        _rat_png, _ov_fname, "image/png", key="dl_overlay",
                     )
                 with _cov2:
                     st.caption(f"{len(_fk)} kept  ·  {len(_fr)} NN-removed")
+
+                st.markdown("---")
+
+                # ── Section B2: Per-channel intensity histograms ──────────────
+                with st.expander("📊 Per-channel intensity histograms", expanded=False):
+                    st.caption(
+                        "Pixel-intensity distribution of each channel's MIP for this "
+                        "sample. Useful for spotting saturation, weak staining, or "
+                        "background offsets, and for tuning normalisation percentiles."
+                    )
+                    _hist_chs = [(_n, _mk, _oc) for _n, _mk, _lk, _oc, _al in _ch_avail]
+                    if not _hist_chs:
+                        st.info("No channel MIPs available — re-run the pipeline.")
+                    else:
+                        _hlog = st.checkbox(
+                            "Log Y (count) scale", value=True, key="ch_hist_log",
+                            help="Log scale makes sparse bright pixels / tails visible.",
+                        )
+                        _ncols = len(_hist_chs)
+                        _fh, _hax = plt.subplots(
+                            1, _ncols, figsize=(3.2 * _ncols, 3.0), squeeze=False
+                        )
+                        for _ax_h, (_hn, _hk, _hc) in zip(_hax[0], _hist_chs):
+                            _vals = np.asarray(_mips[_hk], dtype=float).ravel()
+                            _vals = _vals[np.isfinite(_vals)]
+                            if _vals.size:
+                                _ax_h.hist(_vals, bins=80, color=_hc,
+                                           alpha=0.85, edgecolor="none")
+                            if _hlog:
+                                _ax_h.set_yscale("log")
+                            _ax_h.set_title(_hn, fontsize=9, fontweight="bold")
+                            _ax_h.set_xlabel("intensity", fontsize=8)
+                            _ax_h.tick_params(labelsize=7)
+                            _ax_h.spines[["top", "right"]].set_visible(False)
+                        _hax[0][0].set_ylabel("count", fontsize=8)
+                        _fh.tight_layout()
+                        st.pyplot(_fh, width="stretch")
+                        st.download_button(
+                            "⬇️ Intensity histograms (PNG)", _fig_to_png(_fh),
+                            f"{_stem}_intensity_histograms.png", "image/png",
+                            key="dl_ch_hist",
+                        )
+                        plt.close(_fh)
+
+                # ── Section C: Custom Overlay Builder ─────────────────────────
+                with st.expander("🎨 Custom Overlay Builder", expanded=False):
+                    _b1, _b2, _b3 = st.columns(3)
+                    with _b1:
+                        st.markdown("**Layers**")
+                        _bld_cilia_ch   = st.checkbox("Cilia channel",        value=True,  key="bld_cilia_ch")
+                        _bld_neurite_ch = st.checkbox("Neurite channel",      value=True,  key="bld_neurite_ch")
+                        _bld_nuclei_ch  = st.checkbox("Nuclei channel",       value=False, key="bld_nuclei_ch")
+                        _bld_bb_ch      = st.checkbox("BB channel",           value=False, key="bld_bb_ch")
+                        _bld_ratio_pan  = st.checkbox("Ratio heatmap panel",  value=True,  key="bld_ratio_pan")
+                        _bld_nmask_lay  = st.checkbox("Neurite mask overlay", value=True,  key="bld_nmask_lay")
+                        _bld_outlines   = st.checkbox("Seg. outlines",        value=True,  key="bld_outlines")
+                        _bld_dots       = st.checkbox("Cilia dots (kept)",    value=True,  key="bld_dots")
+                        _bld_rmvd       = st.checkbox("Cilia dots (removed)", value=True,  key="bld_rmvd")
+                    with _b2:
+                        st.markdown("**Colors**")
+                        _c_nmask   = st.color_picker("Neurite mask",    "#FF44FF", key="bld_c_nmask")
+                        _c_cil_ol  = st.color_picker("Cilia outlines",  "#00FF88", key="bld_c_cil")
+                        _c_nuc_ol  = st.color_picker("Nuclei outlines", "#FFFF00", key="bld_c_nuc")
+                        _c_bb_ol   = st.color_picker("BB outlines",     "#FF8800", key="bld_c_bb")
+                        _c_removed = st.color_picker("Removed dots",    "#FF0000", key="bld_c_rmvd")
+                        _bld_cmap  = st.selectbox(
+                            "Ratio colormap",
+                            ["coolwarm", "viridis", "plasma", "RdBu_r", "PiYG"],
+                            key="bld_cmap",
+                        )
+                    with _b3:
+                        st.markdown("**Display**")
+                        _bld_dot_sz   = st.slider("Dot size", 5, 150, _dot_size,   key="bld_dsz")
+                        _bld_nalpha   = st.slider("Mask alpha", 0.0, 1.0, 0.3, step=0.05, key="bld_nalpha")
+                        _bld_vmin_pct = st.slider("Image vmin %", 0, 50, 0,        key="bld_vmin")
+                        _bld_vmax_pct = st.slider("Image vmax %", 50, 100, 100,    key="bld_vmax")
+                        _bld_figw     = st.slider("Fig width (in)", 6, 28, 14,     key="bld_figw")
+                        _bld_figh     = st.slider("Fig height (in)", 4, 20, 8,     key="bld_figh")
+                        _bld_fmt      = st.radio("Export format", ["PNG", "PDF"],  key="bld_fmt")
+
+                    if st.button("🖼️ Build Custom Overlay", key="bld_run", type="primary"):
+                        _bld_panels = []
+                        if _bld_cilia_ch   and "cilia"   in _mips: _bld_panels.append(("Cilia",        "cilia"))
+                        if _bld_neurite_ch and "neurite" in _mips: _bld_panels.append(("Neurites",     "neurite"))
+                        if _bld_bb_ch      and "bb"      in _mips: _bld_panels.append(("Basal Bodies", "bb"))
+                        if _bld_nuclei_ch  and "nuclei"  in _mips: _bld_panels.append(("Nuclei",       "nuclei"))
+                        if _bld_ratio_pan:                          _bld_panels.append(("log(ratio)",   "ratio"))
+
+                        _n_pan = max(1, len(_bld_panels))
+                        _bld_fig, _bld_axs = plt.subplots(
+                            1, _n_pan, figsize=(_bld_figw, _bld_figh), squeeze=False,
+                        )
+                        _bld_axs = _bld_axs[0]
+
+                        def _norm_ch(arr):
+                            lo = np.percentile(arr, _bld_vmin_pct)
+                            hi = np.percentile(arr, _bld_vmax_pct)
+                            return (arr - lo) / (hi - lo + 1e-8)
+
+                        _outline_color_map = {
+                            "cilia":   _c_cil_ol,
+                            "neurite": _c_nmask,
+                            "bb":      _c_bb_ol,
+                            "nuclei":  _c_nuc_ol,
+                        }
+
+                        for _pi, (_ptitle, _pkey) in enumerate(_bld_panels):
+                            _bax = _bld_axs[_pi]
+                            _bax.set_title(_ptitle, fontsize=9, pad=4)
+                            _bax.axis("off")
+
+                            if _pkey == "ratio":
+                                _r_log = np.where(
+                                    np.isfinite(_mips["ratio"]), np.log(_mips["ratio"]), np.nan
+                                )
+                                _cm_r = plt.get_cmap(_bld_cmap).copy()
+                                _cm_r.set_bad("black")
+                                _im_b = _bax.imshow(_r_log, cmap=_cm_r, aspect="equal")
+                                plt.colorbar(_im_b, ax=_bax, label="log(ratio)", shrink=0.8)
+                            else:
+                                _bax.imshow(_norm_ch(_mips[_pkey]),
+                                            cmap="gray", aspect="equal", vmin=0, vmax=1)
+                                if _bld_outlines:
+                                    _lk = _pkey + "_labels"
+                                    _oc_bld = _outline_color_map.get(_pkey, "#FFFFFF")
+                                    _al_bld = 0.55 if _pkey in ("cilia", "bb") else 0.25
+                                    if _lk in _mips and _mips[_lk] is not None:
+                                        _lm = _mips[_lk] > 0
+                                        if _lm.any():
+                                            _seg_overlay(_bax, _lm, _oc_bld, _al_bld)
+                                    elif _pkey == "neurite" and "neurite_mask" in _mips:
+                                        _seg_overlay(_bax, _mips["neurite_mask"], _c_nmask, 0.28)
+                                if _bld_nmask_lay and "neurite_mask" in _mips:
+                                    _r_hex = int(_c_nmask[1:3], 16) / 255
+                                    _g_hex = int(_c_nmask[3:5], 16) / 255
+                                    _b_hex = int(_c_nmask[5:7], 16) / 255
+                                    _mask_rgba = np.zeros(
+                                        (*_mips["neurite_mask"].shape, 4), dtype=np.float32
+                                    )
+                                    _mask_rgba[_mips["neurite_mask"]] = [_r_hex, _g_hex, _b_hex, _bld_nalpha]
+                                    _bax.imshow(_mask_rgba, aspect="equal")
+
+                            if _bld_dots and not _fk.empty and "coords" in _fk.columns and len(_scores_ov) > 0:
+                                try:
+                                    _ck2 = np.array([_parse_coords(c) for c in _fk["coords"]])
+                                    _bax.scatter(
+                                        _ck2[:, 2], _ck2[:, 1],
+                                        c=_scores_ov, cmap="coolwarm",
+                                        vmin=_vmin_ov, vmax=_vmax_ov,
+                                        s=_bld_dot_sz, edgecolor="black", linewidth=0.3, zorder=4,
+                                    )
+                                except Exception:
+                                    pass
+                            if _bld_rmvd and not _fr.empty and "coords" in _fr.columns:
+                                try:
+                                    _cr2 = np.array([_parse_coords(c) for c in _fr["coords"]])
+                                    _bax.scatter(
+                                        _cr2[:, 2], _cr2[:, 1],
+                                        c=_c_removed, s=_bld_dot_sz,
+                                        marker="x", linewidth=0.8, alpha=0.7, zorder=4,
+                                    )
+                                except Exception:
+                                    pass
+
+                        plt.tight_layout()
+                        if _bld_fmt == "PDF":
+                            _bld_bytes = _fig_to_pdf(_bld_fig)
+                            _bld_ext   = "pdf"
+                            _bld_mime  = "application/pdf"
+                        else:
+                            _bld_bytes = _fig_to_png(_bld_fig)
+                            _bld_ext   = "png"
+                            _bld_mime  = "image/png"
+                        plt.close(_bld_fig)
+                        st.session_state["_custom_ov_bytes"] = _bld_bytes
+                        st.session_state["_custom_ov_ext"]   = _bld_ext
+                        st.session_state["_custom_ov_mime"]  = _bld_mime
+
+                    if st.session_state.get("_custom_ov_bytes"):
+                        _ext_ov = st.session_state["_custom_ov_ext"]
+                        if _ext_ov == "png":
+                            st.image(st.session_state["_custom_ov_bytes"], width="stretch")
+                        else:
+                            st.info("PDF preview not available — use the download button below.")
+                        st.download_button(
+                            f"⬇️ Download Custom Overlay ({_ext_ov.upper()})",
+                            st.session_state["_custom_ov_bytes"],
+                            f"{_stem}_custom_overlay.{_ext_ov}",
+                            st.session_state["_custom_ov_mime"],
+                            key="dl_custom_ov",
+                        )
 
 
 # ═════════════════════════════════════════════════════════════════════════════

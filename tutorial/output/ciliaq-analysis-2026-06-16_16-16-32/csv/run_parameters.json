@@ -1,0 +1,33 @@
+{
+  "timestamp": "ciliaq-analysis-2026-06-16_16-16-32",
+  "ch_cilia": 0,
+  "ch_signal_a": -1,
+  "ch_signal_b": -1,
+  "ch_coloc": -1,
+  "threshold_method": "otsu",
+  "threshold_factor": 1.0,
+  "hysteresis_low_factor": 0.5,
+  "background_radius": 0.0,
+  "cilia_gaussian_sigma": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "min_voxels": 10,
+  "max_voxels": 0,
+  "coloc_threshold": null,
+  "base_analysis": true,
+  "ch_neurites": 1,
+  "ch_bb": 2,
+  "ch_nuclei": 3,
+  "nuclei_sigma": 15,
+  "tophat_radius": 12,
+  "neurite_sigma": 5,
+  "bb_spot_sigma": 2.0,
+  "max_cilia_dist_um": 2.0,
+  "ratio_epsilon": 1.0,
+  "axon_threshold": 2.5,
+  "soma_threshold": 1.0,
+  "p_low": 2,
+  "p_high": 98
+}
