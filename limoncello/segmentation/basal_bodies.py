@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pyclesperanto_prototype as cle
 from ..utils.gpu import to_gpu
-from .cilia import _size_filter
+from .cilia import _size_filter, segment_cilia_ml
 
 
 def segment_basal_bodies(
@@ -65,3 +65,36 @@ def segment_basal_bodies(
     )
 
     return _size_filter(labels_gpu, min_size, max_size)
+
+
+def segment_basal_bodies_ml(
+    volume,
+    classifier_path: str,
+    min_size: int = 5,
+    max_size: int = 0,
+    gaussian_sigma=(1.0, 1.0, 0.0),
+    log_transform: bool = False,
+    **kwargs,
+):
+    """
+    Segment basal bodies with a trained APOC classifier.
+
+    This is the machine-learning alternative to the Voronoi-Otsu
+    :func:`segment_basal_bodies`; it runs the same APOC ``ObjectSegmenter``
+    pipeline used for cilia. See :func:`limoncello.segmentation.cilia.segment_cilia_ml`
+    for the parameter semantics.
+
+    Returns
+    -------
+    labels_gpu : cle.Image
+        Labeled basal bodies, same dimensionality as input.
+    """
+    return segment_cilia_ml(
+        volume,
+        classifier_path=classifier_path,
+        min_size=min_size,
+        max_size=max_size,
+        gaussian_sigma=gaussian_sigma,
+        log_transform=log_transform,
+        **kwargs,
+    )

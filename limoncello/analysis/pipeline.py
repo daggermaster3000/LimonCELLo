@@ -11,11 +11,14 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 from ..utils.reader import load_image, load_ims_metadata
-from ..preprocessing.preprocessing import normalize_intensity, percentile_minmax_normalize
+from ..preprocessing.preprocessing import (
+    normalize_intensity, percentile_minmax_normalize,
+    make_isotropic as resample_isotropic,   # aliased: ``make_isotropic`` is a bool param of run_pipeline3
+)
 from ..segmentation.nuclei import segment_nuclei
 from ..segmentation.neurites import segment_neurites
 from ..segmentation.cilia import segment_cilia_ml
-from ..segmentation.basal_bodies import segment_basal_bodies
+from ..segmentation.basal_bodies import segment_basal_bodies, segment_basal_bodies_ml
 from ..qc.qc import run_qc, save_qc_excel, scatter_plot
 from ..analysis.pair_cilia_to_bb import pair_from_mixed_df
 from ..utils.assign_label_features import assign_label_features
@@ -88,6 +91,9 @@ def run_pipeline3(
     basal_bodies_channel: int = 2,
     nuclei_channel: int = 3,
     use_mip: bool = False,
+    make_isotropic: bool = True,
+    bb_method: str = "Voronoi-Otsu",
+    bb_classifier_path: str | None = None,
     bb_spot_sigma: float = 2.0,
     bb_outline_sigma: float = 2.0,
     bb_gaussian_sigma: tuple = (1.0, 1.0, 0.0),
@@ -105,6 +111,7 @@ def run_pipeline3(
     ratio_epsilon: float = 1.0,
     per_channel_norm: dict | None = None,
     progress_callback=None,
+    per_file_callback=None,
 ):
     if gpu_device:
         cle.select_device(gpu_device)
@@ -130,6 +137,7 @@ def run_pipeline3(
         "input_path": str(input_path),
         "output_path": str(output_path),
         "use_mip": use_mip,
+        "make_isotropic": make_isotropic,
         "channels": {
             "cilia": cilia_channel,
             "neurites": neurites_channel,
@@ -162,6 +170,8 @@ def run_pipeline3(
             "max_size": cilia_max_size,
         },
         "basal_bodies": {
+            "method": bb_method,
+            "classifier_path": str(bb_classifier_path) if bb_classifier_path else None,
             "spot_sigma": bb_spot_sigma,
             "outline_sigma": bb_outline_sigma,
             "gaussian_sigma": list(bb_gaussian_sigma),
@@ -242,6 +252,24 @@ def run_pipeline3(
                 [_z_project(a_norm[0, ch]) for ch in range(n_ch)], axis=0
             )[np.newaxis]
 
+        # ── Isotropic resampling (3-D only): downsample finer axes to coarsest ──
+        elif make_isotropic and voxel_size and not all(
+            abs(v - max(voxel_size)) < 1e-6 for v in voxel_size
+        ):
+            iso = max(voxel_size)
+            print(f"  Anisotropic voxels {tuple(round(v, 3) for v in voxel_size)} — "
+                  f"resampling to isotropic {iso:.3f} µm")
+            n_ch = a.shape[1]
+            a = np.stack(
+                [resample_isotropic(np.asarray(a[0, ch]), voxel_size, iso)[0]
+                 for ch in range(n_ch)], axis=0
+            )[np.newaxis]                     # (1, C, Z', Y', X')
+            a_norm = np.stack(
+                [resample_isotropic(np.asarray(a_norm[0, ch]), voxel_size, iso)[0]
+                 for ch in range(n_ch)], axis=0
+            )[np.newaxis]
+            voxel_size = (iso, iso, iso)
+
         # ── Segmentation ──────────────────────────────────────────────────────
         cilia_labels = segment_cilia_ml(
             a[0, cilia_channel],
@@ -268,15 +296,25 @@ def run_pipeline3(
             log_transform=neurite_log,
         )
 
-        basal_bodies_labels = segment_basal_bodies(
-            a[0, basal_bodies_channel],
-            spot_sigma=bb_spot_sigma,
-            outline_sigma=bb_outline_sigma,
-            gaussian_sigma=bb_gaussian_sigma,
-            log_transform=bb_log,
-            min_size=bb_min_size,
-            max_size=bb_max_size,
-        )
+        if bb_method == "APOC classifier":
+            basal_bodies_labels = segment_basal_bodies_ml(
+                a[0, basal_bodies_channel],
+                classifier_path=bb_classifier_path,
+                gaussian_sigma=bb_gaussian_sigma,
+                log_transform=bb_log,
+                min_size=bb_min_size,
+                max_size=bb_max_size,
+            )
+        else:
+            basal_bodies_labels = segment_basal_bodies(
+                a[0, basal_bodies_channel],
+                spot_sigma=bb_spot_sigma,
+                outline_sigma=bb_outline_sigma,
+                gaussian_sigma=bb_gaussian_sigma,
+                log_transform=bb_log,
+                min_size=bb_min_size,
+                max_size=bb_max_size,
+            )
 
         # get neurites masks
         neurite_mask = np.asarray(neurites_label) > 0
@@ -383,8 +421,41 @@ def run_pipeline3(
             ratio_epsilon=ratio_epsilon,
         )
 
+        # ── Pair cilia ↔ basal bodies (closest, strict 1:1, µm cutoff) ──────────
+        # Only cilia paired to a basal body within the cutoff are "validated";
+        # everything downstream (CSV, overlays, label MIPs) keeps validated only.
+        combined = pd.concat([df_cilia, df_basal_bodies], ignore_index=True)
+        paired = pair_from_mixed_df(
+            combined, voxel_size=voxel_size,
+            max_pair_distance_um=max_basal_body_cutoff_um,
+        )
+        df_cilia = paired[(paired["object_type"] == "cilia") & paired["validated"]].reset_index(drop=True)
+        df_basal_bodies = paired[(paired["object_type"] == "basal_body") & paired["validated"]].reset_index(drop=True)
+
+        if df_cilia.empty:
+            print(f"  No validated cilia (paired within {max_basal_body_cutoff_um} µm) in {file}")
+            try:
+                del cilia_labels, nuclei_labels_otsu, skeleton, neurites_label, \
+                    basal_bodies_labels, neurite_mask, skeleton_mask, \
+                    distance_map_nuclei, distance_map_neurites, map_ratio, \
+                    dist_to_neurite, nearest_skel_idx, a_norm, a
+            except NameError:
+                pass
+            _flush_gpu()
+            continue
+
         all_dfs.append(df_basal_bodies)
         all_dfs.append(df_cilia)
+
+        # Validated-only label volumes (everything but the paired cilia/BBs zeroed)
+        _valid_cilia_ids = [int(i) for i in df_cilia["cilia_id"]]
+        _valid_bb_ids    = [int(i) for i in df_basal_bodies["cilia_id"]]
+        cilia_labels_v = np.where(
+            np.isin(np.asarray(cilia_labels), _valid_cilia_ids), np.asarray(cilia_labels), 0
+        ).astype(np.int32)
+        bb_labels_v = np.where(
+            np.isin(np.asarray(basal_bodies_labels), _valid_bb_ids), np.asarray(basal_bodies_labels), 0
+        ).astype(np.int32)
 
         # ── Overlay visualization (MIP) ───────────────────────────────────────
         overlay_dir = os.path.join(output_path, "figures", "overlays")
@@ -417,11 +488,11 @@ def run_pipeline3(
         np.save(os.path.join(_mip_out, f"{_fstem}_bb_mip.npy"),
                 _disp_mip(a[0, basal_bodies_channel]))
         np.save(os.path.join(_mip_out, f"{_fstem}_cilia_labels_mip.npy"),
-                np.max(np.asarray(cilia_labels).astype(np.uint16), axis=0))
+                np.max(cilia_labels_v.astype(np.uint16), axis=0))
         np.save(os.path.join(_mip_out, f"{_fstem}_nuclei_labels_mip.npy"),
                 np.max(nuclei_labels_otsu.astype(np.uint16), axis=0))
         np.save(os.path.join(_mip_out, f"{_fstem}_bb_labels_mip.npy"),
-                np.max(np.asarray(basal_bodies_labels).astype(np.uint16), axis=0))
+                np.max(bb_labels_v.astype(np.uint16), axis=0))
         np.save(os.path.join(_mip_out, f"{_fstem}_neurite_labels_mip.npy"),
                 np.max(np.asarray(neurites_label).astype(np.uint16), axis=0))
 
@@ -470,6 +541,36 @@ def run_pipeline3(
             dpi=300, bbox_inches="tight",
         )
         plt.close("all")
+
+        # ── Live napari visualisation hook (GUI thread, blocks until captured) ──
+        if per_file_callback is not None:
+            napari_overlay_dir = os.path.join(output_path, "figures", "napari_overlays")
+            roi_dir = os.path.join(output_path, "figures", "cilia_rois")
+            os.makedirs(napari_overlay_dir, exist_ok=True)
+            os.makedirs(roi_dir, exist_ok=True)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                _log_ratio_map = np.log(map_ratio)                    # NaN outside neurites
+            try:
+                per_file_callback(dict(
+                    stem=_fstem,
+                    screenshots_dir=napari_overlay_dir,
+                    rois_dir=roi_dir,
+                    voxel_size=tuple(float(v) for v in voxel_size),
+                    raw=np.asarray(a[0]),                              # (C, Z, Y, X)
+                    channels=dict(ch_cilia=cilia_channel, ch_neurites=neurites_channel,
+                                  ch_bb=basal_bodies_channel, ch_nuclei=nuclei_channel),
+                    cilia_labels=cilia_labels_v,
+                    bb_labels=bb_labels_v,
+                    nuclei_labels=np.asarray(nuclei_labels_otsu).astype(np.int32),
+                    neurite_labels=np.asarray(neurites_label).astype(np.int32),
+                    skeleton_mask=np.asarray(skeleton_mask),
+                    nearest_skel_idx=np.asarray(nearest_skel_idx),
+                    log_ratio_map=_log_ratio_map,
+                    cilia_df=df_cilia,
+                    bb_df=df_basal_bodies,
+                ))
+            except Exception as _exc:
+                print(f"  ⚠ napari capture failed for {file}: {_exc}")
 
         # ── Release GPU label buffers + large CPU arrays before the next file ───
         # Without this the previous file's buffers stay alive while the next

@@ -2,9 +2,7 @@
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import linear_sum_assignment
 import re
-import numpy as np
 
 def parse_coords_string(series):
     """
@@ -25,22 +23,34 @@ def parse_coords_string(series):
     return np.array(coords_list, dtype=np.float64)
 
 
-def pair_from_mixed_df(df):
+def pair_from_mixed_df(df, voxel_size=(1.0, 1.0, 1.0), max_pair_distance_um=None):
     """
     Pair cilia and basal bodies from a single dataframe containing both.
 
-    Assumes `coords` column is a numeric array (shape (3,)) for each row.
+    Assumes `coords` column is a numeric (z, y, x) array (shape (3,)) per row,
+    in voxel index units.
 
-    Applies the Hungarian algorithm to the cost matrix containing euclidian distances between bb and cilia centroids
-    i.e. creates a one to one mapping that minimizes the cost.
+    Stringent **closest, strict 1:1** assignment: every (cilium, basal body)
+    pair distance is computed in physical µm (via ``voxel_size``), sorted
+    ascending, and assigned greedily so each cilium takes only its single
+    nearest still-available basal body and each basal body is used at most
+    once. Pairs farther apart than ``max_pair_distance_um`` are rejected.
+
+    Parameters
+    ----------
+    voxel_size : tuple of float
+        Physical spacing (vz, vy, vx) in µm used to scale centroid distances.
+    max_pair_distance_um : float or None
+        Reject any pair beyond this µm distance. None = no cutoff.
 
     Returns
     -------
     pd.DataFrame
-        Original dataframe with:
-        - paired_id
-        - pairing_status ("paired" / "lonely")
-        - pair_distance_um
+        Original dataframe with added columns:
+        - paired_id          (id of the partner object, NaN if unpaired)
+        - pair_distance_um   (µm; NaN if unpaired)
+        - pairing_status     ("paired" / "lonely")
+        - validated          (bool; True iff paired)
     """
     df = df.copy()
 
@@ -54,52 +64,51 @@ def pair_from_mixed_df(df):
     df["paired_id"] = np.nan
     df["pair_distance_um"] = np.nan
     df["pairing_status"] = "lonely"
+    df["validated"] = False
 
     if len(df_cilia) == 0 or len(df_basal) == 0:
         # No possible pairs
         return df
 
     # -------------------------
-    # Build coordinate arrays
+    # Build coordinate arrays (voxel units) and a µm distance matrix
     # -------------------------
-    
-    cilia_coords = parse_coords_string(df_cilia["coords"])  # shape (n_cilia, 3)
-    basal_coords = parse_coords_string(df_basal["coords"])  # shape (n_basal, 3)
+    cilia_coords = parse_coords_string(df_cilia["coords"])  # (n_cilia, 3)
+    basal_coords = parse_coords_string(df_basal["coords"])  # (n_basal, 3)
 
-    # -------------------------
-    # Distance matrix
-    # -------------------------
+    vs = np.asarray(voxel_size, dtype=float)
     dist_matrix = np.linalg.norm(
-        cilia_coords[:, None, :] - basal_coords[None, :, :],
-        axis=2
-    )
-    
-    dist_mask = dist_matrix.copy()
-
+        (cilia_coords[:, None, :] - basal_coords[None, :, :]) * vs,
+        axis=2,
+    )  # µm
 
     # -------------------------
-    # Hungarian assignment
+    # Greedy nearest, strict 1:1 assignment (closest pairs first)
     # -------------------------
-    c_idx, b_idx = linear_sum_assignment(dist_mask)
+    n_cilia, n_basal = dist_matrix.shape
+    order = np.argsort(dist_matrix, axis=None)        # flat indices, ascending
+    cilia_taken = np.zeros(n_cilia, dtype=bool)
+    basal_taken = np.zeros(n_basal, dtype=bool)
 
-    # -------------------------
-    # Assign pairs
-    # -------------------------
-    for c, b in zip(c_idx, b_idx):
-        if dist_mask[c, b] != np.inf:
-            cilia_row_idx = df_cilia.index[c]
-            basal_row_idx = df_basal.index[b]
+    for flat in order:
+        c, b = divmod(int(flat), n_basal)
+        dist = dist_matrix[c, b]
+        if max_pair_distance_um is not None and dist > max_pair_distance_um:
+            break                                     # all remaining are farther
+        if cilia_taken[c] or basal_taken[b]:
+            continue
+        cilia_taken[c] = basal_taken[b] = True
 
-            dist = dist_mask[c, b]
-            cilia_id = df_cilia.loc[cilia_row_idx, "cilia_id"]
-            basal_id = df_basal.loc[basal_row_idx, "cilia_id"]
+        cilia_row_idx = df_cilia.index[c]
+        basal_row_idx = df_basal.index[b]
+        cilia_id = df_cilia.loc[cilia_row_idx, "cilia_id"]
+        basal_id = df_basal.loc[basal_row_idx, "cilia_id"]
 
-            # Assign to both
-            df.loc[cilia_row_idx, ["paired_id", "pair_distance_um", "pairing_status"]] = [
-                basal_id, dist, "paired"
-            ]
-            df.loc[basal_row_idx, ["paired_id", "pair_distance_um", "pairing_status"]] = [
-                cilia_id, dist, "paired"
-            ]
+        df.loc[cilia_row_idx, ["paired_id", "pair_distance_um", "pairing_status", "validated"]] = [
+            basal_id, dist, "paired", True
+        ]
+        df.loc[basal_row_idx, ["paired_id", "pair_distance_um", "pairing_status", "validated"]] = [
+            cilia_id, dist, "paired", True
+        ]
 
     return df

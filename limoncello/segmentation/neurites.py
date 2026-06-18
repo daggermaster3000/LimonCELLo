@@ -57,13 +57,17 @@ def segment_neurites(
             sigma_z=gaussian_sigma[0],
         )
 
-    labels_gpu = cle.voronoi_otsu_labeling(
-        volume_gpu,
-        spot_sigma=spot_sigma,
+    # labels_gpu = cle.voronoi_otsu_labeling(
+    #     volume_gpu,
+    #     spot_sigma=spot_sigma,
+    #     outline_sigma=outline_sigma,
+    #     **kwargs,
+    # )
+    labels_gpu = cle.gauss_otsu_labeling(
+                volume_gpu,
         outline_sigma=outline_sigma,
         **kwargs,
     )
-
     labels_gpu = cle.exclude_small_labels(
         labels_gpu,
         maximum_size=min_size,

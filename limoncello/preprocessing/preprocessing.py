@@ -1,4 +1,49 @@
 import numpy as np
+from skimage.transform import resize
+
+
+def make_isotropic(volume, voxel_size, target_spacing=None, order=1):
+    """
+    Resample a (Z, Y, X) volume to isotropic voxels.
+
+    By default the target spacing is the *coarsest* axis spacing
+    (``max(voxel_size)``, typically Z), so the finer axes are **downsampled**
+    to match it. This keeps the voxel count from exploding (no upsampling) at
+    the cost of in-plane resolution.
+
+    Parameters
+    ----------
+    volume : np.ndarray
+        Image volume (Z, Y, X).
+    voxel_size : tuple of float
+        Physical spacing per axis (vz, vy, vx) in µm.
+    target_spacing : float, optional
+        Isotropic spacing to resample to (µm). Defaults to ``max(voxel_size)``.
+    order : int
+        Interpolation order (1 = linear for intensities, 0 = nearest for labels).
+
+    Returns
+    -------
+    (np.ndarray, tuple)
+        The resampled volume and its new isotropic ``voxel_size`` ``(s, s, s)``.
+        If the input is already isotropic (to within rounding), the volume is
+        returned unchanged.
+    """
+    vol = np.asarray(volume)
+    vs = tuple(float(v) for v in voxel_size)
+    s = float(target_spacing) if target_spacing else max(vs)
+
+    if all(abs(v - s) < 1e-6 for v in vs):
+        return vol, (s, s, s)
+
+    out_shape = tuple(max(1, int(round(dim * v / s))) for dim, v in zip(vol.shape, vs))
+    downsampling = any(v < s for v in vs)            # anti-alias only when shrinking
+    out = resize(
+        vol, out_shape, order=order,
+        anti_aliasing=downsampling, preserve_range=True,
+    ).astype(vol.dtype, copy=False)
+    return out, (s, s, s)
+
 
 def percentile_minmax_normalize(
     data,

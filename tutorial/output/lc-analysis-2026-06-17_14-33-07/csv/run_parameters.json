@@ -1,0 +1,71 @@
+{
+  "timestamp": "2026-06-17T14:33:07",
+  "input_path": "C:\\Users\\qfavey\\Documents\\Thomas-test-data\\d38\\cl5 gibco d38 coverslip 1 40x",
+  "output_path": "C:\\Users\\qfavey\\Documents\\Code-Thomas-Test\\LimonCELLo\\tutorial\\output\\lc-analysis-2026-06-17_14-33-07",
+  "use_mip": false,
+  "make_isotropic": true,
+  "channels": {
+    "cilia": 1,
+    "neurites": 0,
+    "basal_bodies": 2,
+    "nuclei": 3
+  },
+  "intensity_normalization": {
+    "p_low": 0,
+    "p_high": 100,
+    "per_channel": null
+  },
+  "nuclei": {
+    "spot_sigma": 15,
+    "tophat_radius": 12,
+    "outline_sigma": 3,
+    "gaussian_sigma": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "log_transform": false
+  },
+  "neurites": {
+    "spot_sigma": 5,
+    "gaussian_sigma": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "log_transform": false
+  },
+  "cilia": {
+    "gaussian_sigma": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "log_transform": false,
+    "min_size": 10,
+    "max_size": 0
+  },
+  "basal_bodies": {
+    "method": "APOC classifier",
+    "classifier_path": "C:\\Users\\qfavey\\Documents\\Code-Thomas-Test\\LimonCELLo\\segmenters\\BB-d38-3D.cl",
+    "spot_sigma": 2.0,
+    "outline_sigma": 2.0,
+    "gaussian_sigma": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "log_transform": false,
+    "min_size": 5,
+    "max_size": 300
+  },
+  "distance_thresholds": {
+    "max_cilia_um": 2.0,
+    "max_basal_body_um": 5.0,
+    "ratio_epsilon": 1.0
+  },
+  "classification": {
+    "axon_threshold": 2.5,
+    "soma_threshold": 1.0
+  }
+}
