@@ -20,20 +20,19 @@ import numpy as np
 import napari
 from magicgui.widgets import (
     Container, PushButton, ComboBox, FileEdit, Label, CheckBox,
-    SpinBox, FloatSpinBox, Select,
+    SpinBox, FloatSpinBox, Select, LineEdit, Table,
 )
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QScrollArea, QLabel, QFrame,
     QTableWidget, QTableWidgetItem, QAbstractItemView, QProgressBar,
     QApplication,
 )
-from qtpy.QtGui import QPixmap
+from qtpy.QtGui import QPixmap, QColor
 from qtpy.QtCore import Qt, QTimer, QItemSelectionModel, QObject, Signal
 from superqt import QCollapsible
 from napari.qt.threading import thread_worker
 from napari.utils.notifications import show_info, show_warning
 from scipy.ndimage import center_of_mass
-from skimage.measure import regionprops_table
 from limoncello.utils.gpu_distance import distance_transform_edt
 try:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -47,8 +46,15 @@ from limoncello.segmentation.cilia import segment_cilia_ml
 from limoncello.segmentation.nuclei import segment_nuclei
 from limoncello.segmentation.neurites import segment_neurites
 from limoncello.segmentation.basal_bodies import segment_basal_bodies, segment_basal_bodies_ml
-from limoncello.segmentation.train import load_training_pairs, train_object_segmenter
-from limoncello.utils.assign_label_features import assign_label_features
+from limoncello.segmentation.train import (
+    load_training_pairs, train_object_segmenter, find_labels_file,
+    train_segmenter_single, predict_segmenter,
+    build_feature_spec, feature_spec_from_pairs,
+    read_feature_importances, FEATURE_OPERATIONS,
+)
+from limoncello.utils.assign_label_features import (
+    assign_label_features, use_basal_body_ratio)
+from limoncello.utils.shape_props import cilia_shape_props, SHAPE_COLS
 from limoncello.analysis.pair_cilia_to_bb import pair_from_mixed_df
 from limoncello.analysis.pipeline import run_pipeline3
 
@@ -182,8 +188,13 @@ def step_nuclei(state: dict, p: dict) -> dict:
 def step_neurites(state: dict, p: dict) -> dict:
     print("[LC] Segmenting neurites …")
     ch = _clamp_ch(state["norm"].shape[0], p["ch_neurites"], "Neurites")
+    neurite_img = state["norm"][ch]
+    if p.get("merge_nuclei_neurite"):
+        nch = _clamp_ch(state["norm"].shape[0], p["ch_nuclei"], "Nuclei")
+        print("[LC] Merging nuclei into neurite channel before skeletonising …")
+        neurite_img = np.maximum(neurite_img, state["norm"][nch])
     skeleton, neurites_gpu = segment_neurites(
-        state["norm"][ch],
+        neurite_img,
         spot_sigma=p["neurite_sigma"],
         gaussian_sigma=(p["neurite_gauss_z"], p["neurite_gauss_y"], p["neurite_gauss_x"]),
         log_transform=p["neurite_log"],
@@ -279,15 +290,15 @@ def step_assign(state: dict, p: dict) -> dict:
     for df in (cilia_df, bb_df):
         if not df.empty:
             df["class"] = "ambiguous"
-            df.loc[df["log_ratio"] > p["axon_threshold"], "class"] = "axon"
+            df.loc[df["log_ratio"] > p["neurite_threshold"], "class"] = "neurite"
             df.loc[df["log_ratio"] < p["soma_threshold"], "class"] = "soma"
 
-    # ── Per-cilium 3-D region properties (volume / length) ──────────────────────
+    # ── Per-cilium 3-D shape descriptors (volume, sphericity, …) ────────────────
     if not cilia_df.empty:
-        cprops = _region_props(state["cilia_labels"], state["voxel_size"])
-        cilia_df["volume_voxels"] = [cprops.get(int(i), (np.nan,) * 3)[0] for i in cilia_df["cilia_id"]]
-        cilia_df["volume_um3"]    = [cprops.get(int(i), (np.nan,) * 3)[1] for i in cilia_df["cilia_id"]]
-        cilia_df["length_um"]     = [cprops.get(int(i), (np.nan,) * 3)[2] for i in cilia_df["cilia_id"]]
+        cprops = cilia_shape_props(state["cilia_labels"], state["voxel_size"])
+        for _col in SHAPE_COLS:
+            cilia_df[_col] = [cprops.get(int(i), {}).get(_col, np.nan)
+                              for i in cilia_df["cilia_id"]]
 
     # ── Pair cilia ↔ basal bodies (closest, strict 1:1, µm cutoff) ──────────────
     # Keep only validated cilia (paired to a BB within the cutoff) and the BBs
@@ -298,34 +309,27 @@ def step_assign(state: dict, p: dict) -> dict:
             combined, voxel_size=state["voxel_size"],
             max_pair_distance_um=p["max_basal_dist_um"],
         )
-        cilia_df = paired[(paired["object_type"] == "cilia") & paired["validated"]].reset_index(drop=True)
-        bb_df    = paired[(paired["object_type"] == "basal_body") & paired["validated"]].reset_index(drop=True)
+        if p.get("require_basal_body", True):
+            cilia_df = paired[(paired["object_type"] == "cilia")
+                              & paired["validated"]].reset_index(drop=True)
+            bb_df    = paired[(paired["object_type"] == "basal_body")
+                              & paired["validated"]].reset_index(drop=True)
+        else:
+            # BB distance filtering off — keep ALL cilia/BBs (pairing info kept).
+            cilia_df = paired[paired["object_type"] == "cilia"].reset_index(drop=True)
+            bb_df    = paired[paired["object_type"] == "basal_body"].reset_index(drop=True)
 
-    print(f"[LC] Done — {len(cilia_df)} validated cilia, {len(bb_df)} basal bodies paired.")
+    # Optionally take the cilium ratio from its paired basal body, then
+    # re-classify so `class` reflects the basal-body ratio.
+    if p.get("ratio_from_basal_body", True) and not cilia_df.empty:
+        cilia_df = use_basal_body_ratio(cilia_df, bb_df)
+        cilia_df["class"] = "ambiguous"
+        cilia_df.loc[cilia_df["log_ratio"] > p["neurite_threshold"], "class"] = "neurite"
+        cilia_df.loc[cilia_df["log_ratio"] < p["soma_threshold"], "class"] = "soma"
+
+    print(f"[LC] Done — {len(cilia_df)} cilia, {len(bb_df)} basal bodies "
+          f"({'paired-only' if p.get('require_basal_body', True) else 'all kept'}).")
     return dict(cilia_df=cilia_df, bb_df=bb_df)
-
-
-def _region_props(labels, voxel_size) -> dict:
-    """{label_id: (volume_voxels, volume_um3, length_um)} using anisotropic spacing."""
-    lab = np.asarray(labels).astype(np.int32)
-    if lab.size == 0 or lab.max() == 0:
-        return {}
-    spacing = tuple(float(s) for s in voxel_size)
-    vox_um3 = float(np.prod(spacing))
-    out = {}
-    try:
-        rp = regionprops_table(lab, spacing=spacing,
-                               properties=("label", "num_pixels", "axis_major_length"))
-        for i, lid in enumerate(rp["label"]):
-            n = int(rp["num_pixels"][i])
-            out[int(lid)] = (n, n * vox_um3, float(rp["axis_major_length"][i]))
-    except Exception as exc:
-        print(f"[LC] region props failed ({exc}); voxel counts only.")
-        counts = np.bincount(lab.ravel())
-        for lid in range(1, len(counts)):
-            if counts[lid]:
-                out[int(lid)] = (int(counts[lid]), counts[lid] * vox_um3, float("nan"))
-    return out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -338,6 +342,33 @@ def _remove(viewer: napari.Viewer, *names: str) -> None:
             viewer.layers.remove(n)
 
 
+def _add_image_safe(viewer, data, **kwargs):
+    """Add an Image layer with guaranteed-finite data and a non-degenerate
+    contrast window.
+
+    A constant image (min == max) or one containing NaN/inf makes napari pick
+    degenerate ``contrast_limits``, which crashes vispy's Image visual with an
+    OpenGL access violation in ``glDrawArrays``. We sanitise non-finite values
+    and always pass a contrast window with ``vmax > vmin``.
+    """
+    arr = np.asarray(data)
+    finite = np.isfinite(arr)
+    if arr.size and not finite.all():
+        fill = float(arr[finite].min()) if finite.any() else 0.0
+        arr = np.where(finite, arr, fill)
+    if np.issubdtype(arr.dtype, np.floating):
+        arr = arr.astype(np.float32, copy=False)
+    if arr.size and finite.any():
+        vmin = float(arr[finite].min()) if not finite.all() else float(arr.min())
+        vmax = float(arr[finite].max()) if not finite.all() else float(arr.max())
+    else:
+        vmin, vmax = 0.0, 1.0
+    if not (np.isfinite(vmin) and np.isfinite(vmax)) or vmax <= vmin:
+        vmax = vmin + 1.0
+    kwargs.setdefault("contrast_limits", (vmin, vmax))
+    return viewer.add_image(arr, **kwargs)
+
+
 def show_channels(viewer, state) -> None:
     vs = state["voxel_size"]
     n_ch = state["raw"].shape[0]
@@ -347,8 +378,8 @@ def show_channels(viewer, state) -> None:
         ch = _clamp_ch(n_ch, state["channels"][ch_keys[name]], name)
         lname = f"LC: Raw {name}"
         _remove(viewer, lname)
-        viewer.add_image(
-            state["raw"][ch], name=lname, scale=vs,
+        _add_image_safe(
+            viewer, state["raw"][ch], name=lname, scale=vs,
             colormap=cmap, blending="additive", visible=(name == "Cilia"),
         )
 
@@ -358,14 +389,26 @@ def show_labels(viewer, state, key, lname, scale_from="voxel_size") -> None:
     viewer.add_labels(state[key], name=lname, scale=state[scale_from])
 
 
+def show_skeleton(viewer, state) -> None:
+    """Overlay the neurite skeleton as a thin bright layer (for inspection)."""
+    if state.get("skeleton_mask") is None:
+        return
+    _remove(viewer, "LC: Neurite Skeleton")
+    _add_image_safe(
+        viewer, np.asarray(state["skeleton_mask"]).astype(np.float32),
+        name="LC: Neurite Skeleton", scale=state["voxel_size"],
+        colormap="red", blending="additive", opacity=0.9,
+    )
+
+
 def show_ratio(viewer, state) -> None:
     _remove(viewer, "LC: Log Ratio")
     lr = state["log_ratio_map"]
     finite = np.isfinite(lr)
     if finite.any():
         fill = float(np.nanmin(lr[finite]))
-        viewer.add_image(
-            np.where(finite, lr, fill), name="LC: Log Ratio",
+        _add_image_safe(
+            viewer, np.where(finite, lr, fill), name="LC: Log Ratio",
             scale=state["voxel_size"], colormap="bwr",
             opacity=0.65, blending="translucent", visible=False,
         )
@@ -506,8 +549,9 @@ class LimoncelloApp:
 
     # Cilia property columns shown in the browse table (in display order)
     _TABLE_COLS = [
-        "cilia_id", "class", "log_ratio", "ratio", "distance_to_neurite_um",
-        "dt_neurite", "dt_nuclei", "volume_um3", "length_um",
+        "cilia_id", "class", "ai_score", "ai_validated", "log_ratio", "ratio",
+        "distance_to_neurite_um", "dt_neurite", "dt_nuclei", "volume_um3",
+        "length_um", "sphericity",
         "paired_id", "pair_distance_um", "pairing_status",
     ]
 
@@ -614,6 +658,7 @@ class LimoncelloApp:
             nuclei_log=self.nuclei_log.value,
             neurite_sigma=self.neurite_sigma.value,
             neurite_log=self.neurite_log.value,
+            merge_nuclei_neurite=self.neurite_merge_nuclei.value,
             cilia_log=self.cilia_log.value,
             cilia_min_size=self.cilia_min_size.value,
             cilia_max_size=self.cilia_max_size.value,
@@ -626,8 +671,10 @@ class LimoncelloApp:
             bb_max_size=self.bb_max_size.value,
             max_cilia_dist_um=self.max_cilia_dist.value,
             max_basal_dist_um=self.max_basal_dist.value,
+            require_basal_body=self.require_bb.value,
+            ratio_from_basal_body=self.ratio_from_bb.value,
             ratio_epsilon=self.ratio_epsilon.value,
-            axon_threshold=self.axon_threshold.value,
+            neurite_threshold=self.neurite_threshold.value,
             soma_threshold=self.soma_threshold.value,
         )
         # Gaussian pre-blur was removed from the UI; segmentation runs unblurred.
@@ -942,6 +989,7 @@ class LimoncelloApp:
     def _do_neurites(self):
         def _after(v, s):
             show_labels(v, s, "neurite_labels", "LC: Neurite Labels")
+            show_skeleton(v, s)
         self._run_step(step_neurites, ("norm",), _after, "Segment neurites")
 
     def _do_bb(self):
@@ -976,7 +1024,7 @@ class LimoncelloApp:
             (step_load,          self._after_load,                                       "Load & normalise"),
             (step_cilia,         lambda v, s: show_labels(v, s, "cilia_labels",   "LC: Cilia Labels"),      "Segment cilia"),
             (step_nuclei,        lambda v, s: show_labels(v, s, "nuclei_labels",  "LC: Nuclei Labels"),     "Segment nuclei"),
-            (step_neurites,      lambda v, s: show_labels(v, s, "neurite_labels", "LC: Neurite Labels"),    "Segment neurites"),
+            (step_neurites,      lambda v, s: (show_labels(v, s, "neurite_labels", "LC: Neurite Labels"), show_skeleton(v, s)),    "Segment neurites"),
             (step_basal_bodies,  lambda v, s: show_labels(v, s, "bb_labels",      "LC: Basal Body Labels"), "Segment basal bodies"),
             (step_distances,     show_ratio,                                             "Distance maps"),
             (step_assign,        self._after_assign,                                     "Assign & classify"),
@@ -1044,6 +1092,7 @@ class LimoncelloApp:
             outline_sigma=p["nuclei_outline_sigma"], nuclei_log=p["nuclei_log"],
             nuclei_gaussian_sigma=(p["nuclei_gauss_z"], p["nuclei_gauss_y"], p["nuclei_gauss_x"]),
             neurite_spot_sigma=p["neurite_sigma"], neurite_log=p["neurite_log"],
+            merge_nuclei_neurite=p["merge_nuclei_neurite"],
             neurite_gaussian_sigma=(p["neurite_gauss_z"], p["neurite_gauss_y"], p["neurite_gauss_x"]),
             cilia_log=p["cilia_log"],
             cilia_gaussian_sigma=(p["cilia_gauss_z"], p["cilia_gauss_y"], p["cilia_gauss_x"]),
@@ -1055,8 +1104,20 @@ class LimoncelloApp:
             bb_min_size=p["bb_min_size"], bb_max_size=p["bb_max_size"],
             max_cilia_dist_cutoff_um=p["max_cilia_dist_um"],
             max_basal_body_cutoff_um=p["max_basal_dist_um"],
+            require_basal_body=p["require_basal_body"],
+            ratio_from_basal_body=p["ratio_from_basal_body"],
             ratio_epsilon=p["ratio_epsilon"],
-            axon_threshold=p["axon_threshold"], soma_threshold=p["soma_threshold"],
+            neurite_threshold=p["neurite_threshold"], soma_threshold=p["soma_threshold"],
+            # Per-cilium ROIs are now exported inside the pipeline (fast, no GUI),
+            # so they're produced whether or not live capture is on.
+            save_rois=self.batch_rois.value or self.batch_ai.value,
+            # Optional AI validation → writes csv/human_validation.csv (uses the
+            # model + threshold chosen in the 🤖 AI cilia validation section).
+            batch_ai_model=(
+                os.path.join(self._roi_models_dir(), str(self.ai_model_combo.value))
+                if self.batch_ai.value
+                and str(self.ai_model_combo.value).endswith(".pt") else None),
+            batch_ai_threshold=float(self.ai_keep_thr.value),
         )
 
         bridge = self._bridge   # emit progress from the worker thread → GUI thread
@@ -1065,11 +1126,10 @@ class LimoncelloApp:
         # thread: it hands the file's arrays to the GUI thread and blocks until
         # the screenshots are taken, so napari is only ever touched on the GUI thread.
         capture     = self.batch_capture.value
-        capture_rois = capture and self.batch_rois.value
         viz_bridge  = self._viz_bridge
 
         def _per_file(payload):
-            payload["capture_rois"] = capture_rois
+            payload["capture_rois"] = False   # ROIs handled by the pipeline now
             done = threading.Event()
             viz_bridge.visualize.emit(payload, done)
             done.wait()
@@ -1189,83 +1249,434 @@ class LimoncelloApp:
             self._clear_named_layers("LC:")
             done.set()
 
-    def _capture_cilia_rois(self, state: dict, roi_dir: Path, stem: str, margin: int = 12):
-        """One 3-D close-up screenshot per validated cilium: the cilium + its
-        paired basal body (cropped to their bounding box) with the dot + link
-        layers, auto-framed via reset_view."""
+    def _capture_cilia_rois(self, state: dict, roi_dir: Path, stem: str, margin: int = 22):
+        """Export one fast 2-D MIP thumbnail (+ raw .npz crop) per cilium.
+
+        Pure NumPy/Pillow — no napari rendering — so it's orders of magnitude
+        faster than the old per-cilium 3-D screenshot loop while still giving the
+        human a clear close-up (top-down XY + side XZ) in the Screening gallery.
+        The raw crops let a classifier later train on the actual data.
+        """
         cdf = state.get("cilia_df")
         if cdf is None or cdf.empty:
             return
-        vs           = np.asarray(state["voxel_size"], dtype=float)
-        cilia_labels = np.asarray(state["cilia_labels"])
-        bb_labels    = np.asarray(state["bb_labels"])
-        raw          = state["raw"]
-        ch           = state["channels"]
-        shp          = cilia_labels.shape
-        cz = _clamp_ch(raw.shape[0], ch["ch_cilia"], "Cilia")
-        bz = _clamp_ch(raw.shape[0], ch["ch_bb"], "Basal Bodies")
+        from limoncello.visualization.cilia_rois import save_cilia_rois
+        self._capture_progress(f"📸 {stem} — exporting {len(cdf)} cilia ROIs…")
+        try:
+            saved = save_cilia_rois(
+                state["raw"], state["cilia_labels"], state["bb_labels"],
+                cdf, state["channels"], state["voxel_size"],
+                Path(roi_dir), stem, margin=margin,
+            )
+            print(f"[LC] saved {saved}/{len(cdf)} cilia ROIs for {stem} → {roi_dir}")
+        except Exception as exc:                          # never abort the batch
+            print(f"[LC] ROI export failed for {stem}: {exc}")
 
-        # BB id → centroid (for the dot + pairing link)
-        bb_coord = {}
-        bdf = state.get("bb_df")
-        if bdf is not None and not bdf.empty:
-            for _, r in bdf.iterrows():
-                bb_coord[int(r["cilia_id"])] = np.asarray(r["coords"], dtype=float)
+    # ── AI cilia validation (run the ROI-validator CNN on this image) ─────────────
+    def _roi_models_dir(self) -> str:
+        """Codebase ``models/`` dir (next to this file), where ROI validators live."""
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+        except NameError:                                  # __file__ may be unset
+            base = os.path.abspath(".")
+        return os.path.join(base, "models")
 
-        # The whole-image LC layers would clutter the close-up — start clean.
-        self._clear_named_layers("LC:")
+    def _refresh_ai_models(self):
+        """Repopulate the AI-model dropdown from the codebase ``models/`` dir."""
+        d = self._roi_models_dir()
+        found = [f for f in sorted(os.listdir(d))
+                 if f.endswith(".pt")] if os.path.isdir(d) else []
+        self.ai_model_combo.choices = found or ["(no models found)"]
 
-        total = len(cdf)
-        saved = 0
-        for k, (_, row) in enumerate(cdf.iterrows(), 1):
-            self._capture_progress(f"📸 {stem} — ROI {k}/{total}")
+    def _do_ai_validate(self):
+        """Score this image's cilia ROIs with the chosen validator CNN and add a
+        Labels layer showing only the AI-kept (score ≥ threshold) cilia."""
+        if self._busy:
+            return
+        state = self.state
+        cdf = state.get("cilia_df")
+        if cdf is None or cdf.empty or "cilia_labels" not in state \
+                or "cilia_id" not in getattr(cdf, "columns", []):
+            show_warning("Run cilia segmentation + assign on an image first.")
+            return
+        sel = str(self.ai_model_combo.value or "")
+        mpath = os.path.join(self._roi_models_dir(), sel)
+        if not sel.endswith(".pt") or not os.path.isfile(mpath):
+            show_warning("Pick a trained model (.pt) in the AI validation section.")
+            return
+        thr = float(self.ai_keep_thr.value)
+        self._set_busy(True)
+        self._set_status("🤖 AI-validating cilia …")
+
+        @thread_worker
+        def _work():
+            import tempfile, shutil
+            from limoncello.visualization.cilia_rois import save_cilia_rois
+            from limoncello.ml.roi_validator import load_bundle, predict_proba
+            tmp = Path(tempfile.mkdtemp(prefix="lc_ai_"))
             try:
-                cid = int(row["cilia_id"])
-                pid = row.get("paired_id")
-                has_bb = pid is not None and not pd_isna(pid) and int(pid) in bb_coord
+                # Render the SAME thumbnails the model trained on (no raw crops).
+                save_cilia_rois(
+                    state["raw"], state["cilia_labels"], state["bb_labels"],
+                    cdf, state["channels"], state["voxel_size"],
+                    tmp, "ai", save_crops=False)
+                model, meta = load_bundle(mpath)
+                ids = [int(c) for c in cdf["cilia_id"].tolist()]
+                paths = [str(tmp / f"ai_cilia{c}.png") for c in ids]
+                probs = predict_proba(model, paths, size=int(meta.get("size", 64)))
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            return ids, np.asarray(probs, dtype=float)
 
-                mask = cilia_labels == cid
-                if has_bb:
-                    mask = mask | (bb_labels == int(pid))
-                pts = np.argwhere(mask)
-                if pts.size == 0:
-                    continue
-                lo = np.maximum(pts.min(0) - margin, 0)
-                hi = np.minimum(pts.max(0) + margin + 1, shp)
-                sl = tuple(slice(int(lo[i]), int(hi[i])) for i in range(3))
+        def _done(res):
+            ids, probs = res
+            keep_ids = [i for i, p in zip(ids, probs)
+                        if np.isfinite(p) and p >= thr]
+            keep_set = set(keep_ids)
+            state["ai_keep_ids"] = keep_ids
 
-                self._clear_named_layers("ROI:")
-                self.viewer.add_image(raw[cz][sl], name="ROI: Cilia ch", scale=vs,
-                                      colormap="green", blending="additive")
-                self.viewer.add_image(raw[bz][sl], name="ROI: BB ch", scale=vs,
-                                      colormap="magenta", blending="additive")
-                self.viewer.add_labels(cilia_labels[sl], name="ROI: Cilia", scale=vs)
-                self.viewer.add_labels(bb_labels[sl],    name="ROI: BB",    scale=vs)
+            # Write scores back into the cilia table + refresh the displayed grid.
+            _score = {int(i): float(p) for i, p in zip(ids, probs)
+                      if np.isfinite(p)}
+            cdf2 = state.get("cilia_df")
+            if cdf2 is not None and not cdf2.empty:
+                cdf2 = cdf2.copy()
+                cdf2["ai_score"] = [_score.get(int(c), np.nan)
+                                    for c in cdf2["cilia_id"]]
+                cdf2["ai_validated"] = [bool(int(c) in keep_set)
+                                        for c in cdf2["cilia_id"]]
+                state["cilia_df"] = cdf2
+                self._populate_table(cdf2)
 
-                c_local = np.asarray(row["coords"], dtype=float) - lo
-                self.viewer.add_points(c_local[np.newaxis], name="ROI: cilium",
-                                       scale=vs, size=4, face_color="cyan")
-                if has_bb:
-                    b_local = bb_coord[int(pid)] - lo
-                    self.viewer.add_points(b_local[np.newaxis], name="ROI: bb",
-                                           scale=vs, size=4, face_color="yellow")
-                    self.viewer.add_shapes([np.stack([c_local, b_local])], shape_type="line",
-                                           name="ROI: link", scale=vs,
-                                           edge_color="yellow", edge_width=1.0)
-                try:
-                    self.viewer.dims.ndisplay = 3
-                except Exception:
-                    pass
-                self.viewer.reset_view()
-                self._screenshot(roi_dir / f"{stem}_cilia{cid}.png")
-                saved += 1
-            except Exception as exc:                      # one bad cilium must not abort the rest
-                print(f"[LC] ROI capture failed for cilium {row.get('cilia_id')}: {exc}")
+            # Mark cilia with Points layers at their centroids (scaled to physical
+            # µm like the other centroid layers): green rings = AI-kept,
+            # red rings = AI-rejected. Each ring is labelled with its score.
+            _remove(self.viewer, "LC: AI-validated", "LC: AI-rejected",
+                    "LC: AI-kept Cilia")
 
-        self._clear_named_layers("ROI:")
-        print(f"[LC] saved {saved}/{total} cilia ROIs for {stem} → {roi_dir}")
+            def _ai_points(sub, name, color):
+                if sub.empty:
+                    return
+                _coords = np.nan_to_num(
+                    np.asarray(sub["coords"].tolist(), dtype=float))
+                _sc = sub["ai_score"].to_numpy(dtype=float)
+                self.viewer.add_points(
+                    _coords, name=name, scale=state["voxel_size"], size=10,
+                    symbol="ring", face_color=color,
+                    properties={"ai_score": _sc},
+                    text={"string": "{ai_score:.2f}", "size": 8,
+                          "color": color, "translation": [0, -6, 0]},
+                )
+
+            if cdf2 is not None and not cdf2.empty:
+                _scored = cdf2[cdf2["ai_score"].notna()]
+                _ai_points(_scored[_scored["ai_validated"]],
+                           "LC: AI-validated", "lime")
+                _ai_points(_scored[~_scored["ai_validated"]],
+                           "LC: AI-rejected", "red")
+
+            self._set_busy(False)
+            n_eval = int(np.isfinite(probs).sum())
+            self._set_status(
+                f"🤖 AI kept {len(keep_ids)}/{n_eval} cilia (score ≥ {thr:.2f}).")
+            show_info(f"AI validated {len(keep_ids)} of {n_eval} cilia.")
+
+        def _err(e):
+            self._set_busy(False)
+            show_warning(f"❌ AI validation failed: {e}")
+
+        w = _work()
+        w.returned.connect(_done)
+        w.errored.connect(_err)
+        w.start()
 
     # ── classifier training ──────────────────────────────────────────────────────
+    def _resolve_train_output(self, ch: int) -> str:
+        """Return the output ``.cl`` path: the field value if set, else a default
+        ``segmenter_ch{ch}.cl`` in the labels/input folder. Always ends in .cl
+        and is written back to the field."""
+        out = str(self.train_output.value or "").strip()
+        folder = Path(str(self.folder.value)) if self.folder.value else Path(".")
+        labels_dir = str(self.train_labels_dir.value or "")
+        if not out or out in (".", str(folder)):
+            base = Path(labels_dir) if (labels_dir and Path(labels_dir).is_dir()) else folder
+            out = str(base / f"segmenter_ch{ch}.cl")
+        if not out.lower().endswith(".cl"):
+            out += ".cl"
+        self.train_output.value = out
+        return out
+
+    # ── feature-selection grid (operation × sigma checkboxes) ────────────────
+    _OP_SHORT = {"gaussian_blur": "Gauss", "difference_of_gaussian": "DoG",
+                 "laplace_box_of_gaussian_blur": "LoG", "sobel_of_gaussian_blur": "Sobel"}
+
+    def _parse_sigmas(self):
+        """Sigma column values from the σ field, sorted & de-duplicated."""
+        out = []
+        for tok in str(self.train_feat_sigmas.value).replace(";", ",").split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                out.append(float(tok))
+            except ValueError:
+                continue
+        return sorted(dict.fromkeys(out)) or [1.0, 2.0, 3.0, 5.0, 10.0]
+
+    def _build_feature_grid(self):
+        """A checkbox grid: rows = filter operations, columns = sigma scales.
+        Ticked cells become ``operation=sigma`` features (napari-apoc style)."""
+        self._feat_sigmas = self._parse_sigmas()
+        t = QTableWidget()
+        t.setRowCount(len(FEATURE_OPERATIONS))
+        t.setVerticalHeaderLabels([self._OP_SHORT.get(o, o) for o in FEATURE_OPERATIONS])
+        t.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        t.setSelectionMode(QAbstractItemView.NoSelection)
+        # show every row, no inner scrolling (user-friendly full-size grid)
+        t.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        t.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        t.horizontalHeader().setStretchLastSection(True)
+        self.feat_table = t
+        self._populate_feature_columns(default_checked=True)
+        # double-click header to toggle a whole column would be nice, but keep simple
+        t.cellDoubleClicked.connect(self._toggle_feature_cell)
+
+    def _populate_feature_columns(self, default_checked=True, preserve=True):
+        """(Re)create grid columns from the σ list, keeping prior checks if asked."""
+        prev = {}
+        if preserve and self.feat_table.columnCount():
+            for r, op in enumerate(FEATURE_OPERATIONS):
+                for c, s in enumerate(getattr(self, "_feat_sigmas_shown", [])):
+                    it = self.feat_table.item(r, c)
+                    if it is not None:
+                        prev[(op, s)] = it.checkState() == Qt.Checked
+        sig = self._feat_sigmas
+        self.feat_table.setColumnCount(len(sig))
+        self.feat_table.setHorizontalHeaderLabels([f"σ{s:g}" for s in sig])
+        for r, op in enumerate(FEATURE_OPERATIONS):
+            for c, s in enumerate(sig):
+                it = QTableWidgetItem()
+                it.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                checked = prev.get((op, s), default_checked)
+                it.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                it.setToolTip(f"{op}={s:g}")
+                self.feat_table.setItem(r, c, it)
+        self._feat_sigmas_shown = list(sig)
+        self.feat_table.resizeColumnsToContents()
+        self._fit_feature_grid_height()
+
+    def _fit_feature_grid_height(self):
+        """Size the grid to show all rows so it never scrolls vertically."""
+        t = self.feat_table
+        h = t.horizontalHeader().height() + 2 * t.frameWidth()
+        for r in range(t.rowCount()):
+            h += t.rowHeight(r)
+        t.setFixedHeight(h)
+
+    def _rebuild_feature_columns(self):
+        self._feat_sigmas = self._parse_sigmas()
+        self._populate_feature_columns(default_checked=True, preserve=True)
+
+    def _toggle_feature_cell(self, r, c):
+        it = self.feat_table.item(r, c)
+        if it is not None:
+            it.setCheckState(Qt.Unchecked if it.checkState() == Qt.Checked else Qt.Checked)
+
+    def _feature_spec_from_grid(self) -> str:
+        """Build the APOC feature_specification from the ticked grid cells."""
+        pairs = []
+        for r, op in enumerate(FEATURE_OPERATIONS):
+            for c, s in enumerate(self._feat_sigmas_shown):
+                it = self.feat_table.item(r, c)
+                if it is not None and it.checkState() == Qt.Checked:
+                    pairs.append((op, s))
+        return feature_spec_from_pairs(pairs, bool(self.train_feat_original.value))
+
+    # ── feature-importance table (filled after training) ─────────────────────
+    def _build_importance_table(self):
+        t = QTableWidget()
+        t.setColumnCount(4)
+        t.setHorizontalHeaderLabels(["feature", "import.", "share", "weight"])
+        t.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        t.setSelectionBehavior(QAbstractItemView.SelectRows)
+        t.setMinimumHeight(200)
+        t.horizontalHeader().setStretchLastSection(True)
+        self.imp_table = t
+
+    def _set_importance_table(self, rows):
+        """Fill the importance table (rows: ``[(feature, importance), …]`` desc)
+        with share %% + weight bars, and tint the grid cells accordingly."""
+        self.imp_table.setRowCount(0)
+        if not rows:
+            return
+        mx = max((imp for _, imp in rows), default=0.0) or 1.0
+        tot = sum(imp for _, imp in rows) or 1.0
+        self.imp_table.setRowCount(len(rows))
+        for i, (feat, imp) in enumerate(rows):
+            self.imp_table.setItem(i, 0, QTableWidgetItem(str(feat)))
+            self.imp_table.setItem(i, 1, QTableWidgetItem(f"{imp:.4f}"))
+            self.imp_table.setItem(i, 2, QTableWidgetItem(f"{100 * imp / tot:.1f}%"))
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(int(round(100 * imp / mx)))
+            bar.setTextVisible(False)
+            bar.setMaximumHeight(14)
+            self.imp_table.setCellWidget(i, 3, bar)
+        self.imp_table.resizeColumnsToContents()
+        self._tint_feature_grid({str(f): imp for f, imp in rows}, mx)
+
+    def _tint_feature_grid(self, imp_by_feature, mx):
+        """Shade grid cells green by how important that feature turned out."""
+        for r, op in enumerate(FEATURE_OPERATIONS):
+            for c, s in enumerate(self._feat_sigmas_shown):
+                it = self.feat_table.item(r, c)
+                if it is None:
+                    continue
+                imp = imp_by_feature.get(f"{op}={s:g}")
+                if imp is None:
+                    it.setBackground(QColor(0, 0, 0, 0))
+                    it.setToolTip(f"{op}={s:g}")
+                else:
+                    frac = max(0.0, min(1.0, imp / mx))
+                    it.setBackground(QColor(46, 204, 113, int(40 + 180 * frac)))
+                    it.setToolTip(f"{op}={s:g} · importance {imp:.4f}")
+
+    def _refresh_train_annotation(self, *_):
+        """Sync the annotation-layer dropdown with the Labels layers in the viewer."""
+        names = [lyr.name for lyr in self.viewer.layers
+                 if isinstance(lyr, napari.layers.Labels)]
+        cur = self.train_annotation.value
+        self.train_annotation.choices = names
+        if names:
+            self.train_annotation.value = cur if cur in names else names[-1]
+
+    def _do_train_current(self):
+        """APOC-plugin style: train (or extend) a classifier on the currently
+        loaded image channel + a painted annotation layer, then preview the
+        prediction as a new Labels layer in the viewer."""
+        if self._busy:
+            return
+        if not self.state or "raw" not in self.state:
+            show_warning("Load an image first (step 1 · Load & normalise).")
+            return
+        ann_name = self.train_annotation.value
+        layer = next((lyr for lyr in self.viewer.layers
+                      if lyr.name == ann_name and isinstance(lyr, napari.layers.Labels)),
+                     None)
+        if layer is None:
+            show_warning("Pick an annotation (Labels) layer. Use '🏷️ New empty "
+                         "label layer', then paint background=1 and object=2.")
+            return
+        ch  = self.train_channel.value
+        chc = _clamp_ch(self.state["raw"].shape[0], ch, "train")
+        image = np.asarray(self.state["raw"][chc])
+        gt    = np.asarray(layer.data)
+        pos   = self.train_positive.value
+        if gt.shape != image.shape:
+            show_warning(f"Annotation shape {gt.shape} ≠ image channel shape "
+                         f"{image.shape}. Create the label layer while this image "
+                         "is loaded.")
+            return
+        if int(gt.max()) < pos:
+            show_warning(f"Paint background=1 and object={pos} before training.")
+            return
+
+        out = self._resolve_train_output(chc)
+        features = self._feature_spec_from_grid()
+        cont = bool(self.train_continue.value)
+        gpu  = self.gpu_combo.value
+        vs   = self.state["voxel_size"]
+        img_shape = image.shape
+        params = dict(positive_class=pos, max_depth=self.train_max_depth.value,
+                      num_trees=self.train_num_trees.value)
+
+        self._set_busy(True)
+        self._progress_busy("Training on current image …")
+        self._set_status(f"🎓 {'Extending' if cont else 'Training'} classifier on "
+                         f"current image (ch {chc}) …")
+
+        @thread_worker
+        def _work():
+            _select_device(gpu)
+            train_segmenter_single(image, gt, out, features=features,
+                                   continue_training=cont, gpu_device=None, **params)
+            pred = predict_segmenter(image, out, gpu_device=None)
+            return dict(out=out, pred=pred, channel=chc)
+
+        def _done(res):
+            self._set_busy(False)
+            _remove(self.viewer, "LC: Prediction (train)")
+            pred = np.asarray(res["pred"])
+            if pred.shape != img_shape and pred.size == int(np.prod(img_shape)):
+                pred = pred.reshape(img_shape)
+            self.viewer.add_labels(pred, name="LC: Prediction (train)", scale=vs)
+            if res["channel"] == self.ch_cilia.value:
+                self.classifier.value = res["out"]
+            elif res["channel"] == self.ch_bb.value:
+                self.bb_classifier.value = res["out"]
+            try:
+                self._set_importance_table(read_feature_importances(res["out"]))
+            except Exception as exc:                      # noqa: BLE001
+                print(f"[LC] could not read feature importances: {exc}")
+            msg = (f"✅ {'Extended' if cont else 'Trained'} → {Path(res['out']).name}"
+                   "  · preview layer added")
+            self._set_status(msg)
+            show_info(msg)
+
+        def _err(e):
+            self._set_busy(False)
+            show_warning(f"❌ Training failed: {e}")
+
+        w = _work()
+        w.returned.connect(_done)
+        w.errored.connect(_err)
+        w.start()
+
+    def _do_predict_current(self):
+        """Apply the classifier in the output field to the current image channel
+        and show the raw prediction — no retraining."""
+        if self._busy:
+            return
+        if not self.state or "raw" not in self.state:
+            show_warning("Load an image first (step 1 · Load & normalise).")
+            return
+        cl = str(self.train_output.value or "").strip()
+        if not cl or not Path(cl).is_file():
+            show_warning("No classifier .cl to apply — train one first or pick a file.")
+            return
+        ch  = self.train_channel.value
+        chc = _clamp_ch(self.state["raw"].shape[0], ch, "predict")
+        image = np.asarray(self.state["raw"][chc])
+        gpu = self.gpu_combo.value
+        vs  = self.state["voxel_size"]
+        img_shape = image.shape
+
+        self._set_busy(True)
+        self._progress_busy("Predicting …")
+
+        @thread_worker
+        def _work():
+            _select_device(gpu)
+            return predict_segmenter(image, cl, gpu_device=None)
+
+        def _done(pred):
+            self._set_busy(False)
+            _remove(self.viewer, "LC: Prediction (train)")
+            pred = np.asarray(pred)
+            if pred.shape != img_shape and pred.size == int(np.prod(img_shape)):
+                pred = pred.reshape(img_shape)
+            self.viewer.add_labels(pred, name="LC: Prediction (train)", scale=vs)
+            self._set_status(f"👁 Applied {Path(cl).name} to current image (ch {chc}).")
+
+        def _err(e):
+            self._set_busy(False)
+            show_warning(f"❌ Prediction failed: {e}")
+
+        w = _work()
+        w.returned.connect(_done)
+        w.errored.connect(_err)
+        w.start()
+
     def _do_train(self):
         """Train one APOC ObjectSegmenter on a chosen subset of images using their
         raw (un-normalised) channel + matching ``<stem>_labels.tif`` annotations."""
@@ -1275,22 +1686,37 @@ class LimoncelloApp:
         if not folder.is_dir():
             show_warning("Scan a valid input folder first.")
             return
-        selected = list(self.train_images.value or [])
-        if not selected:
-            show_warning("Select one or more images (subset) to train on.")
-            return
         labels_dir = str(self.train_labels_dir.value)
         if not labels_dir or not Path(labels_dir).is_dir():
             show_warning("Select a valid labels folder (with <stem>_labels.tif files).")
             return
-        out = str(self.train_output.value)
-        if not out or out in (".", str(folder)):
-            show_warning("Choose an output .cl path for the classifier.")
-            return
+
+        # Training set: either every scanned image that has a matching labels file
+        # (default — decoupled from the click-to-view selection), or just the
+        # images explicitly selected in the subset list.
+        if self.train_all_labeled.value:
+            selected = [f for f in (self.files or [])
+                        if find_labels_file(labels_dir, Path(f).stem) is not None]
+            if not selected:
+                show_warning(f"No <stem>_labels.tif found in {labels_dir} for any "
+                             "scanned image. Save some annotations first.")
+                return
+        else:
+            selected = list(self.train_images.value or [])
+            if not selected:
+                show_warning("Select one or more images (subset) to train on, "
+                             "or tick 'Train on ALL images with labels'.")
+                return
+
+        ch = self.train_channel.value
+        out = self._resolve_train_output(ch)             # default name, always .cl
+        features = self._feature_spec_from_grid()        # ticked op×σ grid cells
 
         image_paths = [str(folder / name) for name in selected]
-        ch          = self.train_channel.value
         gpu         = self.gpu_combo.value
+        # Match the geometry the annotations were painted on (MIP / isotropic).
+        use_mip  = bool(self.use_mip.value)
+        make_iso = bool(self.make_iso.value)
         params = dict(
             positive_class=self.train_positive.value,
             max_depth=self.train_max_depth.value,
@@ -1304,12 +1730,16 @@ class LimoncelloApp:
         @thread_worker
         def _work():
             _select_device(gpu)
-            pairs, skipped = load_training_pairs(image_paths, labels_dir, ch)
+            pairs, skipped = load_training_pairs(image_paths, labels_dir, ch,
+                                                 use_mip=use_mip, make_iso=make_iso)
             if not pairs:
                 reasons = "; ".join(f"{s}: {r}" for s, r in skipped) or "no usable pairs"
                 raise RuntimeError(f"No (image, labels) pairs to train on — {reasons}")
-            train_object_segmenter(pairs, out, gpu_device=None, **params)
-            return dict(n=len(pairs), skipped=skipped, out=out, channel=ch)
+            skip_stems = {s for s, _ in skipped}
+            used = [Path(p).stem for p in image_paths if Path(p).stem not in skip_stems]
+            print(f"[LC] training on {len(pairs)} image(s): {', '.join(used)}")
+            train_object_segmenter(pairs, out, features=features, gpu_device=None, **params)
+            return dict(n=len(pairs), skipped=skipped, out=out, channel=ch, used=used)
 
         def _done(res):
             self._set_busy(False)
@@ -1318,9 +1748,16 @@ class LimoncelloApp:
                 self.classifier.value = res["out"]
             elif res["channel"] == self.ch_bb.value:
                 self.bb_classifier.value = res["out"]
-            msg = f"✅ Trained on {res['n']} image(s) → {Path(res['out']).name}"
+            # Feature-importance statistics table
+            try:
+                self._set_importance_table(read_feature_importances(res["out"]))
+            except Exception as exc:                      # noqa: BLE001
+                print(f"[LC] could not read feature importances: {exc}")
+            msg = (f"✅ Trained on {res['n']} image(s) → {Path(res['out']).name}  "
+                   f"[{', '.join(res['used'])}]")
             if res["skipped"]:
-                msg += f"  ({len(res['skipped'])} skipped)"
+                msg += f"  ({len(res['skipped'])} skipped: " \
+                       + ", ".join(s for s, _ in res["skipped"]) + ")"
                 for s, r in res["skipped"]:
                     print(f"[LC] train skipped {s}: {r}")
             self._set_status(msg)
@@ -1334,6 +1771,21 @@ class LimoncelloApp:
         w.returned.connect(_done)
         w.errored.connect(_err)
         w.start()
+
+    def _on_train_image_clicked(self, *_):
+        """Selecting an image in the training subset loads it into the viewer with
+        the current channel / normalisation / MIP / isotropic settings."""
+        if self._busy:
+            return
+        cur = set(self.train_images.value or [])
+        added = cur - self._train_sel_prev
+        self._train_sel_prev = cur
+        if not added:
+            return
+        name = sorted(added)[0]
+        if name in (self.file_combo.choices or ()):
+            self.file_combo.value = name          # triggers _on_file_changed (clears state)
+            self._do_load()                       # load & display with current settings
 
     # ── label maker (annotations for training) ───────────────────────────────────
     def _ref_image_layer(self):
@@ -1352,7 +1804,7 @@ class LimoncelloApp:
             return
         shape = np.asarray(ref.data).shape
         lyr = self.viewer.add_labels(
-            np.zeros(shape, dtype=np.uint16), name="labels", scale=ref.scale,
+            np.zeros(shape, dtype=np.uint16), name="Annotations", scale=ref.scale,
         )
         lyr.selected_label = 2          # start painting the 'object' class
         try:
@@ -1360,7 +1812,13 @@ class LimoncelloApp:
         except Exception:
             pass
         self.viewer.layers.selection.active = lyr
-        show_info("Empty label layer added. Paint background=1, object=2, then Save.")
+        self._refresh_train_annotation()
+        try:
+            self.train_annotation.value = lyr.name
+        except Exception:
+            pass
+        show_info("Empty label layer added. Paint background=1, object=2, then "
+                  "'🎓 Train + preview'.")
 
     def _save_label_layer(self):
         """Save the selected layer as ``<opened-file>_labels.tif`` (the naming the
@@ -1425,8 +1883,8 @@ class LimoncelloApp:
         nav = Container(widgets=[prev_btn, next_btn], layout="horizontal", label="")
 
         # Channels
-        self.ch_cilia    = SpinBox(label="Ch: Cilia",        value=0, min=0, max=9)
-        self.ch_neurites = SpinBox(label="Ch: Neurites",     value=1, min=0, max=9)
+        self.ch_cilia    = SpinBox(label="Ch: Cilia",        value=1, min=0, max=9)
+        self.ch_neurites = SpinBox(label="Ch: Neurites",     value=0, min=0, max=9)
         self.ch_bb       = SpinBox(label="Ch: Basal Bodies", value=2, min=0, max=9)
         self.ch_nuclei   = SpinBox(label="Ch: Nuclei",       value=3, min=0, max=9)
         self.use_mip     = CheckBox(label="MIP (2-D projection)", value=False)
@@ -1466,10 +1924,12 @@ class LimoncelloApp:
         # Neurites
         self.neurite_sigma = SpinBox(label="Neurite spot σ", value=5, min=1, max=20)
         self.neurite_log   = CheckBox(label="Neurite log", value=False)
+        self.neurite_merge_nuclei = CheckBox(
+            label="Merge nuclei into neurite before skeletonising", value=False)
         # Cilia
         self.cilia_log      = CheckBox(label="Cilia log", value=False)
         self.cilia_min_size = SpinBox(label="Cilia min vox", value=10, min=0, max=100000)
-        self.cilia_max_size = SpinBox(label="Cilia max vox (0=off)", value=70, min=0, max=1000000)
+        self.cilia_max_size = SpinBox(label="Cilia max vox (0=off)", value=0, min=0, max=1000000)
         # Basal bodies
         self.bb_method        = ComboBox(label="BB method",
                                          choices=["Voronoi-Otsu", "APOC classifier"],
@@ -1487,28 +1947,60 @@ class LimoncelloApp:
         # Distances / classification
         self.max_cilia_dist = FloatSpinBox(label="Max cilia dist (µm)", value=2.0, min=0.1, max=30.0, step=0.5)
         self.max_basal_dist = FloatSpinBox(label="Max BB dist (µm)",    value=5.0, min=0.1, max=30.0, step=0.5)
+        self.require_bb     = CheckBox(label="Require basal body (filter by BB distance)", value=True)
+        self.ratio_from_bb  = CheckBox(label="Ratio from basal body position", value=True)
         self.ratio_epsilon  = FloatSpinBox(label="Ratio ε",             value=1.0, min=0.0, max=10.0, step=0.1)
-        self.axon_threshold = FloatSpinBox(label="Axon log-ratio thr",  value=2.5, min=0.0, max=10.0, step=0.1)
-        self.soma_threshold = FloatSpinBox(label="Soma log-ratio thr",  value=1.0, min=0.0, max=10.0, step=0.1)
+        self.neurite_threshold = FloatSpinBox(label="Neurite log-ratio thr",  value=-0.1, min=-10, max=10.0, step=0.1)
+        self.soma_threshold = FloatSpinBox(label="Soma log-ratio thr",  value=0.1, min=-10, max=10.0, step=0.1)
 
-        # ── Train an APOC classifier on a subset of images (raw, no normalisation) ─
-        self.train_images = Select(label="Images (subset)", choices=())
-        self.train_labels_dir = FileEdit(
-            label="Labels folder (<stem>_labels.tif)", mode="d",
-        )
-        # Label maker: save the selected napari layer as <opened-file>_labels.tif
+        # ── Train an APOC ObjectSegmenter (napari-apoc-plugin style) ────────────
+        # 1) Annotate: paint a Labels layer in the viewer, pick it here.
         self.new_label_btn  = PushButton(text="🏷️ New empty label layer")
         self.new_label_btn.clicked.connect(self._new_label_layer)
-        self.save_label_btn = PushButton(text="💾 Save selected layer as <file>_labels.tif")
-        self.save_label_btn.clicked.connect(self._save_label_layer)
+        self.train_annotation = ComboBox(label="Annotation layer", choices=())
+        self.refresh_ann_btn = PushButton(text="🔄 Refresh layer list")
+        self.refresh_ann_btn.clicked.connect(self._refresh_train_annotation)
         self.train_channel = SpinBox(label="Train channel", value=0, min=0, max=9)
-        self.train_output  = FileEdit(label="Output classifier (.cl)", mode="w",
-                                      filter="APOC classifier (*.cl)")
+        # 2) Features (op × σ checkbox grid, apoc-style) / model.
+        self.train_feat_sigmas = LineEdit(label="σ columns", value="1,2,3,5,10")
+        self.apply_sigma_btn = PushButton(text="↻ Apply σ columns")
+        self.apply_sigma_btn.clicked.connect(lambda *_: self._rebuild_feature_columns())
+        self.train_feat_original = CheckBox(label="include 'original' intensity", value=True)
+        self._build_feature_grid()                       # self.feat_table
         self.train_positive = SpinBox(label="Positive class id", value=2, min=1, max=10)
         self.train_max_depth = SpinBox(label="Tree max depth", value=2, min=1, max=10)
         self.train_num_trees = SpinBox(label="Num trees", value=100, min=10, max=500)
-        self.train_btn = PushButton(text="🎓 Train classifier (subset)")
+        self.train_output  = FileEdit(label="Output classifier (.cl)", mode="w",
+                                      filter="APOC classifier (*.cl)")
+        self.train_continue = CheckBox(
+            label="Continue training (accumulate across images)", value=False)
+        # 3) Train + preview on the current image (interactive).
+        self.train_current_btn = PushButton(text="🎓 Train + preview on current image")
+        self.train_current_btn.clicked.connect(self._do_train_current)
+        self.predict_btn = PushButton(text="👁 Apply classifier to current image")
+        self.predict_btn.clicked.connect(self._do_predict_current)
+        self._build_importance_table()                   # self.imp_table
+
+        # ── Optional: batch-train across many saved <stem>_labels.tif files ─────
+        self.train_labels_dir = FileEdit(
+            label="Labels folder (<stem>_labels.tif)", mode="d",
+        )
+        self.save_label_btn = PushButton(text="💾 Save selected layer as <file>_labels.tif")
+        self.save_label_btn.clicked.connect(self._save_label_layer)
+        self.train_all_labeled = CheckBox(
+            label="Train on ALL images with labels (ignore view selection)", value=True)
+        self.train_images = Select(label="Images (subset)", choices=())
+        self.train_btn = PushButton(text="🎓 Batch-train from saved label files")
         self.train_btn.clicked.connect(self._do_train)
+        # Click an image in the subset → load it into the viewer with current settings
+        self._train_sel_prev: set[str] = set()
+        self.train_images.changed.connect(self._on_train_image_clicked)
+        # Keep the annotation dropdown in sync with the viewer's Labels layers.
+        try:
+            self.viewer.layers.events.inserted.connect(self._refresh_train_annotation)
+            self.viewer.layers.events.removed.connect(self._refresh_train_annotation)
+        except Exception:
+            pass
 
         # Step buttons
         load_btn     = PushButton(text="1 · Load & normalise")
@@ -1533,12 +2025,23 @@ class LimoncelloApp:
         self.batch_btn = PushButton(text="⚡ Run BATCH (whole folder)")
         self.batch_btn.clicked.connect(self._do_batch)
         # Live batch visualisation: show each file's layers in the viewer and
-        # save overlay screenshots (+ optional per-cilium 3-D ROI close-ups).
-        self.batch_capture = CheckBox(label="Capture screenshots during batch", value=True)
-        self.batch_rois    = CheckBox(label="↳ also save per-cilium 3-D ROIs", value=True)
-        self.batch_capture.changed.connect(
-            lambda *_: setattr(self.batch_rois, "enabled", self.batch_capture.value)
-        )
+        # save the whole-image overlay screenshots. The per-cilium ROIs are now
+        # exported by the pipeline itself (fast MIP thumbnails + raw crops), so
+        # they no longer depend on live capture being on.
+        self.batch_capture = CheckBox(label="Capture overlay screenshots during batch", value=True)
+        self.batch_rois    = CheckBox(label="Save per-cilium ROI thumbnails + crops", value=True)
+        self.batch_ai      = CheckBox(label="AI-validate cilia during batch", value=False)
+
+        # Optional AI validation: score this image's cilia ROIs with a trained
+        # validator CNN and show only the kept ones as a Labels layer.
+        self.ai_model_combo  = ComboBox(label="AI model", choices=())
+        self.ai_keep_thr     = FloatSpinBox(label="Keep if score ≥", value=0.6,
+                                            min=0.5, max=0.99, step=0.01)
+        self.ai_refresh_btn  = PushButton(text="⟳ Refresh models")
+        self.ai_validate_btn = PushButton(text="🤖 AI-validate cilia (this image)")
+        self.ai_refresh_btn.clicked.connect(self._refresh_ai_models)
+        self.ai_validate_btn.clicked.connect(self._do_ai_validate)
+        self._refresh_ai_models()
 
         self.status = Label(value="Open a folder to begin.")
         self.progress = QProgressBar()
@@ -1556,8 +2059,13 @@ class LimoncelloApp:
             widgets=[*self._step_buttons, self.run_all_btn], labels=False,
         )
         batch_box = Container(
-            widgets=[self.output, self.batch_capture, self.batch_rois, self.batch_btn],
+            widgets=[self.output, self.batch_capture, self.batch_rois,
+                     self.batch_ai, self.batch_btn],
             labels=True,
+        )
+        ai_box = Container(
+            widgets=[self.ai_model_combo, self.ai_keep_thr,
+                     self.ai_refresh_btn, self.ai_validate_btn], labels=True,
         )
 
         channels_box = Container(
@@ -1569,7 +2077,9 @@ class LimoncelloApp:
             widgets=[self.nuclei_sigma, self.tophat_radius,
                      self.nuclei_outline_sigma, self.nuclei_log], labels=True,
         )
-        neurite_box = Container(widgets=[self.neurite_sigma, self.neurite_log], labels=True)
+        neurite_box = Container(
+            widgets=[self.neurite_sigma, self.neurite_log, self.neurite_merge_nuclei],
+            labels=True)
         cilia_box = Container(
             widgets=[self.classifier, self.cilia_log,
                      self.cilia_min_size, self.cilia_max_size], labels=True,
@@ -1581,14 +2091,32 @@ class LimoncelloApp:
         )
         self._on_bb_method_changed()   # set initial widget visibility
         dist_box = Container(
-            widgets=[self.max_cilia_dist, self.max_basal_dist, self.ratio_epsilon,
-                     self.axon_threshold, self.soma_threshold], labels=True,
+            widgets=[self.max_cilia_dist, self.max_basal_dist, self.require_bb,
+                     self.ratio_from_bb, self.ratio_epsilon,
+                     self.neurite_threshold, self.soma_threshold], labels=True,
         )
-        train_box = Container(
-            widgets=[self.train_images, self.train_labels_dir,
-                     self.new_label_btn, self.save_label_btn,
-                     self.train_channel, self.train_output, self.train_positive,
-                     self.train_max_depth, self.train_num_trees, self.train_btn],
+        # The training section mixes magicgui widgets with two native Qt tables
+        # (feature grid + importance), so it is assembled as a native wrapper
+        # (``train_wrap``) below rather than a single magicgui Container.
+        train_ann_box = Container(
+            widgets=[
+                Label(value="① Annotate — paint a Labels layer, pick it below"),
+                self.new_label_btn, self.train_annotation, self.refresh_ann_btn,
+                self.train_channel,
+            ], labels=True,
+        )
+        train_sig_box = Container(
+            widgets=[self.train_feat_sigmas, self.apply_sigma_btn,
+                     self.train_feat_original], labels=True,
+        )
+        train_model_box = Container(
+            widgets=[self.train_positive, self.train_max_depth, self.train_num_trees,
+                     self.train_output, self.train_continue,
+                     self.train_current_btn, self.predict_btn], labels=True,
+        )
+        train_batch_box = Container(
+            widgets=[self.train_labels_dir, self.save_label_btn,
+                     self.train_all_labeled, self.train_images, self.train_btn],
             labels=True,
         )
 
@@ -1598,12 +2126,28 @@ class LimoncelloApp:
             lbl.setStyleSheet("font-weight:600; margin-top:6px; color:#F5A623;")
             return lbl
 
-        def _collapsible(title: str, box: Container, expanded: bool = False) -> QCollapsible:
+        def _collapsible(title: str, box, expanded: bool = False) -> QCollapsible:
             col = QCollapsible(title)
-            col.addWidget(box.native)
+            col.addWidget(box.native if isinstance(box, Container) else box)
             if expanded:
                 col.expand(animate=False)
             return col
+
+        # Native wrapper for the training section: containers + the two Qt tables.
+        train_wrap = QWidget()
+        _tw = QVBoxLayout(train_wrap)
+        _tw.setContentsMargins(0, 0, 0, 0)
+        _tw.setSpacing(4)
+        _tw.addWidget(train_ann_box.native)
+        _tw.addWidget(_header("② Features  (tick op × σ; double-click toggles)"))
+        _tw.addWidget(train_sig_box.native)
+        _tw.addWidget(self.feat_table)
+        _tw.addWidget(_header("Model"))
+        _tw.addWidget(train_model_box.native)
+        _tw.addWidget(_header("③ Feature importances (after training)"))
+        _tw.addWidget(self.imp_table)
+        _tw.addWidget(_header("— Batch option: train from saved label files —"))
+        _tw.addWidget(train_batch_box.native)
 
         content = QWidget()
         lay = QVBoxLayout(content)
@@ -1615,6 +2159,7 @@ class LimoncelloApp:
 
         lay.addWidget(_header("② Step through one image"))
         lay.addWidget(steps_box.native)
+        lay.addWidget(_collapsible("🤖 AI cilia validation (optional)", ai_box, False))
 
         lay.addWidget(_header("③ Batch (whole folder)"))
         lay.addWidget(batch_box.native)
@@ -1640,7 +2185,7 @@ class LimoncelloApp:
             ("Cilia", cilia_box, False),
             ("Basal bodies", bb_box, False),
             ("Distance & classification", dist_box, False),
-            ("🎓 Train classifier", train_box, False),
+            ("🎓 Train classifier", train_wrap, False),
         ]:
             lay.addWidget(_collapsible(title, box, expanded))
             if title == "Normalisation":

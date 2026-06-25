@@ -45,6 +45,63 @@ DEFAULT_FEATURES = (
 )
 
 
+# APOC feature operations selectable for training (besides the raw "original").
+FEATURE_OPERATIONS = [
+    "gaussian_blur",
+    "difference_of_gaussian",
+    "laplace_box_of_gaussian_blur",
+    "sobel_of_gaussian_blur",
+]
+
+
+def build_feature_spec(operations, sigmas, include_original: bool = True) -> str:
+    """Build an APOC ``feature_specification`` string from selected operations and
+    sigma scales, e.g. ``"gaussian_blur=1 difference_of_gaussian=1 … original"``.
+
+    Falls back to :data:`DEFAULT_FEATURES` if nothing usable is selected.
+    """
+    ops = [o for o in operations if o in FEATURE_OPERATIONS]
+    parts = [f"{op}={s:g}" for s in sigmas for op in ops]
+    if include_original:
+        parts.append("original")
+    return " ".join(parts) if (ops and parts) else DEFAULT_FEATURES
+
+
+def feature_spec_from_pairs(pairs, include_original: bool = True) -> str:
+    """Build an APOC ``feature_specification`` from explicit ``(operation, sigma)``
+    pairs (e.g. from a selection grid), e.g. ``[("gaussian_blur", 1), …]`` →
+    ``"gaussian_blur=1 …"``. Falls back to :data:`DEFAULT_FEATURES` if empty."""
+    parts = [f"{op}={float(s):g}" for op, s in pairs if op in FEATURE_OPERATIONS]
+    if include_original:
+        parts.append("original")
+    # "original" alone isn't a usable feature set — require at least one filter.
+    return " ".join(parts) if any(op in FEATURE_OPERATIONS for op, _ in pairs) else DEFAULT_FEATURES
+
+
+def read_feature_importances(cl_path) -> list[tuple[str, float]]:
+    """Parse a trained ``.cl`` header into ``[(feature, importance), …]`` sorted by
+    importance (descending). Returns ``[]`` if the fields are missing."""
+    spec = imps = None
+    try:
+        with open(cl_path, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("feature_specification"):
+                    spec = line.split("=", 1)[1].split()
+                elif line.startswith("feature_importances"):
+                    imps = [float(x) for x in line.split("=", 1)[1].split(",") if x.strip()]
+                if spec is not None and imps is not None:
+                    break
+    except Exception:                                     # noqa: BLE001
+        return []
+    if not spec or not imps:
+        return []
+    n = min(len(spec), len(imps))
+    rows = list(zip(spec[:n], imps[:n]))
+    rows.sort(key=lambda t: t[1], reverse=True)
+    return rows
+
+
 def _read_labels(path) -> np.ndarray:
     """Read a label/annotation image, preferring tifffile, falling back to skimage."""
     try:
@@ -77,15 +134,36 @@ def _squeeze_single_z(arr: np.ndarray) -> np.ndarray:
     return arr
 
 
+def _preprocess_geometry(raw_zyx, voxel_size, *, use_mip: bool, make_iso: bool):
+    """Apply the same geometry transforms the GUI uses at load time so the raw
+    training image matches the resolution the annotation was painted on.
+
+    Mirrors ``napari_app.step_load``: MIP collapses Z; otherwise, anisotropic
+    voxels are resampled to isotropic (coarsest spacing). Intensities are *not*
+    normalised (training runs on raw values)."""
+    raw_zyx = np.asarray(raw_zyx)
+    if use_mip:
+        return np.max(raw_zyx, axis=0, keepdims=True)
+    if make_iso and voxel_size is not None:
+        iso = max(voxel_size)
+        if not all(abs(v - iso) < 1e-6 for v in voxel_size):
+            from ..preprocessing.preprocessing import make_isotropic
+            return make_isotropic(raw_zyx, voxel_size, iso)[0]
+    return raw_zyx
+
+
 def load_training_pairs(image_paths, labels_dir, channel: int,
-                        labels_suffix: str = "_labels"):
+                        labels_suffix: str = "_labels",
+                        *, use_mip: bool = False, make_iso: bool = False):
     """
     Build ``[(raw_channel_image, ground_truth), …]`` for training.
 
     For each ``.ims`` path, loads the requested raw ``channel`` (no
-    normalisation) and the matching ``<stem><labels_suffix>.tif``. Single-Z
-    stacks are squeezed to 2-D. Pairs whose label file is missing or whose
-    shape disagrees with the image are skipped.
+    normalisation), applies the same MIP / isotropic-resampling the GUI used
+    when the annotation was painted (so shapes match), and pairs it with the
+    matching ``<stem><labels_suffix>.tif``. Single-Z stacks are squeezed to
+    2-D. Pairs whose label file is missing or whose shape disagrees with the
+    (preprocessed) image are skipped.
 
     Returns
     -------
@@ -102,18 +180,89 @@ def load_training_pairs(image_paths, labels_dir, channel: int,
             skipped.append((stem, "no matching labels .tif"))
             continue
 
-        img, _ = load_image(p)
+        img, meta = load_image(p)
         n_ch = img.shape[1]
         ch = int(np.clip(channel, 0, n_ch - 1))
-        raw = _squeeze_single_z(np.asarray(img[0, ch]))
+        voxel_size = (meta or {}).get("voxel_size") or None
+        raw_zyx = _preprocess_geometry(
+            np.asarray(img[0, ch]), voxel_size, use_mip=use_mip, make_iso=make_iso)
+        raw = _squeeze_single_z(raw_zyx)
         gt = _squeeze_single_z(_read_labels(lp))
 
         if gt.shape != raw.shape:
-            skipped.append((stem, f"labels shape {gt.shape} != image {raw.shape}"))
+            skipped.append((stem, f"labels shape {gt.shape} != image {raw.shape} "
+                                  "(check MIP / 'make isotropic' match how you "
+                                  "annotated)"))
             continue
         pairs.append((raw, gt))
 
     return pairs, skipped
+
+
+def train_segmenter_single(
+    image,
+    ground_truth,
+    output_cl,
+    *,
+    features: str | None = None,
+    continue_training: bool = False,
+    positive_class: int = 2,
+    max_depth: int = 2,
+    num_trees: int = 100,
+    gpu_device: str | None = None,
+) -> str:
+    """Train (or extend) an APOC ``ObjectSegmenter`` from a single in-viewer
+    annotation, the way the napari-apoc plugin does.
+
+    With ``continue_training=False`` a fresh classifier is written to
+    ``output_cl`` (any existing file is replaced). With ``continue_training=True``
+    the annotation is *added* to the existing classifier at ``output_cl`` so you
+    can paint on several images in turn and accumulate one model.
+    """
+    from apoc import ObjectSegmenter
+
+    if gpu_device:
+        import pyclesperanto_prototype as cle
+        cle.select_device(gpu_device)
+
+    feats = features or DEFAULT_FEATURES
+    out = Path(output_cl)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.exists() and not continue_training:
+        out.unlink()                                  # start fresh
+
+    image = _squeeze_single_z(np.asarray(image))
+    ground_truth = _squeeze_single_z(np.asarray(ground_truth))
+    if ground_truth.shape != image.shape:
+        raise ValueError(
+            f"Annotation shape {ground_truth.shape} != image shape {image.shape}.")
+    if int(np.max(ground_truth)) < positive_class:
+        raise ValueError(
+            f"Annotation has no '{positive_class}' (object) voxels — paint "
+            f"background=1 and object={positive_class} before training.")
+
+    segmenter = ObjectSegmenter(
+        opencl_filename=str(out),
+        positive_class_identifier=positive_class,
+        max_depth=max_depth,
+        num_ensembles=num_trees,
+    )
+    segmenter.train(feats, ground_truth, image,
+                    continue_training=bool(continue_training) and out.exists())
+    return str(out)
+
+
+def predict_segmenter(image, cl_path, *, gpu_device: str | None = None) -> np.ndarray:
+    """Run a trained ``ObjectSegmenter`` (``.cl``) on ``image`` and return the
+    raw object-label result — the napari-apoc 'preview' (no size filtering)."""
+    from apoc import ObjectSegmenter
+
+    if gpu_device:
+        import pyclesperanto_prototype as cle
+        cle.select_device(gpu_device)
+    seg = ObjectSegmenter(opencl_filename=str(cl_path))
+    image = _squeeze_single_z(np.asarray(image))
+    return np.asarray(seg.predict(image=image))
 
 
 def train_object_segmenter(

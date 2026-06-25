@@ -5,7 +5,7 @@ import os
 from datetime import datetime
 from scipy.ndimage import center_of_mass
 from ..utils.gpu_distance import distance_transform_edt
-from skimage.measure import regionprops_table
+from ..utils.shape_props import cilia_shape_props, SHAPE_COLS
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -21,7 +21,7 @@ from ..segmentation.cilia import segment_cilia_ml
 from ..segmentation.basal_bodies import segment_basal_bodies, segment_basal_bodies_ml
 from ..qc.qc import run_qc, save_qc_excel, scatter_plot
 from ..analysis.pair_cilia_to_bb import pair_from_mixed_df
-from ..utils.assign_label_features import assign_label_features
+from ..utils.assign_label_features import assign_label_features, use_basal_body_ratio
 import pyclesperanto_prototype as cle
 
 
@@ -41,36 +41,6 @@ def _flush_gpu():
     gc.collect()
 
 
-def _region_props_3d(labels, voxel_size):
-    """Per-label 3-D region properties from a label volume (Z, Y, X).
-
-    Returns {label_id: (volume_voxels, volume_um3, length_um)} where the
-    physical quantities use the anisotropic ``voxel_size`` (z, y, x in µm).
-    """
-    lab = np.asarray(labels).astype(np.int32)
-    if lab.size == 0 or lab.max() == 0:
-        return {}
-    spacing = tuple(float(s) for s in voxel_size)
-    vox_um3 = float(np.prod(spacing))
-    out = {}
-    try:
-        rp = regionprops_table(
-            lab, spacing=spacing,
-            properties=("label", "num_pixels", "axis_major_length"),
-        )
-        for i, lid in enumerate(rp["label"]):
-            n_vox = int(rp["num_pixels"][i])
-            out[int(lid)] = (n_vox, n_vox * vox_um3, float(rp["axis_major_length"][i]))
-    except Exception as exc:
-        # Fall back to voxel counts only (no physical length) if regionprops fails
-        print(f"  ⚠ 3-D region props failed ({exc}); using voxel counts only.")
-        counts = np.bincount(lab.ravel())
-        for lid in range(1, len(counts)):
-            if counts[lid]:
-                out[int(lid)] = (int(counts[lid]), counts[lid] * vox_um3, float("nan"))
-    return out
-
-
 def run_pipeline3(
     input_path,
     output_path,
@@ -80,7 +50,7 @@ def run_pipeline3(
     tophat_radius=12,
     neurite_spot_sigma=5,
     cilia_classifier_path=r'segmenters\cilia-segmenter.cl',
-    axon_threshold=2.5,
+    neurite_threshold=2.5,
     soma_threshold=1.0,
     p_low=2,
     p_high=98,
@@ -103,6 +73,7 @@ def run_pipeline3(
     cilia_log: bool = False,
     nuclei_log: bool = False,
     neurite_log: bool = False,
+    merge_nuclei_neurite: bool = False,
     bb_log: bool = False,
     cilia_min_size: int = 20,
     cilia_max_size: int = 0,
@@ -110,6 +81,13 @@ def run_pipeline3(
     bb_max_size: int = 0,
     ratio_epsilon: float = 1.0,
     per_channel_norm: dict | None = None,
+    save_rois: bool = True,
+    save_roi_crops: bool = True,
+    roi_margin: int = 22,
+    require_basal_body: bool = True,
+    ratio_from_basal_body: bool = True,
+    batch_ai_model: str | None = None,
+    batch_ai_threshold: float = 0.5,
     progress_callback=None,
     per_file_callback=None,
 ):
@@ -162,6 +140,7 @@ def run_pipeline3(
             "spot_sigma": neurite_spot_sigma,
             "gaussian_sigma": list(neurite_gaussian_sigma),
             "log_transform": neurite_log,
+            "merge_nuclei": merge_nuclei_neurite,
         },
         "cilia": {
             "gaussian_sigma": list(cilia_gaussian_sigma),
@@ -182,18 +161,34 @@ def run_pipeline3(
         "distance_thresholds": {
             "max_cilia_um": max_cilia_dist_cutoff_um,
             "max_basal_body_um": max_basal_body_cutoff_um,
+            "require_basal_body": require_basal_body,
+            "ratio_from_basal_body": ratio_from_basal_body,
             "ratio_epsilon": ratio_epsilon,
         },
         "classification": {
-            "axon_threshold": axon_threshold,
+            "neurite_threshold": neurite_threshold,
             "soma_threshold": soma_threshold,
+        },
+        "ai_validation": {
+            "model": os.path.basename(batch_ai_model) if batch_ai_model else None,
+            "threshold": batch_ai_threshold if batch_ai_model else None,
         },
     }
     _json_path = os.path.join(csv_dir, "run_parameters.json")
     with open(_json_path, "w") as _f:
         json.dump(params_log, _f, indent=2)
 
+    # Default run label = input folder name, so the data app shows a meaningful
+    # name (instead of lc-analysis-<timestamp>) and it's easy to find.
+    try:
+        _default_label = os.path.basename(str(input_path).rstrip("/\\")) or _run_stamp
+        with open(os.path.join(csv_dir, "run_label.txt"), "w", encoding="utf-8") as _f:
+            _f.write(_default_label)
+    except Exception:                                     # noqa: BLE001
+        pass
+
     all_dfs = []
+    nuclei_rows = []                      # per-file nuclei volume / count summary
 
     all_files = sorted(f for f in os.listdir(input_path) if f.endswith(".ims"))
     n_files = len(all_files)
@@ -289,8 +284,28 @@ def run_pipeline3(
             log_transform=nuclei_log,
         )
 
+        # Per-sample nuclei summary (foreground volume + raw label count). The
+        # nuclei often merge, so the data app estimates the true nucleus count as
+        # nuclei_volume_um3 / single_nucleus_volume. Captured for every file here,
+        # before any "no cilia" early-continue, so ciliation rate can include
+        # samples with zero cilia.
+        _nuc_arr = np.asarray(nuclei_labels_otsu)
+        _nuc_fg = int((_nuc_arr > 0).sum())
+        _vox_vol = float(np.prod(voxel_size))
+        _nuc_ids = np.unique(_nuc_arr)
+        nuclei_rows.append({
+            "filename": file,
+            "nuclei_voxels": _nuc_fg,
+            "nuclei_volume_um3": _nuc_fg * _vox_vol,
+            "n_nuclei_labels": int(len(_nuc_ids) - (1 if (_nuc_ids == 0).any() else 0)),
+            "voxel_volume_um3": _vox_vol,
+        })
+
+        _neurite_in = a_norm[0, neurites_channel]
+        if merge_nuclei_neurite:
+            _neurite_in = np.maximum(_neurite_in, a_norm[0, nuclei_channel])
         skeleton, neurites_label = segment_neurites(
-            a_norm[0, neurites_channel],
+            _neurite_in,
             spot_sigma=neurite_spot_sigma,
             gaussian_sigma=neurite_gaussian_sigma,
             log_transform=neurite_log,
@@ -394,17 +409,11 @@ def run_pipeline3(
             _flush_gpu()
             continue
 
-        # 3-D region properties per cilium (volume, length) from the label volume
-        _cprops = _region_props_3d(np.asarray(cilia_labels), voxel_size)
-        df_cilia["volume_voxels"] = [
-            _cprops.get(int(i), (np.nan, np.nan, np.nan))[0] for i in df_cilia["cilia_id"]
-        ]
-        df_cilia["volume_um3"] = [
-            _cprops.get(int(i), (np.nan, np.nan, np.nan))[1] for i in df_cilia["cilia_id"]
-        ]
-        df_cilia["length_um"] = [
-            _cprops.get(int(i), (np.nan, np.nan, np.nan))[2] for i in df_cilia["cilia_id"]
-        ]
+        # 3-D shape descriptors per cilium (volume, sphericity, …) from the labels
+        _cprops = cilia_shape_props(np.asarray(cilia_labels), voxel_size)
+        for _col in SHAPE_COLS:
+            df_cilia[_col] = [_cprops.get(int(i), {}).get(_col, np.nan)
+                              for i in df_cilia["cilia_id"]]
 
         df_basal_bodies = assign_label_features(
             basal_bodies_labels,
@@ -429,8 +438,18 @@ def run_pipeline3(
             combined, voxel_size=voxel_size,
             max_pair_distance_um=max_basal_body_cutoff_um,
         )
-        df_cilia = paired[(paired["object_type"] == "cilia") & paired["validated"]].reset_index(drop=True)
-        df_basal_bodies = paired[(paired["object_type"] == "basal_body") & paired["validated"]].reset_index(drop=True)
+        if require_basal_body:
+            # Strict mode: keep only cilia paired to a basal body within cutoff.
+            df_cilia = paired[(paired["object_type"] == "cilia")
+                              & paired["validated"]].reset_index(drop=True)
+            df_basal_bodies = paired[(paired["object_type"] == "basal_body")
+                                     & paired["validated"]].reset_index(drop=True)
+        else:
+            # Lenient mode: BB distance filtering off — keep ALL cilia (and BBs),
+            # paired or not. pair_id / pair_distance still populated where a pair
+            # exists, so ROI crops and features stay available.
+            df_cilia = paired[paired["object_type"] == "cilia"].reset_index(drop=True)
+            df_basal_bodies = paired[paired["object_type"] == "basal_body"].reset_index(drop=True)
 
         if df_cilia.empty:
             print(f"  No validated cilia (paired within {max_basal_body_cutoff_um} µm) in {file}")
@@ -444,6 +463,12 @@ def run_pipeline3(
             _flush_gpu()
             continue
 
+        # Optionally take each cilium's ratio/distance features from its paired
+        # basal body position (the anchor on the soma/neurite) rather than the
+        # cilium centroid. Runs before classification so `class` follows suit.
+        if ratio_from_basal_body:
+            df_cilia = use_basal_body_ratio(df_cilia, df_basal_bodies)
+
         all_dfs.append(df_basal_bodies)
         all_dfs.append(df_cilia)
 
@@ -456,6 +481,25 @@ def run_pipeline3(
         bb_labels_v = np.where(
             np.isin(np.asarray(basal_bodies_labels), _valid_bb_ids), np.asarray(basal_bodies_labels), 0
         ).astype(np.int32)
+
+        # ── Per-cilium ROI export (fast MIP thumbnails + raw crops) ────────────
+        # Pure NumPy/Pillow, no GUI — so ROIs are produced on headless runs too,
+        # not only when napari live-capture is on.
+        if save_rois:
+            try:
+                from limoncello.visualization.cilia_rois import save_cilia_rois
+                _roi_dir = os.path.join(output_path, "figures", "cilia_rois")
+                _n_roi = save_cilia_rois(
+                    np.asarray(a[0]), cilia_labels_v, bb_labels_v, df_cilia,
+                    dict(ch_cilia=cilia_channel, ch_bb=basal_bodies_channel,
+                         ch_neurites=neurites_channel, ch_nuclei=nuclei_channel),
+                    tuple(float(v) for v in voxel_size), _roi_dir,
+                    os.path.splitext(file)[0], margin=roi_margin,
+                    save_crops=save_roi_crops,
+                )
+                print(f"  📸 exported {_n_roi}/{len(df_cilia)} cilia ROIs → {_roi_dir}")
+            except Exception as _exc:                         # never abort the batch
+                print(f"  ⚠ ROI export failed: {_exc}")
 
         # ── Overlay visualization (MIP) ───────────────────────────────────────
         overlay_dir = os.path.join(output_path, "figures", "overlays")
@@ -596,10 +640,17 @@ def run_pipeline3(
     file_map = {f: f"S{i+1}" for i, f in enumerate(unique_files)}
     final_df["file_short"] = final_df["filename"].map(file_map)
 
+    # Per-sample nuclei summary → csv/nuclei_summary.csv (for ciliation rate).
+    if nuclei_rows:
+        nuc_df = pd.DataFrame(nuclei_rows)
+        nuc_df["file_short"] = nuc_df["filename"].map(file_map).fillna(
+            nuc_df["filename"].map(lambda f: os.path.splitext(f)[0]))
+        nuc_df.to_csv(os.path.join(csv_dir, "nuclei_summary.csv"), index=False)
+
     # Classification
     def classify(score):
-        if score > axon_threshold:
-            return "axon"
+        if score > neurite_threshold:
+            return "neurite"
         elif score < soma_threshold:
             return "soma"
         else:
@@ -612,6 +663,37 @@ def run_pipeline3(
     os.makedirs(fig_dir, exist_ok=True)
 
     final_cilia_df = final_df[final_df["object_type"] == "cilia"]
+
+    # ── Optional: AI-validate cilia from their ROI images (batch) ──────────────
+    # Scores every cilium's exported ROI thumbnail with a trained validator and
+    # writes csv/human_validation.csv (filename, cilia_id, human_validated) — the
+    # exact file + columns the data app's Screening tab reads, so AI decisions
+    # load just like manual screening.
+    if batch_ai_model and not final_cilia_df.empty:
+        try:
+            from limoncello.ml.roi_validator import load_bundle, predict_proba
+            _ai_roi_dir = os.path.join(output_path, "figures", "cilia_rois")
+            _ai_model, _ai_meta = load_bundle(batch_ai_model)
+            _keys = [(str(r["filename"]), int(r["cilia_id"]))
+                     for _, r in final_cilia_df.iterrows()]
+            _paths = [os.path.join(_ai_roi_dir,
+                                   f"{os.path.splitext(fn)[0]}_cilia{cid}.png")
+                      for fn, cid in _keys]
+            _probs = predict_proba(_ai_model, _paths,
+                                   size=int(_ai_meta.get("size", 64)))
+            _hv = [{"filename": fn, "cilia_id": cid,
+                    "human_validated": bool(p >= batch_ai_threshold),
+                    "ai_score": float(p)}
+                   for (fn, cid), p in zip(_keys, _probs) if np.isfinite(p)]
+            if _hv:
+                pd.DataFrame(_hv, columns=["filename", "cilia_id",
+                                           "human_validated", "ai_score"]).to_csv(
+                    os.path.join(csv_dir, "human_validation.csv"), index=False)
+                _nk = sum(1 for r in _hv if r["human_validated"])
+                print(f"  🤖 AI-validated {_nk}/{len(_hv)} cilia "
+                      f"(score ≥ {batch_ai_threshold}) → csv/human_validation.csv")
+        except Exception as _exc:                              # never abort the run
+            print(f"  ⚠ batch AI validation failed: {_exc}")
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     sns.histplot(final_cilia_df["ratio"], kde=True, ax=axes[0, 0])

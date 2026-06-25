@@ -988,8 +988,10 @@ _JSON_SS_MAP = [
     (("basal_bodies", "max_size"),                         "bb_max_size",          int),
     (("distance_thresholds", "max_cilia_um"),              "max_cilia",            float),
     (("distance_thresholds", "max_basal_body_um"),         "max_basal",            float),
+    (("distance_thresholds", "require_basal_body"),        "require_bb",           bool),
+    (("distance_thresholds", "ratio_from_basal_body"),     "ratio_from_bb",        bool),
     (("distance_thresholds", "ratio_epsilon"),             "ratio_epsilon",        float),
-    (("classification", "axon_threshold"),                 "pf_axon_thr",          float),
+    (("classification", "neurite_threshold"),             "pf_axon_thr",          float),
     (("classification", "soma_threshold"),                 "pf_soma_thr",          float),
 ]
 
@@ -1073,6 +1075,8 @@ _SS_DEFAULTS: dict = {
     "bb_max_size":         0,
     "max_cilia":           2.0,
     "max_basal":           2.0,
+    "require_bb":          True,
+    "ratio_from_bb":       True,
     "ratio_epsilon":       1.0,
     "use_mip":             False,
     **_PF_DEFAULTS,
@@ -1447,12 +1451,40 @@ with st.sidebar:
         "Max basal body distance (µm)", 0.5, 10.0, step=0.1, key="max_basal",
         help="🔄 Max centroid→neurite distance to include a basal body"
     )
+    require_bb = st.checkbox(
+        "Require basal body (filter cilia by BB distance)", key="require_bb",
+        help="🔄 Off = keep ALL cilia regardless of basal-body pairing distance."
+    )
+    ratio_from_bb = st.checkbox(
+        "Ratio from basal body position", key="ratio_from_bb",
+        help="🔄 Sample the soma/neurite ratio at the paired basal body (the "
+             "anchor) instead of the cilium centroid. Unpaired cilia keep their "
+             "own value."
+    )
     ratio_epsilon = st.slider(
         "Ratio epsilon (µm)", 0.0, 10.0, step=0.1, key="ratio_epsilon",
         help="🔄 Constant ε added to both numerator and denominator: "
              "ratio = (dt_nuclei + ε) / (dt_neurite + ε). "
              "Prevents division by zero and log(0). Larger ε → smoother ratio."
     )
+
+    # ── 🤖 AI cilia validation (optional) ─────────────────────────────────────
+    _models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+    _ai_models = ([f for f in sorted(os.listdir(_models_dir)) if f.endswith(".pt")]
+                  if os.path.isdir(_models_dir) else [])
+    ai_validate = st.checkbox(
+        "🤖 AI-validate cilia after run", key="ai_validate",
+        value=False, disabled=not _ai_models,
+        help="Score each cilium's ROI image with a trained validator and write "
+             "csv/human_validation.csv (loaded by the data app's Screening tab)."
+        if _ai_models else "No models found in the codebase models/ folder."
+    )
+    ai_model_name = st.selectbox(
+        "AI model", _ai_models or ["(no models found)"], key="ai_model_name",
+        disabled=not (_ai_models and ai_validate))
+    ai_threshold = st.slider(
+        "Keep if AI score ≥", 0.50, 0.99, 0.50, 0.01, key="ai_threshold",
+        disabled=not (_ai_models and ai_validate))
 
     st.markdown("---")
 
@@ -1541,11 +1573,17 @@ if run_clicked:
             output_path=output_path,
             max_cilia_dist_cutoff_um=max_cilia,
             max_basal_body_cutoff_um=max_basal,
+            require_basal_body=require_bb,
+            ratio_from_basal_body=ratio_from_bb,
+            batch_ai_model=(os.path.join(_models_dir, ai_model_name)
+                            if ai_validate and ai_model_name.endswith(".pt")
+                            else None),
+            batch_ai_threshold=float(ai_threshold),
             nuclei_spot_sigma=nuclei_sigma,
             tophat_radius=tophat_radius,
             neurite_spot_sigma=neurite_sigma,
             cilia_classifier_path=classifier_path,
-            axon_threshold=float(pf_axon_thr),
+            neurite_threshold=float(pf_axon_thr),
             soma_threshold=float(pf_soma_thr),
             p_low=p_low,
             p_high=p_high,

@@ -3,12 +3,12 @@ synthetic_data.py — neuron-like validation images for the LimonCELLo pipeline.
 
 Generates 4-channel 3-D images (matching the napari app's default channel order
 ``[Cilia, Neurites, Basal Bodies, Nuclei]``) with **known** cilia placement, so
-the pipeline's soma/axon classification can be validated against ground truth.
+the pipeline's soma/neurite classification can be validated against ground truth.
 
 Scenarios (cilia ≈ 10–20 per image):
   A  all_soma   — every cilium sits next to a nucleus (→ should classify "soma")
-  B  all_axon   — every cilium sits on a neurite, away from soma (→ "axon")
-  C  mix_20/50/80 — given fraction of cilia on axons, the rest on somas
+  B  all_neurite   — every cilium sits on a neurite, away from soma (→ "neurite")
+  C  mix_20/50/80 — given fraction of cilia on neurites, the rest on somas
   D  random     — cilia placed uniformly at random (no structure association)
 
 Each cilium gets a basal body stamped at its base. For every image we also write
@@ -128,7 +128,7 @@ def _walk_path(rng, start, shape, n_steps=14, step=18.0, z_wander=0.6):
 
 def _point_along(path, rng, lo=0.35, hi=1.0):
     """A random point on a poly-line, restricted to the [lo, hi] arc-fraction
-    (so axonal cilia don't land on the soma at the path start)."""
+    (so neurite cilia don't land on the soma at the path start)."""
     seg = rng.integers(max(1, int(lo * (len(path) - 1))), len(path) - 1 + 1)
     seg = int(np.clip(seg, 1, len(path) - 1))
     a, b = path[seg - 1], path[seg]
@@ -139,11 +139,11 @@ def _point_along(path, rng, lo=0.35, hi=1.0):
 # Image generation
 # ─────────────────────────────────────────────────────────────────────────────
 def generate_image(rng, shape=(16, 384, 384), n_neurons=4, n_cilia=15,
-                   axon_fraction=0.0, scenario="custom", voxel=(0.4, 0.15, 0.15)):
+                   neurite_fraction=0.0, scenario="custom", voxel=(0.4, 0.15, 0.15)):
     """Build one neuron-like 4-channel image.
 
     Returns ``(vol_czyx_uint16, ground_truth_records, cilia_mask_bool)``.
-    ``axon_fraction`` is the share of cilia placed on neurites; the rest go on
+    ``neurite_fraction`` is the share of cilia placed on neurites; the rest go on
     somas. ``scenario == 'random'`` overrides placement to uniform-random.
     """
     from scipy.ndimage import gaussian_filter
@@ -179,13 +179,13 @@ def generate_image(rng, shape=(16, 384, 384), n_neurons=4, n_cilia=15,
             pos = np.array([rng.uniform(1, Z - 2),
                             rng.uniform(8, Y - 8), rng.uniform(8, X - 8)])
             cls = "random"
-        elif rng.uniform() < axon_fraction and paths:
+        elif rng.uniform() < neurite_fraction and paths:
             # On a neurite, nudged just off the centre-line.
             path = paths[int(rng.integers(0, len(paths)))]
             base = _point_along(path, rng)
             off = rng.normal(0, 1.5, 3); off[0] *= 0.2
             pos = base + off
-            cls = "axon"
+            cls = "neurite"
         else:
             # Just outside a nucleus surface (on the soma, away from neurites).
             c = centers[int(rng.integers(0, len(centers)))]
@@ -240,13 +240,13 @@ def sparse_labels(cilia_mask, rng, n_bg=4000):
 # ─────────────────────────────────────────────────────────────────────────────
 # Dataset driver
 # ─────────────────────────────────────────────────────────────────────────────
-# (scenario_name, axon_fraction)  — 'random' handled specially.
+# (scenario_name, neurite_fraction)  — 'random' handled specially.
 _SCENARIOS = [
     ("A_all_soma",   0.0),
-    ("B_all_axon",   1.0),
-    ("C_mix_axon20", 0.2),
-    ("C_mix_axon50", 0.5),
-    ("C_mix_axon80", 0.8),
+    ("B_all_neurite",   1.0),
+    ("C_mix_neurite20", 0.2),
+    ("C_mix_neurite50", 0.5),
+    ("C_mix_neurite80", 0.8),
     ("D_random",     None),
 ]
 
@@ -266,7 +266,7 @@ def build_dataset(out_dir, reps=3, shape=(16, 384, 384), voxel=(0.4, 0.15, 0.15)
             scen = "random" if name.startswith("D_") else "custom"
             vol, recs, cmask = generate_image(
                 rng, shape=shape, n_neurons=n_neurons, n_cilia=n_cil,
-                axon_fraction=(0.0 if frac is None else frac),
+                neurite_fraction=(0.0 if frac is None else frac),
                 scenario=scen, voxel=voxel,
             )
             stem = f"{name}_rep{rep + 1}"
@@ -277,11 +277,11 @@ def build_dataset(out_dir, reps=3, shape=(16, 384, 384), voxel=(0.4, 0.15, 0.15)
                                  sparse_labels(cmask, rng))
             for r in recs:
                 gt_rows.append({"filename": f"{stem}.ims", "scenario": name,
-                                "axon_fraction": (np.nan if frac is None else frac),
+                                "neurite_fraction": (np.nan if frac is None else frac),
                                 **r})
-            n_ax = sum(r["intended_class"] == "axon" for r in recs)
+            n_ax = sum(r["intended_class"] == "neurite" for r in recs)
             n_so = sum(r["intended_class"] == "soma" for r in recs)
-            print(f"  ✓ {stem}: {len(recs)} cilia (axon={n_ax}, soma={n_so})")
+            print(f"  ✓ {stem}: {len(recs)} cilia (neurite={n_ax}, soma={n_so})")
 
     gt = pd.DataFrame(gt_rows)
     gt.to_csv(out / "ground_truth.csv", index=False)

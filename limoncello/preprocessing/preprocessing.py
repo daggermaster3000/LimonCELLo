@@ -2,7 +2,29 @@ import numpy as np
 from skimage.transform import resize
 
 
-def make_isotropic(volume, voxel_size, target_spacing=None, order=1):
+def _isotropic_gpu(vol, vs, s, order):
+    """GPU resample to isotropic voxels via pyclesperanto. Raises on any failure
+    so the caller can fall back to the CPU path."""
+    import pyclesperanto_prototype as cle
+
+    # clesperanto uses x,y,z ordering; our volume is (Z, Y, X).
+    # new_size = old_size * factor, so factor = old_spacing / target_spacing.
+    fz, fy, fx = vs[0] / s, vs[1] / s, vs[2] / s
+    linear = order != 0                              # linear for intensities, nearest for labels
+
+    src = cle.push(np.asarray(vol, dtype=np.float32))
+    # Anti-alias before *downsampling* intensities (nearest labels must not blur).
+    if linear:
+        sig = [max(0.0, (1.0 / f - 1.0) / 2.0) if f < 1.0 else 0.0
+               for f in (fx, fy, fz)]
+        if any(g > 0 for g in sig):
+            src = cle.gaussian_blur(src, sigma_x=sig[0], sigma_y=sig[1], sigma_z=sig[2])
+    out = cle.resample(src, factor_x=fx, factor_y=fy, factor_z=fz,
+                       linear_interpolation=linear)
+    return np.asarray(out)
+
+
+def make_isotropic(volume, voxel_size, target_spacing=None, order=1, use_gpu=True):
     """
     Resample a (Z, Y, X) volume to isotropic voxels.
 
@@ -10,6 +32,11 @@ def make_isotropic(volume, voxel_size, target_spacing=None, order=1):
     (``max(voxel_size)``, typically Z), so the finer axes are **downsampled**
     to match it. This keeps the voxel count from exploding (no upsampling) at
     the cost of in-plane resolution.
+
+    When ``use_gpu`` is set (default) the resampling runs on the GPU via
+    pyclesperanto's ``resample`` (with a Gaussian anti-alias pre-blur when
+    downsampling intensities); it transparently falls back to the CPU
+    ``skimage.transform.resize`` if the GPU path is unavailable or errors.
 
     Parameters
     ----------
@@ -21,6 +48,8 @@ def make_isotropic(volume, voxel_size, target_spacing=None, order=1):
         Isotropic spacing to resample to (µm). Defaults to ``max(voxel_size)``.
     order : int
         Interpolation order (1 = linear for intensities, 0 = nearest for labels).
+    use_gpu : bool
+        Try the GPU (clesperanto) path first. Falls back to CPU on failure.
 
     Returns
     -------
@@ -35,6 +64,13 @@ def make_isotropic(volume, voxel_size, target_spacing=None, order=1):
 
     if all(abs(v - s) < 1e-6 for v in vs):
         return vol, (s, s, s)
+
+    if use_gpu:
+        try:
+            out = _isotropic_gpu(vol, vs, s, order).astype(vol.dtype, copy=False)
+            return out, (s, s, s)
+        except Exception as exc:                     # noqa: BLE001
+            print(f"[LC] GPU isotropic resample failed ({exc}); using CPU.")
 
     out_shape = tuple(max(1, int(round(dim * v / s))) for dim, v in zip(vol.shape, vs))
     downsampling = any(v < s for v in vs)            # anti-alias only when shrinking

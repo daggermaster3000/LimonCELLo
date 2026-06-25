@@ -117,7 +117,9 @@ st.markdown("---")
 # PIPELINE FLOWCHART
 # ─────────────────────────────────────────────────────────────────────────────
 st.subheader("🗺️ Pipeline Flowchart")
-st.caption("Flowchart generated from this run's parameters. Download as PNG.")
+st.caption("From raw .ims through segmentation and classification to per-cilium "
+           "ROI export and the human + CNN screening/validation step. Generated "
+           "from this run's parameters. Download as PNG.")
 
 
 def _draw_pipeline_diagram(params: dict) -> plt.Figure:
@@ -130,9 +132,9 @@ def _draw_pipeline_diagram(params: dict) -> plt.Figure:
     dist  = params.get("distance_thresholds", {})
     cls   = params.get("classification", {})
 
-    fig, ax = plt.subplots(figsize=(16, 10))
+    fig, ax = plt.subplots(figsize=(16, 12.8))
     ax.set_xlim(0, 16)
-    ax.set_ylim(0, 10)
+    ax.set_ylim(-3.4, 10)
     ax.axis("off")
     fig.patch.set_facecolor("#F8F9FA")
     ax.set_facecolor("#F8F9FA")
@@ -144,6 +146,8 @@ def _draw_pipeline_diagram(params: dict) -> plt.Figure:
     C_DIST  = "#E67E22"   # distance maps
     C_FEAT  = "#8E44AD"   # feature assignment
     C_CLS   = "#C0392B"   # classification
+    C_ROI   = "#0FB9B1"   # ROI export
+    C_AI    = "#D6336C"   # screening + AI validation
 
     def _box(cx, cy, w, h, title, subtitle="", color="#2980B9"):
         rect = mpatches.FancyBboxPatch(
@@ -249,6 +253,37 @@ def _draw_pipeline_diagram(params: dict) -> plt.Figure:
          "Output  →  Excel (all_cilia_features.xlsx) · Overlay PNGs · Summary figures",
          color=C_IO)
 
+    # ── ROI export + screening / AI validation (post-classification) ───────────
+    Y_ROI = -0.7
+    Y_SCR = -2.0
+
+    _arrow(8, Y_OUT - 0.30, 8, Y_ROI + 0.38)
+    _box(8, Y_ROI, 9, 0.75,
+         "Per-cilium ROI Export",
+         "figures/cilia_rois/ — uniform XY-MIP PNG (cilia + basal body) "
+         "+ raw .npz crop (GPU isotropic resample)",
+         color=C_ROI)
+
+    _arrow(8, Y_ROI - 0.38, 8, Y_SCR + 0.38)
+    _box(8, Y_SCR, 11, 0.95,
+         "Screening & AI Validation  (data app)",
+         "Human keep/reject  →  trains CNN on ROI images "
+         "(tiny CPU / big GPU · augmentation · early-stopping)\n"
+         "→  predicts P(real cilium) on the run  →  sets human_validated "
+         "(false-positive QC; rejected cilia drop from all tabs)",
+         color=C_AI)
+
+    # Dashed feedback: human_validated re-filters the analysis (straight line to
+    # the right of every box, so it never crosses them).
+    ax.annotate(
+        "", xy=(13.9, Y_FEAT), xytext=(13.9, Y_SCR),
+        arrowprops=dict(arrowstyle="-|>", color=C_AI, lw=1.2, ls="--",
+                        mutation_scale=11, connectionstyle="arc3,rad=0"),
+        zorder=1,
+    )
+    ax.text(14.15, (Y_FEAT + Y_SCR) / 2, "human_validated\nre-filters\nanalysis",
+            fontsize=6, color=C_AI, style="italic", ha="left", va="center")
+
     # Legend
     _legend_items = [
         (C_IO,   "I/O"),
@@ -257,11 +292,12 @@ def _draw_pipeline_diagram(params: dict) -> plt.Figure:
         (C_DIST, "Distance maps"),
         (C_FEAT, "Feature assignment"),
         (C_CLS,  "Classification"),
+        (C_ROI,  "ROI export"),
+        (C_AI,   "Screening + AI"),
     ]
     for _li, (_lc, _ll) in enumerate(_legend_items):
-        _lp = mpatches.Patch(facecolor=_lc, edgecolor="white", label=_ll)
-        ax.text(0.1 + _li * 2.65, 0.1, _ll, fontsize=7, color=_lc, fontweight="bold",
-                va="bottom", ha="left", zorder=3)
+        ax.text(0.1 + _li * 1.95, -3.1, _ll, fontsize=7, color=_lc,
+                fontweight="bold", va="bottom", ha="left", zorder=3)
 
     plt.tight_layout(pad=0.5)
     return fig

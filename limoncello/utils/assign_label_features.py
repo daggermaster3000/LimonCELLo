@@ -95,3 +95,40 @@ def assign_label_features(
         print(f"No valid {object_type} found in {file}")
 
     return df
+
+
+# Ratio / distance features that are sampled from a position in the volume and
+# can therefore be re-read at the basal body instead of the cilium centroid.
+BB_RATIO_COLS = ["ratio", "log_ratio", "dt_neurite", "dt_nuclei",
+                 "log_dt_neurite", "log_dt_nuclei", "distance_to_neurite_um"]
+
+
+def use_basal_body_ratio(df_cilia: pd.DataFrame,
+                         df_basal_bodies: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of ``df_cilia`` whose ratio / distance features are taken
+    from each cilium's *paired basal body* position instead of the cilium
+    centroid. Cilia with no paired basal body keep their own (centroid) values.
+
+    The basal body anchors the cilium to the soma/neurite, so its ratio is a
+    more reliable soma-vs-neurite signal than the cilium tip's.
+    """
+    if (df_cilia is None or df_cilia.empty
+            or df_basal_bodies is None or df_basal_bodies.empty
+            or "paired_id" not in df_cilia.columns):
+        return df_cilia
+
+    bb_by_id = df_basal_bodies.set_index("cilia_id")
+    df = df_cilia.copy()
+    cols = [c for c in BB_RATIO_COLS
+            if c in df.columns and c in df_basal_bodies.columns]
+    for col in cols:
+        vals = []
+        for _, row in df.iterrows():
+            pid = row.get("paired_id")
+            if (pid is not None and not (isinstance(pid, float) and np.isnan(pid))
+                    and int(pid) in bb_by_id.index):
+                vals.append(bb_by_id.loc[int(pid), col])
+            else:
+                vals.append(row[col])
+        df[col] = vals
+    return df
