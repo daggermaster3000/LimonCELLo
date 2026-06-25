@@ -1,5 +1,5 @@
 """
-Limoncello — Data Analysis app 🍋📊
+Limoncello — Data Analysis app
 
 A *data-focused* companion to the main pipeline app (``app.py``). It does **not**
 run the pipeline; it loads the CSV/Excel results of one or more finished
@@ -18,6 +18,8 @@ Run with:  streamlit run data_app.py
 from __future__ import annotations
 
 import os
+import tempfile
+import hashlib
 from io import BytesIO
 from pathlib import Path
 
@@ -41,7 +43,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG / CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Limoncello Data 🍋📊", layout="wide",
+st.set_page_config(page_title="Limoncello Data", layout="wide",
                    initial_sidebar_state="expanded")
 
 _CLASS_PALETTE = {"neurite": "#2ecc71", "soma": "#e74c3c", "ambiguous": "#f39c12"}
@@ -252,6 +254,23 @@ def roi_images(run_dir: str, stem: str) -> list[str]:
     return sorted(paths, key=_cid)
 
 
+def _load_sample_mip(run_dir: str, stem: str, tag: str):
+    """One saved XY-MIP array (``figures/mips/<stem>_<tag>_mip.npy``) or None."""
+    p = os.path.join(run_dir, "figures", "mips", f"{stem}_{tag}_mip.npy")
+    try:
+        return np.load(p) if os.path.exists(p) else None
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+def _parse_coords_yx(series):
+    """(y, x) pixel positions from a cilia df ``coords`` column (lists or the
+    ``"[z, y, x]"`` strings Excel round-trips to)."""
+    from limoncello.analysis.pair_cilia_to_bb import parse_coords_string
+    arr = parse_coords_string(series)                         # (n, 3) z,y,x
+    return [(float(r[1]), float(r[2])) for r in arr]
+
+
 # ── Human validation (manual cilia screening) ───────────────────────────────
 # Decisions live in st.session_state (keyed by run/filename/cilia_id) and are
 # persisted to ``<run_dir>/csv/human_validation.csv`` so they survive restarts.
@@ -391,9 +410,9 @@ def _show_and_export(fig, basename: str, key: str, *, despine: bool = True):
     plt.close(fig)
     st.image(png.getvalue(), use_container_width=True)
     c1, c2 = st.columns(2)
-    c1.download_button("⬇️ PNG (300 dpi)", png.getvalue(),
+    c1.download_button(":material/download: PNG (300 dpi)", png.getvalue(),
                        f"{basename}.png", "image/png", key=f"{key}_png")
-    c2.download_button("⬇️ SVG (vector)", svg.getvalue(),
+    c2.download_button(":material/download: SVG (vector)", svg.getvalue(),
                        f"{basename}.svg", "image/svg+xml", key=f"{key}_svg")
 
 
@@ -540,7 +559,7 @@ def _qc_bar_fig(qc: pd.DataFrame):
 st.session_state.setdefault("runs", [])          # [{"dir":..., "label":...}]
 
 with st.sidebar:
-    st.header("🍋 Runs")
+    st.header(":material/nutrition: Runs")
     st.caption("Add one or more finished `lc-analysis-*` runs to explore and compare.")
 
     base = st.text_input(
@@ -563,14 +582,14 @@ with st.sidebar:
             if d in added_dirs:
                 continue
             _saved = load_run_label(d)
-            _disp_to_name[f"🏷️ {_saved}  ({name})" if _saved else name] = name
+            _disp_to_name[f":material/label: {_saved}  ({name})" if _saved else name] = name
         c1, c2 = st.columns([3, 1])
         with c1:
             pick = st.multiselect("Available runs", list(_disp_to_name), key="pick_runs")
         with c2:
             st.write("")
             st.write("")
-            if st.button("➕ Add", use_container_width=True):
+            if st.button(":material/add: Add", use_container_width=True):
                 for disp in pick:
                     name = _disp_to_name[disp]
                     _dir = found[name]
@@ -578,7 +597,7 @@ with st.sidebar:
                         {"dir": _dir, "label": load_run_label(_dir) or name}
                     )
                 st.rerun()
-        if st.button("➕ Add latest run", use_container_width=True):
+        if st.button(":material/add: Add latest run", use_container_width=True):
             latest = find_latest_run_dir(base) if not _is_run_dir(base) else base
             if latest and latest not in added_dirs:
                 st.session_state["runs"].append(
@@ -607,7 +626,7 @@ with st.sidebar:
                     save_run_label(r["dir"], _new_label)
                     st.rerun()
                 st.caption(os.path.basename(r["dir"]))
-                if st.button("🗑️ Remove", key=f"rm_{r['dir']}",
+                if st.button(":material/delete: Remove", key=f"rm_{r['dir']}",
                              use_container_width=True):
                     st.session_state["runs"] = [
                         x for x in st.session_state["runs"] if x["dir"] != r["dir"]]
@@ -628,11 +647,11 @@ _runs = st.session_state["runs"]
 _df = combined_dataframe(_runs)
 _ready = not _df.empty
 
-st.title("Limoncello — Data Analysis 🍋📊")
+st.title(":material/nutrition: Limoncello — Data Analysis :material/bar_chart:")
 
 if not _ready:
     st.info(
-        "👈 Add one or more runs from the sidebar to begin. "
+        ":material/keyboard_arrow_left: Add one or more runs from the sidebar to begin. "
         "Point it at the **Output folder** you used in the pipeline app "
         "(it contains the `lc-analysis-*` run folders)."
     )
@@ -646,7 +665,7 @@ _df = _df.rename(columns={"dt_neurite": "dt_neurite_um", "dt_nuclei": "dt_nuclei
 # ── Reclassify neurite / soma on the fly from log_ratio thresholds ───────────
 with st.sidebar:
     st.markdown("---")
-    st.header("🏷️ Classification")
+    st.header(":material/label: Classification")
     st.caption("Re-threshold log_ratio → neurite / soma / ambiguous, live across all tabs.")
     # Apply thresholds requested by the Validation optimizer (set before the
     # widgets instantiate, so it's allowed to write their keys).
@@ -676,7 +695,7 @@ _has_otype = "object_type" in _df.columns
 _cil_raw = _df[_df["object_type"] == "cilia"] if _has_otype else _df
 with st.sidebar:
     st.markdown("---")
-    st.header("🔧 Cilia size filter")
+    st.header(":material/build: Cilia size filter")
     st.caption("Remove false-positive cilia by 3-D volume / length. "
                "Applies to every tab and the report.")
 
@@ -707,7 +726,7 @@ _df = apply_size_filter(_df, _has_otype, _vol_rng, _len_rng, _drop_na)
 _n_cil_after = int((_df["object_type"] == "cilia").sum()) if _has_otype else len(_df)
 if _n_cil_after < _n_cil_before:
     st.sidebar.success(
-        f"🔧 Size filter kept {_n_cil_after} / {_n_cil_before} cilia "
+        f":material/build: Size filter kept {_n_cil_after} / {_n_cil_before} cilia "
         f"({_n_cil_before - _n_cil_after} removed)."
     )
 
@@ -773,11 +792,11 @@ else:
 
 with st.sidebar:
     st.markdown("---")
-    st.header("🕵️ Screening")
+    st.header(":material/person_search: Screening")
     _n_rejected = int((~_df["human_validated"]).sum())
     _excl_rejected = st.checkbox(
         "Exclude human-rejected cilia from all tabs", value=True, key="excl_rej",
-        help="Decisions are made in the 🕵️ Screening tab and saved per run.")
+        help="Decisions are made in the :material/person_search: Screening tab and saved per run.")
     st.caption(f"{_n_rejected} cilia manually rejected so far.")
 
 if _excl_rejected and "human_validated" in _df.columns:
@@ -803,8 +822,8 @@ for _i, _r in enumerate(_runs, 1):
 
 (tab_over, tab_screen, tab_dist, tab_scatter, tab_inter, tab_corr,
  tab_table, tab_qc, tab_validate, tab_report) = st.tabs(
-    ["🔬 Overlays", "🕵️ Screening", "📊 Hist / KDE", "🟢 Scatter", "⚡ Interactive",
-     "🔗 Correlation", "📋 Data table", "🩺 QC", "🤝 Validation", "📄 Report"]
+    [":material/biotech: Overlays", ":material/person_search: Screening", ":material/bar_chart: Hist / KDE", ":material/scatter_plot: Scatter", ":material/bolt: Interactive",
+     ":material/link: Correlation", ":material/list_alt: Data table", ":material/monitor_heart: QC", ":material/handshake: Validation", ":material/description: Report"]
 )
 
 _run_dir_by_label = {r["label"]: r["dir"] for r in _runs}
@@ -830,6 +849,39 @@ def _roi_npz_path(run_label: str, filename, cid):
     return p if os.path.exists(p) else None
 
 
+_AI_THUMB_DIR = os.path.join(tempfile.gettempdir(), "lc_ai_thumbs")
+
+
+def _roi_model_png(run_label: str, filename, cid, correct: bool):
+    """Path to the **model-input** thumbnail for one cilium, re-rendered from its
+    raw ``.npz`` crop with display correction on/off — so what the user sees in
+    the gallery is exactly what the model is trained / scored on. Disk-cached in
+    the temp dir; falls back to the saved PNG when no crop is available.
+
+    Not ``st.cache_data``-decorated on purpose: it does file IO and the cache
+    key would have to hash the (possibly numpy) filename — caching on disk by a
+    content hash is simpler and avoids hashing surprises.
+    """
+    npz = _roi_npz_path(run_label, filename, cid)
+    if npz:
+        try:
+            from limoncello.visualization.cilia_rois import render_npz_thumb
+            from PIL import Image
+            os.makedirs(_AI_THUMB_DIR, exist_ok=True)
+            _sig = f"{npz}|{os.path.getmtime(npz)}|{int(bool(correct))}"
+            _key = hashlib.md5(_sig.encode()).hexdigest()
+            outp = os.path.join(_AI_THUMB_DIR, f"{_key}.png")
+            if os.path.exists(outp):
+                return outp
+            arr = render_npz_thumb(npz, correct_display=bool(correct))
+            if arr is not None:
+                Image.fromarray(arr).save(outp)
+                return outp
+        except Exception:                                 # noqa: BLE001
+            pass
+    return _roi_png_path(run_label, filename, cid)
+
+
 @st.cache_data(show_spinner=False)
 def _roi_multichannel_png(npz_path: str):
     """All-channel ROI render (cilia=green, BB=magenta, neurite=cyan,
@@ -844,11 +896,36 @@ def _roi_multichannel_png(npz_path: str):
         return None
 
 
+def _raw_roi_thumb(png_path: str):
+    """Raw-intensity ROI thumbnail re-rendered from the cilium's ``.npz`` crop
+    with display correction OFF — same image the Screening gallery shows. Shares
+    the ``_AI_THUMB_DIR`` disk cache (sig ``npz|mtime|0``). Falls back to the
+    saved PNG when no crop is on disk."""
+    npz = os.path.splitext(png_path)[0] + ".npz"
+    if os.path.exists(npz):
+        try:
+            from limoncello.visualization.cilia_rois import render_npz_thumb
+            from PIL import Image
+            os.makedirs(_AI_THUMB_DIR, exist_ok=True)
+            _sig = f"{npz}|{os.path.getmtime(npz)}|0"
+            _key = hashlib.md5(_sig.encode()).hexdigest()
+            outp = os.path.join(_AI_THUMB_DIR, f"{_key}.png")
+            if os.path.exists(outp):
+                return outp
+            arr = render_npz_thumb(npz, correct_display=False)
+            if arr is not None:
+                Image.fromarray(arr).save(outp)
+                return outp
+        except Exception:                                 # noqa: BLE001
+            pass
+    return png_path
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB — OVERLAYS (3-D napari screenshots + ROI gallery)
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_over:
-    st.subheader("🔬 3-D napari overlays")
+    st.subheader(":material/biotech: 3-D napari overlays")
     _run_labels = [r["label"] for r in _runs]
     oc1, oc2 = st.columns(2)
     with oc1:
@@ -874,6 +951,72 @@ with tab_over:
                     st.caption(_OVERVIEW_LABEL[tag])
                     st.image(imgs[tag], use_container_width=True)
 
+        # ── Validation rings on the XY MIP (pixel-accurate, from coords) ───────
+        _cil_mip = _load_sample_mip(_sel_run["dir"], _stem, "cilia")
+        if _cil_mip is not None:
+            with st.expander(":green[:material/circle:]:red[:material/circle:] Validation rings on overview MIP", expanded=True):
+                _samp = _cilia_full[(_cilia_full["run"] == _sel_label)
+                                    & (_cilia_full["filename"].apply(
+                                        lambda f: Path(str(f)).stem == _stem))].copy()
+                if _samp.empty or "coords" not in _samp.columns:
+                    st.caption("No cilia coordinates available for this sample.")
+                else:
+                    rc1, rc2, rc3 = st.columns(3)
+                    with rc1:
+                        _ring_by = st.selectbox(
+                            "Colour rings by",
+                            ["Human/AI validation", "Class"], key="ov_ring_by")
+                    with rc2:
+                        _ring_r = st.slider("Ring radius (px)", 4, 40, 14,
+                                            key="ov_ring_r")
+                    with rc3:
+                        _show_ids = st.checkbox("Show cilia IDs", value=True,
+                                                key="ov_ring_ids")
+                    # Per-channel display min/max (range sliders, 0–1 on the
+                    # min-max-normalised MIP).
+                    st.caption("Display range per channel (min, max)")
+                    mc1, mc2, mc3, mc4 = st.columns(4)
+                    with mc1:
+                        _clim_cil = st.slider("Cilia", 0.0, 1.0, (0.0, 1.0),
+                                              0.01, key="ov_clim_cil")
+                    with mc2:
+                        _clim_bb = st.slider("Basal body", 0.0, 1.0, (0.0, 1.0),
+                                             0.01, key="ov_clim_bb")
+                    with mc3:
+                        _clim_neu = st.slider("Neurite", 0.0, 1.0, (0.0, 1.0),
+                                              0.01, key="ov_clim_neu")
+                    with mc4:
+                        _clim_nuc = st.slider("Nuclei", 0.0, 1.0, (0.0, 1.0),
+                                              0.01, key="ov_clim_nuc")
+                    from limoncello.visualization.ring_overlay import (
+                        mip_rgb, ring_overlay_figure)
+                    _bg = mip_rgb(
+                        cilia=_cil_mip,
+                        neurite=_load_sample_mip(_sel_run["dir"], _stem, "neurite"),
+                        nuclei=_load_sample_mip(_sel_run["dir"], _stem, "nuclei"),
+                        bb=_load_sample_mip(_sel_run["dir"], _stem, "bb"),
+                        cilia_clim=_clim_cil, bb_clim=_clim_bb,
+                        neurite_clim=_clim_neu, nuclei_clim=_clim_nuc)
+                    _yx = _parse_coords_yx(_samp["coords"])
+                    if _ring_by == "Class" and "class" in _samp.columns:
+                        _cmap = {"neurite": True, "soma": False}
+                        _keep = [_cmap.get(str(c), None) for c in _samp["class"]]
+                        _cap = ":green[:material/circle:] neurite · :red[:material/circle:] soma · :orange[:material/circle:] ambiguous"
+                    else:
+                        _keep = ([bool(v) for v in _samp["human_validated"]]
+                                 if "human_validated" in _samp.columns
+                                 else [None] * len(_samp))
+                        _cap = ":green[:material/circle:] kept/validated · :red[:material/circle:] rejected"
+                    _ids = ([int(c) for c in _samp["cilia_id"]]
+                            if "cilia_id" in _samp.columns else None)
+                    _fig = ring_overlay_figure(
+                        _bg, _yx, _keep, None, ids=_ids, show_ids=_show_ids,
+                        radius=float(_ring_r), title=f"{_stem}")
+                    st.pyplot(_fig, use_container_width=True)
+                    plt.close(_fig)
+                    st.caption(_cap + ". Positions from each cilium's centroid "
+                               "coordinates, projected onto the XY MIP.")
+
         _roi_dir = os.path.join(_sel_run["dir"], "figures", "cilia_rois")
         _all_rois = (sorted(f for f in os.listdir(_roi_dir) if f.lower().endswith(".png"))
                      if os.path.isdir(_roi_dir) else [])
@@ -885,9 +1028,9 @@ with tab_over:
             rois = [os.path.join(_roi_dir, f) for f in _all_rois]
 
         st.markdown("---")
-        st.subheader(f"🔎 Per-cilium ROIs ({len(rois)})")
+        st.subheader(f":material/search: Per-cilium ROIs ({len(rois)})")
 
-        with st.expander("🛠️ ROI diagnostics", expanded=not rois):
+        with st.expander(":material/construction: ROI diagnostics", expanded=not rois):
             st.write(f"Folder: `{_roi_dir}`")
             st.write(f"Exists: **{os.path.isdir(_roi_dir)}** · "
                      f"PNG files in folder: **{len(_all_rois)}**")
@@ -916,7 +1059,7 @@ with tab_over:
                 row = grid[start:start + _per_row]
                 for col, p in zip(st.columns(_per_row), row):
                     with col:
-                        st.image(p, caption=os.path.basename(p),
+                        st.image(_raw_roi_thumb(p), caption=os.path.basename(p),
                                  use_container_width=True)
 
 
@@ -995,7 +1138,7 @@ def _discover_roi_models():
 
 
 with tab_screen:
-    st.subheader("🕵️ Cilia screening — keep the good, toss the junk")
+    st.subheader(":material/person_search: Cilia screening — keep the good, toss the junk")
     st.caption("Review every detected cilium's 3-D ROI and decide whether it's a "
                "real cilium. Rejected ones get `human_validated = False` and can be "
                "dropped from every other tab via the sidebar toggle.")
@@ -1006,8 +1149,8 @@ with tab_screen:
         # Honour a deferred "review unsure" jump from the AI panel (must run
         # before the Show/Mode widgets below are instantiated).
         if st.session_state.pop("_jump_unsure", False):
-            st.session_state["sc_show"] = "🤖 AI unsure"
-            st.session_state["sc_mode"] = "🖼️ Gallery"
+            st.session_state["sc_show"] = ":material/smart_toy: AI unsure"
+            st.session_state["sc_mode"] = ":material/image: Gallery"
 
         # Run is the shared context for the AI assistant and the gallery below.
         _sc_run = st.selectbox("Run", [r["label"] for r in _runs], key="sc_run")
@@ -1016,12 +1159,12 @@ with tab_screen:
         _NONE_MODEL = "(none — manual screening)"
         _ai_set = st.session_state.setdefault("ai_validated", set())
 
-        # ── 🤖 AI assistant: TRAIN a model, then PREDICT on the run ───────────
-        with st.expander(f"## 🤖 AI screening assistant"):
-            st.markdown("## 🤖 AI screening assistant")
+        # ── :material/smart_toy: AI assistant: TRAIN a model, then PREDICT on the run ───────────
+        with st.expander(f"## :material/smart_toy: AI screening assistant"):
+            st.markdown("## :material/smart_toy: AI screening assistant")
             _tab_train, _tab_predict, _tab_acts = st.tabs(
-                ["🧠 Train a model", "🔮 Predict on this run",
-                 "🔬 Activation maps"])
+                [":material/psychology: Train a model", ":material/online_prediction: Predict on this run",
+                 ":material/biotech: Activation maps"])
 
             # ===== TRAIN =====
             with _tab_train:
@@ -1029,11 +1172,13 @@ with tab_screen:
                            "(their ROI images) to suggest decisions for the rest.")
                 # Labelled examples = saved decisions with an ROI image (skip the
                 # model's own past suggestions to avoid a feedback loop).
+                # Train on RAW-intensity thumbnails (correct=False) — the same
+                # images shown in the gallery, so the user sees what the model sees.
                 _labelled, _n_keep_ex, _n_rej_ex = [], 0, 0
                 for _tk, _ok in _VAL.items():
                     if _tk in _ai_set:
                         continue
-                    _pp = _roi_png_path(*_tk)
+                    _pp = _roi_model_png(*_tk, False)
                     if _pp:
                         _labelled.append((_pp, 1 if _ok else 0))
                         _n_keep_ex += int(bool(_ok))
@@ -1041,8 +1186,8 @@ with tab_screen:
 
                 a1, a2, a3 = st.columns(3)
                 a1.metric("Training images", len(_labelled))
-                a2.metric("✅ keep examples", _n_keep_ex)
-                a3.metric("❌ reject examples", _n_rej_ex)
+                a2.metric(":material/check_circle: keep examples", _n_keep_ex)
+                a3.metric(":material/cancel: reject examples", _n_rej_ex)
 
                 tn1, tn2 = st.columns([2, 1])
                 with tn1:
@@ -1065,11 +1210,11 @@ with tab_screen:
                                      if c.isalnum() or c in "-_") or "roi_validator"
                 _model_path = os.path.join(_MODELS_DIR, f"{_safe_name}.pt")
 
-                with st.expander(f"🧬 {_arch_label} architecture", expanded=False):
+                with st.expander(f":material/schema: {_arch_label} architecture", expanded=False):
                     _apng = _arch_diagram_png(_arch)
                     st.image(_apng, width=540)
                     st.download_button(
-                        "⬇️ Download architecture (PNG)", _apng,
+                        ":material/download: Download architecture (PNG)", _apng,
                         f"roi_validator_{_arch}_architecture.png", "image/png",
                         key="dl_arch")
 
@@ -1077,7 +1222,7 @@ with tab_screen:
                 if not _ready:
                     st.info("Screen at least **8 cilia including some of each** "
                             "(keep *and* reject, with ROI images) to train.")
-                if st.button("🧠 Train / retrain model", type="primary",
+                if st.button(":material/psychology: Train / retrain model", type="primary",
                              disabled=not _ready, key="ai_train"):
                     try:
                         from limoncello.ml.roi_validator import (train_validator,
@@ -1095,7 +1240,7 @@ with tab_screen:
                             f"Trained on {_res['n_train']} images "
                             f"({_res.get('device', 'cpu').upper()}, {_arch}) · "
                             f"{_res['val_acc'] * 100:.0f}% val accuracy · saved as "
-                            f"**{_safe_name}.pt**. Use it in the **🔮 Predict** tab.")
+                            f"**{_safe_name}.pt**. Use it in the **:material/online_prediction: Predict** tab.")
                     except Exception as exc:              # noqa: BLE001
                         st.error(f"Training failed: {exc}")
 
@@ -1113,9 +1258,9 @@ with tab_screen:
                     _cf = _clf.get("confusion")
                     if _cf:
                         st.caption(
-                            f"Validation: ✅ {_cf['tp']} correct keeps · "
-                            f"✅ {_cf['tn']} correct rejects · "
-                            f"⚠️ {_cf['fp']} wrongly kept · {_cf['fn']} missed.")
+                            f"Validation: :material/check_circle: {_cf['tp']} correct keeps · "
+                            f":material/check_circle: {_cf['tn']} correct rejects · "
+                            f":material/warning: {_cf['fp']} wrongly kept · {_cf['fn']} missed.")
                     _hist = _clf.get("history")
                     if _hist and isinstance(_hist[0], dict):
                         _hdf = pd.DataFrame(_hist).set_index("epoch")
@@ -1131,7 +1276,7 @@ with tab_screen:
             with _tab_predict:
                 _roi_models = _discover_roi_models()
                 if not _roi_models:
-                    st.info("No trained model yet — train one in the **🧠 Train** "
+                    st.info("No trained model yet — train one in the **:material/psychology: Train** "
                             "tab first.")
                 else:
                     _want = st.session_state.pop("_select_model", None)
@@ -1180,14 +1325,14 @@ with tab_screen:
                                 continue
                             _tk = _val_key(_rw["run"], _rw["filename"],
                                            _rw["cilia_id"])
-                            _pp = _roi_png_path(_rw["run"], _rw["filename"],
-                                                _rw["cilia_id"])
+                            _pp = _roi_model_png(_rw["run"], _rw["filename"],
+                                                 _rw["cilia_id"], False)
                             if _pp:
                                 _cand.append((_tk, _pp))
 
                         st.caption(f"Scores all **{len(_cand)}** cilia with an ROI "
                                    f"image in run **{_sc_run}**.")
-                        if _cand and st.button(f"🔮 Predict on '{_sc_run}'",
+                        if _cand and st.button(f":material/online_prediction: Predict on '{_sc_run}'",
                                                type="primary", key="ai_predict"):
                             from limoncello.ml.roi_validator import predict_proba
                             _probs = predict_proba(
@@ -1219,7 +1364,7 @@ with tab_screen:
                             s3.metric("→ needs you", _n_un)
 
                             if _n_un and st.button(
-                                    f"👀 Review the {_n_un} unsure in the gallery",
+                                    f":material/visibility: Review the {_n_un} unsure in the gallery",
                                     key="ai_review_unsure"):
                                 st.session_state["_jump_unsure"] = True
                                 st.rerun()
@@ -1232,12 +1377,21 @@ with tab_screen:
                                     with _col:
                                         st.image(_preds["paths"][_i],
                                                  use_container_width=True)
+                                        _tk_i = _preds["tks"][_i]
+                                        _samp_i = Path(str(_tk_i[1])).stem
                                         st.caption(f"score {_pa[_i]:.2f}")
+                                        st.markdown(
+                                            f"<div title='{_samp_i}' "
+                                            f"style='color:#888;font-size:0.75em;"
+                                            f"overflow:hidden;text-overflow:ellipsis;"
+                                            f"white-space:nowrap'>cilia "
+                                            f"{int(_tk_i[2])} · {_samp_i}</div>",
+                                            unsafe_allow_html=True)
 
                             st.warning("Applies to **undecided** cilia only — your "
                                        "manual decisions are preserved. ‘Needs "
                                        "you’ cilia are left for review.")
-                            if st.button("✅ Apply keep/reject suggestions",
+                            if st.button(":material/check_circle: Apply keep/reject suggestions",
                                          type="primary", key="ai_apply"):
                                 _changed, _applied = set(), 0
                                 for _tk, _pb in zip(_preds["tks"], _pa):
@@ -1266,8 +1420,8 @@ with tab_screen:
                            "the keep / reject decision for one ROI.")
                 _clf = st.session_state.get("roi_clf")
                 if not _clf:
-                    st.info("Load or train a model first (in the **🧠 Train** or "
-                            "**🔮 Predict** tab).")
+                    st.info("Load or train a model first (in the **:material/psychology: Train** or "
+                            "**:material/online_prediction: Predict** tab).")
                 else:
                     # Pick an ROI from the current run that has an image.
                     _av_scope = _cilia_full[_cilia_full["run"] == _sc_run]
@@ -1298,7 +1452,7 @@ with tab_screen:
                             _show_layers = st.checkbox("Per-layer activations",
                                                        value=True, key="av_layers")
 
-                        if st.button("🔬 Visualize", type="primary",
+                        if st.button(":material/biotech: Visualize", type="primary",
                                      key="av_run"):
                             try:
                                 from limoncello.ml.roi_validator import (
@@ -1357,12 +1511,69 @@ with tab_screen:
         with gc2:
             _sc_show = st.selectbox("Show", ["All", "Kept", "Rejected",
                                              "Unscreened", "Ambiguous only",
-                                             "🤖 AI unsure"],
+                                             ":material/smart_toy: AI unsure"],
                                     key="sc_show")
         with gc3:
             _sort_opts = [c for c in ("cilia_id", "log_ratio", "volume_um3",
                                       "length_um", "class") if c in _scope.columns]
             _sc_sort = st.selectbox("Sort by", _sort_opts or ["cilia_id"], key="sc_sort")
+
+        # When a single sample is filtered, show its overview MIP with the
+        # kept / rejected cilia highlighted (live decisions), so you can screen
+        # each ROI against the full-image context.
+        if (_sc_sample != "All" and _run_dir and "coords" in _scope.columns
+                and "cilia_id" in _scope.columns):
+            _cil_mip = _load_sample_mip(_run_dir, _sc_sample, "cilia")
+            _samp_ov = _scope[_scope["coords"].notna() & _scope["cilia_id"].notna()]
+            if _cil_mip is not None and not _samp_ov.empty:
+                with st.expander(
+                        f":material/biotech: Overview — kept / rejected on "
+                        f"{_sc_sample}", expanded=True):
+                    from limoncello.visualization.ring_overlay import (
+                        mip_rgb, ring_overlay_figure)
+                    sr1, sr2 = st.columns(2)
+                    with sr1:
+                        _sc_ring_r = st.slider("Ring radius (px)", 4, 40, 14,
+                                               key="sc_ring_r")
+                    with sr2:
+                        _sc_ring_ids = st.checkbox("Show cilia IDs", value=True,
+                                                   key="sc_ring_ids")
+                    # Per-channel display window (min, max) on the min-max-normalised MIP.
+                    st.caption("Display range per channel (min, max)")
+                    sm1, sm2, sm3, sm4 = st.columns(4)
+                    with sm1:
+                        _sc_clim_cil = st.slider("Cilia", 0.0, 1.0, (0.0, 1.0),
+                                                 0.01, key="sc_clim_cil")
+                    with sm2:
+                        _sc_clim_bb = st.slider("Basal body", 0.0, 1.0, (0.0, 1.0),
+                                                0.01, key="sc_clim_bb")
+                    with sm3:
+                        _sc_clim_neu = st.slider("Neurite", 0.0, 1.0, (0.0, 1.0),
+                                                 0.01, key="sc_clim_neu")
+                    with sm4:
+                        _sc_clim_nuc = st.slider("Nuclei", 0.0, 1.0, (0.0, 1.0),
+                                                 0.01, key="sc_clim_nuc")
+                    _bg = mip_rgb(
+                        cilia=_cil_mip,
+                        neurite=_load_sample_mip(_run_dir, _sc_sample, "neurite"),
+                        nuclei=_load_sample_mip(_run_dir, _sc_sample, "nuclei"),
+                        bb=_load_sample_mip(_run_dir, _sc_sample, "bb"),
+                        cilia_clim=_sc_clim_cil, bb_clim=_sc_clim_bb,
+                        neurite_clim=_sc_clim_neu, nuclei_clim=_sc_clim_nuc)
+                    _yx = _parse_coords_yx(_samp_ov["coords"])
+                    _keep = [_VAL.get(_val_key(_sc_run, fn, cid), None)
+                             for fn, cid in zip(_samp_ov["filename"],
+                                                _samp_ov["cilia_id"])]
+                    _ids = [int(c) for c in _samp_ov["cilia_id"]]
+                    _fig = ring_overlay_figure(
+                        _bg, _yx, _keep, None, ids=_ids,
+                        show_ids=_sc_ring_ids, radius=float(_sc_ring_r),
+                        title=_sc_sample)
+                    st.pyplot(_fig, use_container_width=True)
+                    plt.close(_fig)
+                    st.caption(":green[:material/circle:] kept · "
+                               ":red[:material/circle:] rejected · "
+                               ":orange[:material/circle:] undecided")
 
         # Resolve each row's store key + current decision, then apply the filter.
         _scope = _scope[_scope["cilia_id"].notna()].copy()
@@ -1387,10 +1598,10 @@ with tab_screen:
             _view_c = _scope[~_scope["_done"]]
         elif _sc_show == "Ambiguous only" and "class" in _scope.columns:
             _view_c = _scope[_scope["class"] == "ambiguous"]
-        elif _sc_show == "🤖 AI unsure":
+        elif _sc_show == ":material/smart_toy: AI unsure":
             _view_c = _scope[_unsure_mask]
             if _view_c.empty:
-                st.info("No AI-uncertain cilia to review. Run **🔮 Predict** in "
+                st.info("No AI-uncertain cilia to review. Run **:material/online_prediction: Predict** in "
                         "the AI assistant above first.")
         else:
             _view_c = _scope
@@ -1404,23 +1615,23 @@ with tab_screen:
         _seen = int(_scope["_done"].sum())
         p1, p2, p3, p4 = st.columns(4)
         p1.metric("In view", f"{len(_view_c)} / {_tot}")
-        p2.metric("✅ Kept", _kept)
-        p3.metric("❌ Rejected", _rej)
-        p4.metric("👀 Screened", f"{_seen}/{_tot}")
+        p2.metric(":material/check_circle: Kept", _kept)
+        p3.metric(":material/cancel: Rejected", _rej)
+        p4.metric(":material/visibility: Screened", f"{_seen}/{_tot}")
         st.progress(_seen / _tot if _tot else 0.0,
-                    text=("🎉 All screened!" if _seen >= _tot and _tot
+                    text=(":material/celebration: All screened!" if _seen >= _tot and _tot
                           else f"{_seen} of {_tot} reviewed in this run"))
 
-        _mode = st.radio("Mode", ["🖼️ Gallery", "🎯 Focus (one at a time)"],
+        _mode = st.radio("Mode", [":material/image: Gallery", ":material/center_focus_strong: Focus (one at a time)"],
                          horizontal=True, key="sc_mode")
 
         # ── Bulk actions (must mutate state BEFORE the toggles are built) ──────
         st.caption("Reject-only workflow? Toggle off the bad cilia, then click "
-                   "**✔️ Mark all reviewed** so the kept ones also count as "
+                   "**:material/check: Mark all reviewed** so the kept ones also count as "
                    "screened (and train the AI). Your rejections are preserved.")
         b1, b2, b3, b4, b5 = st.columns(5)
         _shown_tks = list(_view_c["_tk"])
-        if b1.button("✔️ Mark all reviewed", type="primary",
+        if b1.button(":material/check: Mark all reviewed", type="primary",
                      use_container_width=True, key="sc_markrev",
                      help="Marks every still-undecided cilium shown as KEPT, "
                           "leaving your rejections untouched — so the whole set "
@@ -1430,24 +1641,24 @@ with tab_screen:
                     _commit_decision(t, True, persist=False)
             _persist_run(_sc_run)
             st.rerun()
-        if b2.button("✅ Keep all shown", use_container_width=True, key="sc_keepall",
+        if b2.button(":material/check_circle: Keep all shown", use_container_width=True, key="sc_keepall",
                      help="Force-keep everything shown, overriding any rejections."):
             for t in _shown_tks:
                 _commit_decision(t, True, persist=False)
             _persist_run(_sc_run)
             st.rerun()
-        if b3.button("❌ Reject all shown", use_container_width=True, key="sc_rejall"):
+        if b3.button(":material/cancel: Reject all shown", use_container_width=True, key="sc_rejall"):
             for t in _shown_tks:
                 _commit_decision(t, False, persist=False)
             _persist_run(_sc_run)
             st.rerun()
-        if b4.button("↩️ Reset shown", use_container_width=True, key="sc_resetall"):
+        if b4.button(":material/undo: Reset shown", use_container_width=True, key="sc_resetall"):
             for t in _shown_tks:
                 _VAL.pop(t, None)                          # back to undecided (defaults to keep)
                 st.session_state.setdefault("ai_validated", set()).discard(t)
             _persist_run(_sc_run)
             st.rerun()
-        if b5.button("💾 Save decisions", type="secondary",
+        if b5.button(":material/save: Save decisions", type="secondary",
                      use_container_width=True, key="sc_save"):
             _saved = 0
             for r in _runs:
@@ -1456,14 +1667,14 @@ with tab_screen:
                 if rows:
                     save_validation_file(r["dir"], rows)
                     _saved += len(rows)
-            st.success(f"💾 Saved {_saved} decisions to each run's "
+            st.success(f":material/save: Saved {_saved} decisions to each run's "
                        "`csv/human_validation.csv`.")
 
         if _view_c.empty:
-            st.info("No cilia match this filter. 🎈")
+            st.info("No cilia match this filter.")
 
         # ── FOCUS mode: one big card, keep/reject advances ────────────────────
-        elif _mode.startswith("🎯"):
+        elif _mode.startswith(":material/center_focus_strong:"):
             _sig = f"{_sc_run}|{_sc_sample}|{_sc_show}|{_sc_sort}"
             if st.session_state.get("_focus_sig") != _sig:
                 st.session_state["_focus_sig"] = _sig
@@ -1482,11 +1693,12 @@ with tab_screen:
                 f"padding:6px 12px;display:inline-block'>"
                 f"<b>cilia {cid}</b> &nbsp;·&nbsp; "
                 f"<span style='color:{_CLASS_PALETTE.get(cls,'#888')}'>●</span> {cls} "
-                f"&nbsp;·&nbsp; {'✅ KEPT' if keep else '❌ REJECTED'}</div>",
+                f"&nbsp;·&nbsp; {'KEPT' if keep else 'REJECTED'}</div>",
                 unsafe_allow_html=True)
             ic, sc = st.columns([2, 1])
             with ic:
-                _p = _roi_png_path(_sc_run, row["filename"], cid)
+                # Gallery shows RAW intensities (re-rendered from the .npz crop).
+                _p = _roi_model_png(_sc_run, row["filename"], cid, False)
                 if _p:
                     st.image(_p, use_container_width=True)
                 else:
@@ -1497,18 +1709,18 @@ with tab_screen:
                 st.caption(f"{_i + 1} / {_n}")
 
             n1, n2, n3, n4 = st.columns(4)
-            if n1.button("⬅️ Prev", use_container_width=True, key="fx_prev"):
+            if n1.button(":material/arrow_back: Prev", use_container_width=True, key="fx_prev"):
                 st.session_state["_focus_i"] = max(0, _i - 1)
                 st.rerun()
-            if n2.button("✅ Keep ▶", use_container_width=True, key="fx_keep"):
+            if n2.button(":material/check_circle: Keep ▶", use_container_width=True, key="fx_keep"):
                 _commit_decision(tk, True)
                 st.session_state["_focus_i"] = min(_n - 1, _i + 1)
                 st.rerun()
-            if n3.button("❌ Reject ▶", use_container_width=True, key="fx_rej"):
+            if n3.button(":material/cancel: Reject ▶", use_container_width=True, key="fx_rej"):
                 _commit_decision(tk, False)
                 st.session_state["_focus_i"] = min(_n - 1, _i + 1)
                 st.rerun()
-            if n4.button("Next ➡️", use_container_width=True, key="fx_next"):
+            if n4.button("Next :material/arrow_forward:", use_container_width=True, key="fx_next"):
                 st.session_state["_focus_i"] = min(_n - 1, _i + 1)
                 st.rerun()
 
@@ -1531,12 +1743,21 @@ with tab_screen:
                 keep = bool(st.session_state[wk])
                 colr = "#2ecc71" if keep else "#e74c3c"
                 dot = _CLASS_PALETTE.get(cls, "#888")
+                _samp = (str(row["file_short"])
+                         if "file_short" in row and pd.notna(row.get("file_short"))
+                         else Path(str(row["filename"])).stem)
+                # Sample name shown muted + truncated; full name on hover (title attr).
                 st.markdown(
                     f"<div style='border-top:7px solid {colr};"
                     f"border-radius:5px;margin-bottom:2px'></div>"
+                    f"<span title='sample: {_samp}'>"
                     f"<span style='color:{dot}'>●</span> "
-                    f"<b>cilia {cid}</b> · {cls}", unsafe_allow_html=True)
-                _p = _roi_png_path(run_label, row["filename"], cid)
+                    f"<b>cilia {cid}</b> · {cls}</span>"
+                    f"<div title='{_samp}' style='color:#888;font-size:0.75em;"
+                    f"overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>"
+                    f"{_samp}</div>", unsafe_allow_html=True)
+                # Gallery shows RAW intensities (re-rendered from the .npz crop).
+                _p = _roi_model_png(run_label, row["filename"], cid, False)
                 if _p:
                     st.image(_p, use_container_width=True)
                 else:
@@ -1550,7 +1771,7 @@ with tab_screen:
                     st.caption(cap)
                 _aiv = row.get("_ai", np.nan)
                 if pd.notna(_aiv):
-                    st.caption(f"🤖 score {_aiv:.2f}")
+                    st.caption(f":material/smart_toy: score {_aiv:.2f}")
                 st.toggle("keep this cilium", key=wk,
                           on_change=_gallery_toggle, args=(tk,))
 
@@ -1566,7 +1787,7 @@ with tab_screen:
 # TAB — HIST / KDE
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_dist:
-    st.subheader("📊 Distribution (compare runs)")
+    st.subheader(":material/bar_chart: Distribution (compare runs)")
     dc1, dc2, dc3, dc4 = st.columns(4)
     with dc1:
         _def_m = "log_ratio" if "log_ratio" in _num_cols else (_num_cols[0] if _num_cols else None)
@@ -1765,7 +1986,7 @@ with tab_dist:
 # TAB — SCATTER
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_scatter:
-    st.subheader("🟢 Scatter (compare runs)")
+    st.subheader(":material/scatter_plot: Scatter (compare runs)")
     if len(_num_cols) < 2:
         st.info("Need at least two numeric columns.")
     else:
@@ -1842,9 +2063,9 @@ with tab_scatter:
 
                 _rx, _ry = _role(_sx), _role(_sy)
                 if _sx_norm != "none" or _sy_norm != "none":
-                    st.caption("⚠️ Class boundaries hidden — turn off normalization.")
+                    st.caption(":material/warning: Class boundaries hidden — turn off normalization.")
                 elif None in (_rx[0], _ry[0]) or _rx[0] == _ry[0] or _rx[1] != _ry[1]:
-                    st.caption("⚠️ Class boundaries need dt_neurite vs dt_nuclei "
+                    st.caption(":material/warning: Class boundaries need dt_neurite vs dt_nuclei "
                                "(or their log) on the two axes.")
                 else:
                     _islog = _rx[1]
@@ -1886,7 +2107,7 @@ with tab_scatter:
 # TAB — INTERACTIVE SCATTER (hover = sample/ratio/log_ratio, click = ROI image)
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_inter:
-    st.subheader("⚡ Interactive scatter")
+    st.subheader(":material/bolt: Interactive scatter")
     if not _PLOTLY:
         st.info("Install plotly for the interactive explorer:  `pip install plotly`")
     elif len(_num_cols) < 2:
@@ -1987,7 +2208,7 @@ with tab_inter:
                     _multi = _roi_multichannel_png(_npz)
                     if _multi is not None:
                         st.image(_multi, use_container_width=True)
-                        st.caption("🟢 cilia · 🟣 basal body · 🔵 nuclei · cyan neurite")
+                        st.caption(":green[:material/circle:] cilia · :violet[:material/circle:] basal body · :blue[:material/circle:] nuclei · cyan neurite")
                     else:
                         path = _roi_png_path(rl, info.get("filename"),
                                              info.get("cilia_id"))
@@ -2003,7 +2224,7 @@ with tab_inter:
 # TAB — CORRELATION HEATMAP
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_corr:
-    st.subheader("🔗 Correlation heatmap")
+    st.subheader(":material/link: Correlation heatmap")
     _default_corr = [c for c in ("log_ratio", "ratio", "distance_to_neurite_um",
                                  "dt_neurite_um", "dt_nuclei_um", "volume_um3",
                                  "length_um", "pair_distance_um") if c in _num_cols]
@@ -2053,7 +2274,7 @@ with tab_corr:
 # TAB — DATA TABLE
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_table:
-    st.subheader("📋 Per-object table")
+    st.subheader(":material/list_alt: Per-object table")
     fc1, fc2, fc3, fc4 = st.columns(4)
     with fc1:
         _f_run = st.multiselect("Run", [r["label"] for r in _runs],
@@ -2087,13 +2308,13 @@ with tab_table:
 
     st.caption(f"Showing {len(_view):,} of {len(_df):,} objects")
     st.dataframe(_view, use_container_width=True, height=420)
-    st.download_button("⬇️ Download filtered (CSV)",
+    st.download_button(":material/download: Download filtered (CSV)",
                        _view.to_csv(index=False).encode(),
                        "objects_filtered.csv", "text/csv", key="dl_tbl")
 
     # Per-run / per-sample summary
     st.markdown("---")
-    st.subheader("🧫 Summary")
+    st.subheader(":material/science: Summary")
     if _has_otype:
         _cil = _df[_df["object_type"] == "cilia"]
     else:
@@ -2105,7 +2326,7 @@ with tab_table:
         _by = [c for c in ("run", "file_short") if c in _cil.columns] or ["run"]
         _summary = _cil.groupby(_by).agg(**_agg).reset_index()
         st.dataframe(_summary, use_container_width=True)
-        st.download_button("⬇️ Download summary (CSV)",
+        st.download_button(":material/download: Download summary (CSV)",
                            _summary.to_csv(index=False).encode(),
                            "summary.csv", "text/csv", key="dl_sum")
 
@@ -2114,7 +2335,7 @@ with tab_table:
 # TAB — QC
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_qc:
-    st.subheader("🩺 Quality control")
+    st.subheader(":material/monitor_heart: Quality control")
     st.caption("Samples are flagged on **detected counts** of cilia and basal "
                "bodies (robust modified z-score within each run).")
     _qc = flag_deviant(per_sample_qc(_df))
@@ -2130,7 +2351,7 @@ with tab_qc:
             m4.metric("Total basal bodies", int(_qc["n_bb"].sum()))
 
         if len(_qc) < 4:
-            st.caption("⚠ Fewer than 4 samples per run — too few to flag statistical outliers.")
+            st.caption(":material/warning: Fewer than 4 samples per run — too few to flag statistical outliers.")
         elif _n_flagged:
             st.warning(
                 "Deviant samples (robust modified z-score > 3.5 within their run): "
@@ -2140,7 +2361,7 @@ with tab_qc:
                 )
             )
         else:
-            st.success("✓ No deviant samples — all metrics within robust range.")
+            st.success(":material/check: No deviant samples — all metrics within robust range.")
 
         st.pyplot(_qc_bar_fig(_qc), use_container_width=True)
 
@@ -2148,13 +2369,13 @@ with tab_qc:
         def _hl(row):
             return ["background-color: #fdecea" if row["flags"] else "" for _ in row]
         st.dataframe(_qc.style.apply(_hl, axis=1), use_container_width=True)
-        st.download_button("⬇️ Download QC table (CSV)",
+        st.download_button(":material/download: Download QC table (CSV)",
                            _qc.to_csv(index=False).encode(),
                            "qc_per_sample.csv", "text/csv", key="dl_qc")
 
         # ── Cilia-count comparison across runs ─────────────────────────────────
         if _has_otype and {"run"}.issubset(_cilia.columns) and not _cilia.empty:
-            st.markdown("#### 🔢 Cilia count comparison")
+            st.markdown("#### :material/pin: Cilia count comparison")
             _per_run = (_cilia.groupby("run").size()
                         .rename("n_cilia").reset_index())
             _per_samp = (_cilia.groupby(["run", "filename"]).size()
@@ -2185,7 +2406,7 @@ with tab_qc:
             st.dataframe(_per_run, use_container_width=True, hide_index=True)
 
         # ── Ciliation rate (cilia per estimated nucleus) ───────────────────────
-        st.markdown("#### 🧫 Ciliation rate")
+        st.markdown("#### :material/science: Ciliation rate")
         _nuc = combined_nuclei(_runs)
         if _nuc.empty:
             st.info("No `nuclei_summary.csv` found for the loaded runs. Re-run the "
@@ -2238,14 +2459,14 @@ with tab_qc:
                 plt.close(_fcs)
             st.dataframe(_merged[_disp_cols].round(3), use_container_width=True,
                          hide_index=True)
-            st.download_button("⬇️ Download ciliation table (CSV)",
+            st.download_button(":material/download: Download ciliation table (CSV)",
                                _merged[_disp_cols].to_csv(index=False).encode(),
                                "ciliation_rate.csv", "text/csv", key="dl_cil")
 
         # ── False positives from human screening ──────────────────────────────
-        st.markdown("#### 🚫 False positives (human-rejected detections)")
+        st.markdown("#### :material/block: False positives (human-rejected detections)")
         st.caption("A false positive = a detected cilium the reviewer rejected "
-                   "in the 🕵️ Screening tab. Rate is over **screened** cilia "
+                   "in the :material/person_search: Screening tab. Rate is over **screened** cilia "
                    "(unreviewed ones are ignored).")
         if "human_validated" not in _cilia_full.columns or _cilia_full.empty:
             st.info("No cilia to evaluate.")
@@ -2280,7 +2501,7 @@ with tab_qc:
             f3.metric("False positives", _fp_n)
             f4.metric("FP rate", f"{_rate:.1f}%")
             if _scr == 0:
-                st.warning("Nothing screened yet — review cilia in the 🕵️ "
+                st.warning("Nothing screened yet — review cilia in the :material/person_search: "
                            "Screening tab to compute false positives.")
             else:
                 _fp_tbl = (_fpd.groupby("run")
@@ -2292,12 +2513,12 @@ with tab_qc:
                     100 * _fp_tbl["false_positives"]
                     / _fp_tbl["screened"].replace(0, np.nan)).round(1)
                 st.dataframe(_fp_tbl, use_container_width=True)
-                st.download_button("⬇️ Download false-positive table (CSV)",
+                st.download_button(":material/download: Download false-positive table (CSV)",
                                    _fp_tbl.to_csv(index=False).encode(),
                                    "false_positives.csv", "text/csv", key="dl_fp")
 
         # The pipeline's own QC sheets (per run), shown verbatim
-        with st.expander("📑 Pipeline QC sheets (per run)", expanded=False):
+        with st.expander(":material/article: Pipeline QC sheets (per run)", expanded=False):
             for r in _runs:
                 sheets = load_qc_sheets(r["dir"], _excel_mtime(r["dir"]))
                 st.markdown(f"**{r['label']}**")
@@ -2375,7 +2596,7 @@ def _validation_compare(label, merged, hand_col, pipe_col, unit=""):
 
 
 with tab_validate:
-    st.subheader("🤝 Validate pipeline vs hand analysis")
+    st.subheader(":material/handshake: Validate pipeline vs hand analysis")
     st.caption("Load a per-sample hand-count Excel and compare it to the pipeline "
                "(matched by filename). Validates cilia counts, the estimated "
                "nucleus count, and the soma / neurite split.")
@@ -2457,7 +2678,7 @@ with tab_validate:
                                         "pipe_on_neurite")
 
                 # ── Optimize the soma/neurite thresholds to match the hand split ──
-                with st.expander("🔧 Optimize neurite / soma thresholds to match "
+                with st.expander(":material/build: Optimize neurite / soma thresholds to match "
                                  "hand", expanded=False):
                     st.caption("Grid-searches the two log_ratio thresholds to best "
                                "reproduce the hand soma/neurite split (matches each "
@@ -2524,7 +2745,7 @@ with tab_validate:
                         _ofig.tight_layout()
                         st.pyplot(_ofig, use_container_width=False)
                         plt.close(_ofig)
-                        if st.button("✅ Apply optimized thresholds",
+                        if st.button(":material/check_circle: Apply optimized thresholds",
                                      type="primary", key="apply_opt_thr"):
                             st.session_state["_apply_thr"] = (round(float(_bs), 2),
                                                               round(float(_bn), 2))
@@ -2541,7 +2762,7 @@ with tab_validate:
                 st.markdown("**Per-sample comparison**")
                 st.dataframe(_tbl.round(1), use_container_width=True, hide_index=True)
                 st.download_button(
-                    "⬇️ Download comparison (CSV)",
+                    ":material/download: Download comparison (CSV)",
                     _tbl.to_csv(index=False).encode(),
                     "pipeline_vs_hand.csv", "text/csv", key="dl_validation")
 
@@ -2663,7 +2884,7 @@ def build_report_pdf(runs, df, *, include_qc, include_overviews, include_rois,
     with PdfPages(buf) as pdf:
         # ── Title page ──────────────────────────────────────────────────────
         fig = plt.figure(figsize=(11, 8.5))
-        fig.text(0.5, 0.92, "Limoncello — Data Report 🍋", ha="center",
+        fig.text(0.5, 0.92, "Limoncello — Data Report", ha="center",
                  fontsize=18, fontweight="bold")
         lines = [f"Runs compared: {len(runs)}", ""]
         for r in runs:
@@ -2745,7 +2966,7 @@ def build_report_pdf(runs, df, *, include_qc, include_overviews, include_rois,
 
 
 with tab_report:
-    st.subheader("📄 PDF report")
+    st.subheader(":material/description: PDF report")
     st.caption("Bundles the 3-D napari images and run-comparison plots into one PDF.")
     rc0, rc1, rc2, rc3 = st.columns(4)
     with rc0:
@@ -2763,7 +2984,7 @@ with tab_report:
         key="r_metric",
     )
 
-    if st.button("🖨️ Build PDF report", type="primary", key="r_build"):
+    if st.button(":material/print: Build PDF report", type="primary", key="r_build"):
         with st.spinner("Rendering report …"):
             try:
                 pdf_bytes = build_report_pdf(
@@ -2779,6 +3000,6 @@ with tab_report:
                 st.session_state["_report_pdf"] = None
 
     if st.session_state.get("_report_pdf"):
-        st.download_button("⬇️ Download report (PDF)",
+        st.download_button(":material/download: Download report (PDF)",
                            st.session_state["_report_pdf"],
                            "limoncello_report.pdf", "application/pdf", key="dl_report")
