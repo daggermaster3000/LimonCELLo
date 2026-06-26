@@ -875,6 +875,7 @@ def run_roi_only_batch(
     expected_xy_um: float | None = None,
     xy_tol: float = 0.03,
     roi_sample_frac: float = 1.0,
+    roi_tile_px: int = 512,
     sample_seed: int = 0,
     progress_callback=None,
 ):
@@ -890,9 +891,11 @@ def run_roi_only_batch(
     (filename, file_short, object_type, cilia_id, coords + 3-D shape props) — the
     columns the ROI labeler and screening tab need. Returns the workbook path.
 
-    ``roi_sample_frac`` < 1 exports only a random fraction of the detected cilia
-    (≈ that % of the whole dataset, reproducible via ``sample_seed``) — handy for
-    building a smaller ROI set to label / train the CNN on.
+    ``roi_sample_frac`` < 1 keeps **all** cilia from **random regions** of each
+    image (the XY plane is split into ``roi_tile_px`` tiles and ≈ that fraction of
+    the tiles are chosen at random, reproducible via ``sample_seed``) — so you get
+    spatially-coherent crops with their full local context, not cherry-picked
+    individual cilia.
     """
     from ..visualization.cilia_rois import save_cilia_rois
 
@@ -994,15 +997,32 @@ def run_roi_only_batch(
             "cilia_id": [int(i) for i in ids],
             "coords": [[float(c[0]), float(c[1]), float(c[2])] for c in cents],
         })
-        # Optionally export only a random fraction of this image's cilia.
+        # Optionally keep ALL cilia from a random selection of image regions
+        # (tile the XY plane, pick ~frac of the tiles) — spatially-coherent crops
+        # with full local context, not individual cilia cherry-picked.
         if roi_sample_frac < 1.0 and len(df):
-            keep = rng.random(len(df)) < roi_sample_frac
-            df = df[keep].reset_index(drop=True)
+            n0 = len(df)
+            Y, X = int(cilia_labels.shape[-2]), int(cilia_labels.shape[-1])
+            tp = max(16, int(roi_tile_px))
+            ny = max(1, -(-Y // tp))
+            nx = max(1, -(-X // tp))
+            n_tiles = ny * nx
+            n_keep = max(1, round(roi_sample_frac * n_tiles))
+            sel = set(int(t) for t in
+                      rng.choice(n_tiles, size=min(n_keep, n_tiles), replace=False))
+
+            def _tile_of(c):
+                ty = min(int(c[1]) // tp, ny - 1)
+                tx = min(int(c[2]) // tp, nx - 1)
+                return ty * nx + tx
+
+            df = df[df["coords"].apply(lambda c: _tile_of(c) in sel)].reset_index(drop=True)
             if df.empty:
-                print(f"  (sampled 0/{len(keep)} cilia at {roi_sample_frac:.0%})")
+                print(f"  (no cilia in {len(sel)}/{n_tiles} random tiles)")
                 _flush_gpu()
                 continue
-            print(f"  sampled {len(df)}/{len(keep)} cilia at {roi_sample_frac:.0%}")
+            print(f"  {len(df)}/{n0} cilia in {len(sel)}/{n_tiles} random "
+                  f"{tp}px tiles (~{roi_sample_frac:.0%} of area)")
         # 3-D shape descriptors (volume, length, …) for the labeler's stat line.
         cprops = cilia_shape_props(cilia_labels, voxel_size)
         for col in SHAPE_COLS:

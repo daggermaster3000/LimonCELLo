@@ -1149,6 +1149,7 @@ class LimoncelloApp:
             roi_correct_display=self.roi_correct.value,
             expected_xy_um=(self.batch_xy_um.value or None),
             roi_sample_frac=float(self.batch_roi_pct.value) / 100.0,
+            roi_tile_px=int(self.batch_roi_tile.value),
         )
 
         # Per-file live visualisation (optional). The callback runs in the worker
@@ -2074,8 +2075,10 @@ class LimoncelloApp:
             label="Classifier XY µm (0 = all formats)", value=0.152,
             min=0.0, max=5.0, step=0.001)
         self.batch_roi_pct = FloatSpinBox(
-            label="Export ROI % (100 = all)", value=100.0, min=1.0, max=100.0,
-            step=1.0)
+            label="Export region % of area (100 = all)", value=100.0, min=1.0,
+            max=100.0, step=1.0)
+        self.batch_roi_tile = SpinBox(
+            label="Region tile size (px)", value=512, min=32, max=8192)
 
         # Optional AI validation: score this image's cilia ROIs with a trained
         # validator CNN and show only the kept ones as a Labels layer.
@@ -2105,8 +2108,9 @@ class LimoncelloApp:
         )
         batch_box = Container(
             widgets=[self.output, self.batch_roi_only, self.batch_xy_um,
-                     self.batch_roi_pct, self.batch_capture, self.batch_rois,
-                     self.roi_correct, self.batch_ai, self.batch_btn],
+                     self.batch_roi_pct, self.batch_roi_tile, self.batch_capture,
+                     self.batch_rois, self.roi_correct, self.batch_ai,
+                     self.batch_btn],
             labels=True,
         )
         ai_box = Container(
