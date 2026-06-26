@@ -36,6 +36,8 @@ Run with:  python napari_cnn_app.py
 from __future__ import annotations
 
 import os
+import hashlib
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -44,26 +46,79 @@ import torch
 from torch import nn
 from magicgui.widgets import (
     Container, PushButton, ComboBox, FileEdit, Label, FloatSlider, SpinBox,
-    FloatSpinBox, CheckBox,
+    FloatSpinBox, CheckBox, LineEdit,
 )
 from napari.qt.threading import thread_worker
 from napari.utils.notifications import show_info, show_warning
 from scipy.ndimage import maximum_filter, center_of_mass
+try:
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+except Exception:                                              # older matplotlib
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 
 # Reuse the pipeline app's loader + device helpers so behaviour matches.
 from napari_app import (
     step_load, _detect_gpus, _default_gpu, _select_device, _add_image_safe,
-    _clamp_ch,
 )
 from limoncello.segmentation.cilia import segment_cilia_ml
 from limoncello.ml.roi_validator import (
-    ROINetBig, TinyROINet, load_bundle, DEFAULT_SIZE,
+    ROINetBig, TinyROINet, load_bundle, DEFAULT_SIZE, get_device,
 )
+from limoncello.analysis.pair_cilia_to_bb import parse_coords_string
 
 _DEFAULT_CLASSIFIER = str(
     (Path(__file__).parent / "segmenters" / "Cilia-d38-3D.cl").resolve()
 )
 _MODELS_DIR = str((Path(__file__).parent / "models").resolve())
+
+
+def _clamp_ch(n_ch: int, idx) -> int:
+    """Clamp a channel index into ``[0, n_ch - 1]``."""
+    try:
+        return int(min(max(int(idx), 0), n_ch - 1))
+    except (TypeError, ValueError):
+        return 0
+
+
+_ISO_CACHE = os.path.join(tempfile.gettempdir(), "lc_iso_cache")
+
+
+def cached_load(p: dict) -> dict:
+    """``step_load`` with a disk cache of the (isotropic) raw stack.
+
+    The raw stack depends only on the file + ``use_mip`` + ``make_isotropic`` (not
+    the percentile params, which only affect the unused ``norm``), so we key on
+    those and skip re-reading the ``.ims`` + resampling on repeat loads — a big win
+    when training reloads every image. Cached as ``.npz`` in the system temp dir;
+    returns ``dict(raw, voxel_size, n_ch)``.
+    """
+    ims = p.get("ims_path", "")
+    try:
+        sig = (f"{ims}|{os.path.getmtime(ims)}|{int(bool(p.get('use_mip')))}|"
+               f"{int(bool(p.get('make_isotropic')))}")
+    except OSError:
+        return step_load({}, p)
+    key = hashlib.md5(sig.encode()).hexdigest()
+    os.makedirs(_ISO_CACHE, exist_ok=True)
+    cpath = os.path.join(_ISO_CACHE, f"{key}.npz")
+    if os.path.exists(cpath):
+        try:
+            d = np.load(cpath, allow_pickle=False)
+            return dict(raw=d["raw"],
+                        voxel_size=tuple(float(v) for v in d["voxel_size"]),
+                        n_ch=int(d["n_ch"]))
+        except Exception:                                     # noqa: BLE001
+            pass
+    out = step_load({}, p)
+    try:
+        np.savez(cpath, raw=out["raw"],
+                 voxel_size=np.asarray(out["voxel_size"], dtype=float),
+                 n_ch=int(out["n_ch"]))
+        print(f"[cache] saved isotropic stack → {cpath}")
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"[cache] could not write {cpath}: {exc}")
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -192,6 +247,81 @@ def cnn_heatmap(fcn: nn.Module, rgb: np.ndarray,
     return prob.float().cpu().numpy()
 
 
+def model_stride(model: nn.Module) -> int:
+    """Total downsampling stride of a trained classifier's conv stack
+    (max-pools): 16 for the big net (4 pools), 4 for tiny (2 pools)."""
+    return 16 if isinstance(model, ROINetBig) else 4
+
+
+def cam_heatmap(model: nn.Module, rgb: np.ndarray,
+                device: torch.device) -> np.ndarray:
+    """Coarse class-activation-style ``P(cilium)`` map **without building the
+    FCN** — the cheap, free localization signal.
+
+    Run the trained classifier's conv blocks (drop the trailing GAP in
+    ``features``) to get the pre-pool feature map ``(C, H/16, W/16)``, then apply
+    the head's dense weights as 1×1 convolutions straight onto that map (dense
+    ``[out,in]`` → conv ``[out,in,1,1]``; for the tiny net the first dense is a
+    4×4 conv). Softmax over the 2 class channels → a 6×6-per-patch CAM. This is
+    mathematically the same as the surgically-built FCN, just computed directly
+    off the original model's features + classification weights — no new module.
+    """
+    import torch.nn.functional as F
+    model = model.to(device).eval()
+    x = torch.from_numpy(rgb[None]).to(device)
+    feats = model.features[:-1]                 # conv blocks, no GAP
+    lins = [m for m in model.head if isinstance(m, nn.Linear)]
+    with torch.no_grad():
+        feat = feats(x)                         # (1, C, h, w)
+        c = feat.shape[1]
+        w1, b1 = lins[0].weight, lins[0].bias
+        w2, b2 = lins[-1].weight, lins[-1].bias
+        if w1.shape[1] == c:                    # big: dense 256→128 is a 1×1 conv
+            h = F.relu(F.conv2d(feat, w1[:, :, None, None], b1))
+        else:                                   # tiny: dense 512→32 is a 4×4 conv
+            k = int(round((w1.shape[1] // c) ** 0.5))
+            h = F.relu(F.conv2d(feat, w1.view(w1.shape[0], c, k, k), b1))
+        logits = F.conv2d(h, w2[:, :, None, None], b2)
+        prob = torch.softmax(logits, dim=1)[0, 1]
+    return prob.float().cpu().numpy()
+
+
+def sliding_window_heatmap(model: nn.Module, rgb: np.ndarray, size: int,
+                           stride: int, device: torch.device,
+                           batch_size: int = 256) -> np.ndarray:
+    """Brute-force sliding window — the simplest detector, no architecture change.
+
+    Slide the **original** ``size×size`` classifier over ``rgb (3, H, W)`` with
+    ``stride``, score each window's ``P(keep)``, and assemble them into a grid
+    heatmap ``(n_rows, n_cols)`` on the same ``cell * stride + size/2`` geometry as
+    the FCN/CAM maps (so the same peak-find + coord mapping apply). Windows are
+    batched for throughput, but this still recomputes the shared convolutions for
+    every overlapping window — exactly the redundant work the fully-convolutional
+    version avoids. Fine for offline screening.
+    """
+    model = model.to(device).eval()
+    _, h, w = rgb.shape
+    # Pad so at least one full window fits in each axis.
+    pad_h, pad_w = max(0, size - h), max(0, size - w)
+    if pad_h or pad_w:
+        rgb = np.pad(rgb, ((0, 0), (0, pad_h), (0, pad_w)))
+        _, h, w = rgb.shape
+    ys = list(range(0, h - size + 1, stride)) or [0]
+    xs = list(range(0, w - size + 1, stride)) or [0]
+    cells = [(i, j, y, x) for i, y in enumerate(ys) for j, x in enumerate(xs)]
+    hm = np.zeros((len(ys), len(xs)), dtype=np.float32)
+    with torch.no_grad():
+        for b in range(0, len(cells), batch_size):
+            chunk = cells[b:b + batch_size]
+            batch = np.stack([rgb[:, y:y + size, x:x + size] for *_, y, x in chunk])
+            probs = torch.softmax(
+                model(torch.from_numpy(batch).to(device)), dim=1)[:, 1]
+            probs = probs.float().cpu().numpy()
+            for (i, j, _, _), pv in zip(chunk, probs):
+                hm[i, j] = pv
+    return hm
+
+
 def peak_find(heatmap: np.ndarray, threshold: float,
               min_distance: int) -> tuple[np.ndarray, np.ndarray]:
     """Local maxima of ``heatmap`` ≥ ``threshold``, separated by at least
@@ -207,15 +337,26 @@ def peak_find(heatmap: np.ndarray, threshold: float,
 
 
 def heatmap_peaks_to_image_xy(rc: np.ndarray, stride: float, in_scale: float,
-                              size: int) -> np.ndarray:
+                              offset: float) -> np.ndarray:
     """Map heatmap (row, col) indices back to **input image** (y, x) pixel
-    centres. Each output cell covers a ``size``-wide receptive field stepped by
-    ``stride`` on the (possibly up-scaled) input, so the receptive-field centre is
-    ``cell * stride + size/2``; divide by ``in_scale`` to undo the input rescale.
+    centres: ``(rc * stride + offset) / in_scale``.
+
+    ``offset`` is the per-cell centre offset (in scaled-input px) and differs by
+    detector:
+
+    * FCN / CAM — the conv blocks are ``padding=1`` ('same') with stride-2 pools,
+      so output cell ``r`` maps to the input block ``[r*stride, (r+1)*stride)``,
+      centred at ``offset = stride/2``. (Using ``size/2`` here — the
+      receptive-field *width* — would shift every centre down-right by
+      ``size/2 - stride/2``.)
+    * Sliding window — cell ``r`` is an explicit window with top-left ``r*stride``,
+      so its centre is ``offset = size/2``.
+
+    Divide by ``in_scale`` to undo the input rescale → native image pixels.
     """
     if rc.size == 0:
         return np.empty((0, 2), float)
-    yx = rc.astype(np.float64) * stride + size / 2.0
+    yx = rc.astype(np.float64) * stride + float(offset)
     return yx / max(in_scale, 1e-6)
 
 
@@ -247,6 +388,194 @@ def apoc_gated_by_centres(raw: np.ndarray, ch_cilia: int, classifier_path: str,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Whole-image detector — TRAINED on full images (not a transplant)
+# ──────────────────────────────────────────────────────────────────────────────
+# The transplant/CAM/sliding paths reuse a classifier trained on tight 96×96 ROI
+# crops, so they inherit that object-fills-the-frame scale. Here we instead train
+# a fully-convolutional detector *directly on whole images*: targets are
+# reconstructed by stamping each kept cilium (from the run's ``all_data`` coords +
+# ``human_validation.csv`` keep/reject) as a Gaussian onto a 1/16-resolution
+# heatmap over the full image. The net then learns cilia at their true
+# whole-image scale/context. Conv blocks can be warm-started from the ROI
+# classifier; the head is trained fresh.
+class FCNDetector(torch.nn.Module):
+    """Fully-convolutional cilium detector: ROINetBig conv blocks (no GAP) → 1×1
+    conv head → single-channel logit heatmap (sigmoid → P(cilium)), stride 16."""
+
+    stride = 16
+
+    def __init__(self):
+        super().__init__()
+        self.features = ROINetBig().features[:-1]      # 4 conv blocks, no GAP
+        self.head = torch.nn.Sequential(
+            torch.nn.Conv2d(256, 128, 1), torch.nn.ReLU(),
+            torch.nn.Conv2d(128, 1, 1))
+
+    def forward(self, x):
+        return self.head(self.features(x))
+
+    def warm_start_from(self, classifier: torch.nn.Module) -> bool:
+        """Copy the trained conv-block weights from a ROINetBig classifier."""
+        if isinstance(classifier, ROINetBig):
+            self.features.load_state_dict(classifier.features[:-1].state_dict())
+            return True
+        return False
+
+
+def _stamp_gaussian(target: np.ndarray, gy: int, gx: int, sigma: float) -> None:
+    """Max-blend a unit Gaussian centred at ``(gy, gx)`` into ``target`` (in grid
+    cells), so overlapping cilia don't sum past 1."""
+    h, w = target.shape
+    r = max(1, int(round(3 * sigma)))
+    ys = np.arange(max(0, gy - r), min(h, gy + r + 1))
+    xs = np.arange(max(0, gx - r), min(w, gx + r + 1))
+    if ys.size == 0 or xs.size == 0:
+        return
+    yy, xx = np.meshgrid(ys, xs, indexing="ij")
+    g = np.exp(-((yy - gy) ** 2 + (xx - gx) ** 2) / (2.0 * sigma * sigma))
+    sub = target[ys[0]:ys[-1] + 1, xs[0]:xs[-1] + 1]
+    np.maximum(sub, g.astype(np.float32), out=sub)
+
+
+def reconstruct_targets(run_dir: str, image_folder: str, p: dict,
+                        log=print) -> list:
+    """Reconstruct full-image training targets from a finished run.
+
+    Reads the run's ``csv/all_cilia_features.xlsx`` (cilium coords per image) and
+    ``csv/human_validation.csv`` (keep/reject); for each image present in
+    ``image_folder`` it loads the volume (same isotropic loader as inference),
+    builds the whole-image RGB, and stamps every **kept** cilium as a Gaussian on
+    a 1/``stride`` target heatmap. Returns ``[(rgb (3,H,W), target (Hc,Wc),
+    filename, n_pos), …]``.
+    """
+    import pandas as pd
+    xls = os.path.join(run_dir, "csv", "all_cilia_features.xlsx")
+    if not os.path.exists(xls):
+        raise FileNotFoundError(f"No all_cilia_features.xlsx in {run_dir}/csv")
+    df = pd.read_excel(xls, sheet_name="all_data")
+    if "object_type" in df.columns:
+        df = df[df["object_type"] == "cilia"]
+    keep: dict[tuple[str, int], bool] = {}
+    vfile = os.path.join(run_dir, "csv", "human_validation.csv")
+    if os.path.exists(vfile):
+        v = pd.read_csv(vfile)
+        keep = {(str(r.filename), int(r.cilia_id)): bool(r.human_validated)
+                for r in v.itertuples()}
+
+    stride, sigma = int(p["stride"]), float(p["sigma"])
+    crop = float(p.get("crop_factor", 0.5))
+    samples = []
+    for fn, g in df.groupby("filename"):
+        ipath = os.path.join(image_folder, str(fn))
+        if not os.path.exists(ipath):
+            log(f"  skip {fn} — image not in folder"); continue
+        loaded = cached_load(dict(p["load"], ims_path=ipath))
+        rgb = build_fcn_input(loaded["raw"], p["ch_cilia"], p["ch_bb"], 1.0)
+        _, h, w = rgb.shape
+        ph, pw = (-h) % stride, (-w) % stride          # pad to multiple of stride
+        if ph or pw:
+            rgb = np.pad(rgb, ((0, 0), (0, ph), (0, pw)))
+        _, h, w = rgb.shape
+        hc, wc = h // stride, w // stride
+        target = np.zeros((hc, wc), dtype=np.float32)
+        coords = parse_coords_string(g["coords"])      # (n, 3) z, y, x
+        vxy = float(loaded["voxel_size"][1])           # µm per XY pixel
+        n_pos = 0
+        for (_, row), c in zip(g.iterrows(), coords):
+            if not keep.get((str(fn), int(row["cilia_id"])), True):
+                continue                               # rejected → background
+            gy = min(max(int(round(float(c[1]) / stride - 0.5)), 0), hc - 1)
+            gx = min(max(int(round(float(c[2]) / stride - 0.5)), 0), wc - 1)
+            # Footprint from the cilium's own ROI bbox (length_um → radius in
+            # grid cells), shrunk by `crop`; fall back to the fixed sigma. Clamp
+            # so a positive is always at least ~half a cell wide.
+            s = sigma
+            lum = row.get("length_um", np.nan) if hasattr(row, "get") else np.nan
+            if np.isfinite(lum) and vxy > 0:
+                r_cells = (float(lum) / 2.0 / vxy) / stride
+                s = min(sigma, max(0.4, r_cells * crop))
+            _stamp_gaussian(target, gy, gx, s)
+            n_pos += 1
+        samples.append((rgb.astype(np.float32), target, str(fn), n_pos))
+        log(f"  {fn}: {n_pos} positives · grid {hc}×{wc}")
+    return samples
+
+
+def train_fcn_detector(samples: list, *, epochs: int = 30, lr: float = 1e-3,
+                       warm: torch.nn.Module | None = None,
+                       progress=None) -> tuple[FCNDetector, list]:
+    """Train an ``FCNDetector`` on reconstructed full-image targets.
+
+    Weighted BCE on the dense heatmap (positives are sparse), Adam, horizontal/
+    vertical flip augmentation (kept consistent between image and target;
+    batch = 1 so arbitrary image sizes are fine). Returns ``(model, history)``.
+    """
+    if not samples:
+        raise ValueError("No training samples (no images matched / no positives).")
+    device = get_device()
+    model = FCNDetector().to(device)
+    if warm is not None:
+        model.warm_start_from(warm)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    tot = float(sum(t.size for _, t, _, _ in samples))
+    pos = float(sum((t > 0.5).sum() for _, t, _, _ in samples))
+    pw = torch.tensor([max(1.0, (tot - pos) / max(pos, 1.0))], device=device)
+    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pw)
+    rng = np.random.default_rng(0)
+    history = []
+    for ep in range(epochs):
+        model.train()
+        run = 0.0
+        for i in rng.permutation(len(samples)):
+            rgb, target, _, _ = samples[i]
+            xb = torch.from_numpy(rgb[None]).to(device)
+            tb = torch.from_numpy(target[None, None]).to(device)
+            if rng.random() < 0.5:
+                xb = torch.flip(xb, [3]); tb = torch.flip(tb, [3])
+            if rng.random() < 0.5:
+                xb = torch.flip(xb, [2]); tb = torch.flip(tb, [2])
+            opt.zero_grad()
+            loss = loss_fn(model(xb), tb)
+            loss.backward()
+            opt.step()
+            run += float(loss.item())
+        history.append(run / len(samples))
+        if progress:
+            progress((ep + 1) / epochs,
+                     f"epoch {ep + 1}/{epochs} · BCE {history[-1]:.4f} ({device.type})")
+    return model, history
+
+
+def detector_heatmap(model: FCNDetector, rgb: np.ndarray,
+                     device: torch.device) -> np.ndarray:
+    """Run a trained ``FCNDetector`` over a whole image → P(cilium) heatmap
+    (sigmoid of the single-channel logit map)."""
+    model = model.to(device).eval()
+    x = torch.from_numpy(rgb[None]).to(device)
+    with torch.no_grad():
+        hm = torch.sigmoid(model(x))[0, 0]
+    return hm.float().cpu().numpy()
+
+
+def save_detector(path: str, model: FCNDetector, meta: dict) -> str:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"kind": "fcn_detector", "stride": int(model.stride),
+                "state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
+                "meta": meta}, path)
+    return path
+
+
+def load_detector(path: str) -> tuple[FCNDetector, dict]:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if payload.get("kind") != "fcn_detector":
+        raise ValueError(f"{path} is not an FCN detector bundle.")
+    model = FCNDetector()
+    model.load_state_dict(payload["state_dict"])
+    model.eval()
+    return model, payload.get("meta", {})
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # App
 # ──────────────────────────────────────────────────────────────────────────────
 class LimoncelloCNNApp:
@@ -260,7 +589,13 @@ class LimoncelloCNNApp:
         self.fcn: nn.Module | None = None
         self.fcn_stride: int = 16
         self.model_size: int = DEFAULT_SIZE["big"]
+        self.detector: FCNDetector | None = None
         self._busy = False
+        # Detector training-loss plot (filled live during training).
+        self.train_fig = Figure(figsize=(4, 2.2), tight_layout=True)
+        self.train_ax = self.train_fig.add_subplot(111)
+        self.train_canvas = FigureCanvas(self.train_fig)
+        self._plot_training([])
         self.widget = self._build()
 
     # ── UI ────────────────────────────────────────────────────────────────────
@@ -285,10 +620,10 @@ class LimoncelloCNNApp:
         self.scan_btn.clicked.connect(self._scan_folder)
         self.file_combo = ComboBox(label="Image", choices=())
 
-        self.ch_cilia = SpinBox(label="Cilia channel", value=0, min=0, max=16)
+        self.ch_cilia = SpinBox(label="Cilia channel", value=1, min=0, max=16)
         self.ch_bb = SpinBox(label="Basal-body channel", value=2, min=0, max=16)
-        self.p_low = FloatSpinBox(label="Norm p-low", value=2.0, min=0, max=100)
-        self.p_high = FloatSpinBox(label="Norm p-high", value=98.0, min=0, max=100)
+        self.p_low = FloatSpinBox(label="Norm p-low", value=0.0, min=0, max=100)
+        self.p_high = FloatSpinBox(label="Norm p-high", value=100.0, min=0, max=100)
 
         self.in_scale = FloatSlider(label="Input scale ×", value=1.0,
                                     min=0.5, max=6.0, step=0.5)
@@ -296,6 +631,11 @@ class LimoncelloCNNApp:
         self.load_btn.clicked.connect(self._on_load)
         self.run_btn = PushButton(text="③ Run CNN heatmap")
         self.run_btn.clicked.connect(self._on_run_heatmap)
+        self.cam_btn = PushButton(text="③′ Run CAM heatmap (no FCN build)")
+        self.cam_btn.clicked.connect(self._on_run_cam)
+        self.sw_stride = SpinBox(label="Sliding stride (px)", value=32, min=4, max=256)
+        self.sw_btn = PushButton(text="③″ Run sliding window (no FCN, slow)")
+        self.sw_btn.clicked.connect(self._on_run_sliding)
 
         self.thr = FloatSlider(label="Peak threshold", value=0.5, min=0.0,
                                max=1.0, step=0.01)
@@ -315,8 +655,28 @@ class LimoncelloCNNApp:
         self.apoc_btn.clicked.connect(self._on_apoc)
         self.apoc_status = Label(value="—")
 
+        # ── Train a whole-image detector (no transplant) ──────────────────────
+        self.run_dir = FileEdit(label="Run output dir (csv/)", mode="d")
+        self.det_epochs = SpinBox(label="Detector epochs", value=30, min=1, max=500)
+        self.det_sigma = FloatSpinBox(label="Target σ max (cells)", value=1.5,
+                                      min=0.3, max=8.0, step=0.1)
+        self.det_crop = FloatSpinBox(label="ROI crop factor", value=0.5,
+                                     min=0.1, max=1.5, step=0.05)
+        self.det_warm = CheckBox(label="Warm-start conv from ROI model", value=True)
+        self.det_name = LineEdit(label="Save as", value="fcn_detector.pt")
+        self.train_det_btn = PushButton(text="Ⓣ Train whole-image detector")
+        self.train_det_btn.clicked.connect(self._on_train_detector)
+        self.det_pick = ComboBox(label="Detector (.pt)",
+                                 choices=self._discover_detectors())
+        self.load_det_btn = PushButton(text="Load detector")
+        self.load_det_btn.clicked.connect(self._on_load_detector)
+        self.run_det_btn = PushButton(text="③‴ Run trained detector heatmap")
+        self.run_det_btn.clicked.connect(self._on_run_detector)
+        self.det_status = Label(value="No detector trained/loaded.")
+
         self._buttons = [self.build_fcn_btn, self.load_btn, self.run_btn,
-                         self.detect_btn, self.apoc_btn]
+                         self.cam_btn, self.sw_btn, self.detect_btn, self.apoc_btn,
+                         self.train_det_btn, self.load_det_btn, self.run_det_btn]
 
         return Container(widgets=[
             Label(value="<b>Fully-convolutional cilia detector</b>"),
@@ -329,12 +689,17 @@ class LimoncelloCNNApp:
             self.ch_cilia, self.ch_bb, self.p_low, self.p_high,
             self.in_scale, self.load_btn,
             Label(value="<b>3 · Heatmap → centres</b>"),
-            self.run_btn, self.thr, self.min_dist, self.detect_btn,
-            self.detect_status,
+            self.run_btn, self.cam_btn, self.sw_stride, self.sw_btn,
+            self.thr, self.min_dist, self.detect_btn, self.detect_status,
             Label(value="<b>4 · APOC gated by CNN</b>"),
             self.classifier, self.cilia_min, self.cilia_max, self.gate_radius,
             self.apoc_btn, self.apoc_status,
-        ], labels=True, scrollable=True)
+            Label(value="<b>T · Train whole-image detector (no transplant)</b>"),
+            self.run_dir, self.det_epochs, self.det_sigma, self.det_crop,
+            self.det_warm,
+            self.det_name, self.train_det_btn,
+            self.det_pick, self.load_det_btn, self.run_det_btn, self.det_status,
+        ], labels=True, scrollable=False)   # outer QScrollArea (main) handles scroll
 
     # ── model discovery ────────────────────────────────────────────────────────
     def _discover_models(self) -> list[str]:
@@ -392,7 +757,8 @@ class LimoncelloCNNApp:
             gpu_device=self.gpu_combo.value,
             ch_cilia=self.ch_cilia.value, ch_neurites=0,
             ch_bb=self.ch_bb.value, ch_nuclei=0,
-            use_mip=False, make_isotropic=False,
+            # Match the pipeline that made the CNN's training crops (isotropic).
+            use_mip=False, make_isotropic=True,
             p_low=self.p_low.value, p_high=self.p_high.value, ch_norm={},
         )
         if self.file_combo.value and self.folder.value:
@@ -414,7 +780,7 @@ class LimoncelloCNNApp:
         @thread_worker
         def _work():
             _select_device(p["gpu_device"])
-            return step_load(self.state, p)
+            return cached_load(p)
 
         def _done(updates):
             self.state.update(updates)
@@ -468,6 +834,7 @@ class LimoncelloCNNApp:
             heatmap, in_hw = res
             self.state["heatmap"] = heatmap
             self.state["fcn_in_scale"] = scale
+            self.state["peak_offset"] = self.fcn_stride / 2.0   # 'same'-conv grid
             self._show_heatmap(heatmap, in_hw)
             self._set_busy(False)
             show_info(f"Heatmap {heatmap.shape} · max P={heatmap.max():.2f}")
@@ -475,6 +842,101 @@ class LimoncelloCNNApp:
         def _err(e):
             self._set_busy(False)
             show_warning(f"Heatmap failed: {e}")
+
+        w = _work(); w.returned.connect(_done); w.errored.connect(_err); w.start()
+
+    def _on_run_cam(self):
+        """CAM heatmap straight off the trained classifier — no FCN build needed.
+        Loads the selected .pt, runs its conv stack, applies the head weights as
+        1×1 convs (see ``cam_heatmap``). Same downstream detect/APOC steps."""
+        if self._busy:
+            return
+        if "raw" not in self.state:
+            show_warning("Load an image first (step ②).")
+            return
+        name = self.model_combo.value
+        if not name:
+            show_warning("Pick a trained .pt model first.")
+            return
+        self._set_busy(True)
+        show_info("Running CAM heatmap (no FCN build) …")
+        scale = float(self.in_scale.value)
+        rgb = build_fcn_input(self.state["raw"], self.ch_cilia.value,
+                              self.ch_bb.value, scale)
+        path = os.path.join(_MODELS_DIR, str(name))
+
+        @thread_worker
+        def _work():
+            _select_device(self.gpu_combo.value)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model, meta = load_bundle(path)
+            stride = model_stride(model)
+            size = int(meta.get("size", DEFAULT_SIZE.get(meta.get("arch", "big"), 64)))
+            return cam_heatmap(model, rgb, device), rgb.shape[1:], stride, size
+
+        def _done(res):
+            heatmap, in_hw, stride, size = res
+            self.fcn_stride, self.model_size = stride, size
+            self.state["heatmap"] = heatmap
+            self.state["fcn_in_scale"] = scale
+            self.state["peak_offset"] = stride / 2.0            # 'same'-conv grid
+            self._show_heatmap(heatmap, in_hw)
+            self._set_busy(False)
+            show_info(f"CAM heatmap {heatmap.shape} · max P={heatmap.max():.2f} "
+                      f"(stride {stride}).")
+
+        def _err(e):
+            self._set_busy(False)
+            show_warning(f"CAM failed: {e}")
+
+        w = _work(); w.returned.connect(_done); w.errored.connect(_err); w.start()
+
+    def _on_run_sliding(self):
+        """Brute-force sliding-window detector — slide the original classifier at
+        the chosen stride. No FCN/CAM, no architecture change; slow but simple.
+        Feeds the same detect/APOC steps via the same peak geometry."""
+        if self._busy:
+            return
+        if "raw" not in self.state:
+            show_warning("Load an image first (step ②).")
+            return
+        name = self.model_combo.value
+        if not name:
+            show_warning("Pick a trained .pt model first.")
+            return
+        self._set_busy(True)
+        stride = int(self.sw_stride.value)
+        show_info(f"Sliding window (stride {stride}px) — this is the slow path …")
+        scale = float(self.in_scale.value)
+        rgb = build_fcn_input(self.state["raw"], self.ch_cilia.value,
+                              self.ch_bb.value, scale)
+        path = os.path.join(_MODELS_DIR, str(name))
+
+        @thread_worker
+        def _work():
+            _select_device(self.gpu_combo.value)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model, meta = load_bundle(path)
+            size = int(meta.get("size", DEFAULT_SIZE.get(meta.get("arch", "big"), 64)))
+            hm = sliding_window_heatmap(model, rgb, size, stride, device)
+            return hm, rgb.shape[1:], stride, size
+
+        def _done(res):
+            heatmap, in_hw, sd, size = res
+            # Sliding-window geometry: grid spacing == window stride.
+            self.fcn_stride, self.model_size = sd, size
+            self.state["heatmap"] = heatmap
+            self.state["fcn_in_scale"] = scale
+            # Window top-left at r*stride → centre at size/2.
+            self.state["peak_offset"] = size / 2.0
+            self._show_heatmap(heatmap, in_hw)
+            self._set_busy(False)
+            show_info(f"Sliding-window heatmap {heatmap.shape} · "
+                      f"max P={heatmap.max():.2f} (stride {sd}px).")
+
+        def _err(e):
+            self._set_busy(False)
+            show_warning(f"Sliding window failed: {e}")
 
         w = _work(); w.returned.connect(_done); w.errored.connect(_err); w.start()
 
@@ -506,9 +968,11 @@ class LimoncelloCNNApp:
             return
         rc, scores = peak_find(self.state["heatmap"], float(self.thr.value),
                                int(self.min_dist.value))
+        # Offset depends on which detector produced the heatmap (FCN/CAM →
+        # stride/2; sliding window → size/2); set when the heatmap was computed.
+        offset = float(self.state.get("peak_offset", self.fcn_stride / 2.0))
         yx = heatmap_peaks_to_image_xy(
-            rc, self.fcn_stride, float(self.state.get("fcn_in_scale", 1.0)),
-            self.model_size)
+            rc, self.fcn_stride, float(self.state.get("fcn_in_scale", 1.0)), offset)
         self.state["centres_yx"] = yx
         self._show_centres(yx, scores)
         self.detect_status.value = f"{len(yx)} ROI centres ≥ {self.thr.value:.2f}"
@@ -572,12 +1036,165 @@ class LimoncelloCNNApp:
 
         w = _work(); w.returned.connect(_done); w.errored.connect(_err); w.start()
 
+    # ── train / load / run whole-image detector ──────────────────────────────
+    def _plot_training(self, history: list) -> None:
+        """Draw the detector's per-epoch BCE loss curve in the bottom dock."""
+        self.train_ax.clear()
+        if history:
+            self.train_ax.plot(range(1, len(history) + 1), history, "-o",
+                               color="#0C5DA5", ms=3, lw=1.4)
+            self.train_ax.set_title(f"Detector training — final BCE "
+                                    f"{history[-1]:.4f}", fontsize=9)
+        else:
+            self.train_ax.set_title("Detector training (no run yet)", fontsize=9)
+        self.train_ax.set_xlabel("epoch", fontsize=8)
+        self.train_ax.set_ylabel("BCE loss", fontsize=8)
+        self.train_ax.tick_params(labelsize=7)
+        self.train_canvas.draw_idle()
+
+    def _discover_detectors(self) -> list[str]:
+        """``.pt`` files in models/ that are FCN-detector bundles."""
+        out = []
+        if os.path.isdir(_MODELS_DIR):
+            for f in sorted(os.listdir(_MODELS_DIR)):
+                if not f.endswith(".pt"):
+                    continue
+                try:
+                    pl = torch.load(os.path.join(_MODELS_DIR, f),
+                                    map_location="cpu", weights_only=False)
+                    if isinstance(pl, dict) and pl.get("kind") == "fcn_detector":
+                        out.append(f)
+                except Exception:                             # noqa: BLE001
+                    pass
+        return out
+
+    def _on_train_detector(self):
+        if self._busy:
+            return
+        run_dir = str(self.run_dir.value or "")
+        folder = str(self.folder.value or "")
+        if not os.path.isdir(run_dir):
+            show_warning("Pick the run output dir (the lc-analysis-* folder with csv/).")
+            return
+        if not os.path.isdir(folder):
+            show_warning("Set the Image folder (originals) the run was computed from.")
+            return
+        self._set_busy(True)
+        show_info("Reconstructing targets + training detector — see console …")
+        load_base = {k: v for k, v in self._params().items() if k != "ims_path"}
+        ptrain = dict(stride=16, sigma=float(self.det_sigma.value),
+                      crop_factor=float(self.det_crop.value),
+                      ch_cilia=self.ch_cilia.value, ch_bb=self.ch_bb.value,
+                      load=load_base)
+        epochs = int(self.det_epochs.value)
+        warm_name = str(self.model_combo.value) if self.det_warm.value else ""
+        save_name = str(self.det_name.value or "fcn_detector.pt")
+        if not save_name.endswith(".pt"):
+            save_name += ".pt"
+
+        @thread_worker
+        def _work():
+            _select_device(self.gpu_combo.value)
+            print(f"[detector] reconstructing targets from {run_dir} …")
+            samples = reconstruct_targets(run_dir, folder, ptrain)
+            n_pos = sum(s[3] for s in samples)
+            print(f"[detector] {len(samples)} images · {n_pos} positives total")
+            warm = None
+            if warm_name.endswith(".pt"):
+                warm, _ = load_bundle(os.path.join(_MODELS_DIR, warm_name))
+            model, hist = train_fcn_detector(
+                samples, epochs=epochs, warm=warm,
+                progress=lambda f, m: print(f"[detector] {m}"))
+            out = save_detector(os.path.join(_MODELS_DIR, save_name), model,
+                                {"run_dir": run_dir, "epochs": epochs,
+                                 "sigma": ptrain["sigma"], "n_images": len(samples),
+                                 "n_positives": int(n_pos), "final_loss": hist[-1],
+                                 "history": hist})
+            return model, out, len(samples), int(n_pos), hist
+
+        def _done(res):
+            model, out, n_img, n_pos, hist = res
+            self.detector = model
+            self.fcn_stride, self.model_size = model.stride, 96
+            self.det_pick.choices = self._discover_detectors()
+            self.det_pick.value = os.path.basename(out)
+            self._plot_training(hist)
+            self.det_status.value = (f"Trained on {n_img} imgs / {n_pos} cilia · "
+                                     f"BCE {hist[-1]:.4f} · saved {os.path.basename(out)}")
+            self._set_busy(False)
+            show_info(f"Detector trained ({n_img} images, {n_pos} cilia). Saved {out}.")
+
+        def _err(e):
+            self._set_busy(False); show_warning(f"Detector training failed: {e}")
+
+        w = _work(); w.returned.connect(_done); w.errored.connect(_err); w.start()
+
+    def _on_load_detector(self):
+        name = self.det_pick.value
+        if not name:
+            show_warning("No detector .pt to load (train one first).")
+            return
+        try:
+            self.detector, meta = load_detector(os.path.join(_MODELS_DIR, str(name)))
+            self.fcn_stride, self.model_size = self.detector.stride, 96
+        except Exception as exc:                              # noqa: BLE001
+            show_warning(f"Load failed: {exc}")
+            return
+        if meta.get("history"):                               # show its loss curve
+            self._plot_training(meta["history"])
+        self.det_status.value = f"Loaded {name} · {meta.get('n_images', '?')} imgs"
+        show_info(f"Detector {name} loaded.")
+
+    def _on_run_detector(self):
+        if self._busy:
+            return
+        if self.detector is None:
+            show_warning("Train or load a detector first.")
+            return
+        if "raw" not in self.state:
+            show_warning("Load an image first (step ②).")
+            return
+        self._set_busy(True)
+        show_info("Running trained detector heatmap …")
+        scale = float(self.in_scale.value)
+        rgb = build_fcn_input(self.state["raw"], self.ch_cilia.value,
+                              self.ch_bb.value, scale)
+
+        @thread_worker
+        def _work():
+            _select_device(self.gpu_combo.value)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            return detector_heatmap(self.detector, rgb, device), rgb.shape[1:]
+
+        def _done(res):
+            heatmap, in_hw = res
+            self.fcn_stride, self.model_size = self.detector.stride, 96
+            self.state["heatmap"] = heatmap
+            self.state["fcn_in_scale"] = scale
+            self.state["peak_offset"] = self.detector.stride / 2.0   # 'same'-conv grid
+            self._show_heatmap(heatmap, in_hw)
+            self._set_busy(False)
+            show_info(f"Detector heatmap {heatmap.shape} · max P={heatmap.max():.2f}")
+
+        def _err(e):
+            self._set_busy(False); show_warning(f"Detector run failed: {e}")
+
+        w = _work(); w.returned.connect(_done); w.errored.connect(_err); w.start()
+
 
 def main():
+    from qtpy.QtWidgets import QScrollArea
     viewer = napari.Viewer(title="LimonCELLo — Fast CNN cilia detector")
     app = LimoncelloCNNApp(viewer)
-    viewer.window.add_dock_widget(app.widget, area="right",
-                                  name="Fast CNN detector")
+    # Wrap the panel in a real QScrollArea — magicgui's own ``scrollable`` often
+    # doesn't take when docked, so the long control list gets clipped otherwise.
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setWidget(app.widget.native)
+    viewer.window.add_dock_widget(scroll, area="right", name="Fast CNN detector")
+    # Detector training-loss plot in its own bottom dock.
+    viewer.window.add_dock_widget(app.train_canvas, area="bottom",
+                                  name="Detector training")
     napari.run()
 
 
