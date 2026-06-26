@@ -874,6 +874,8 @@ def run_roi_only_batch(
     save_roi_crops: bool = True,
     expected_xy_um: float | None = None,
     xy_tol: float = 0.03,
+    roi_sample_frac: float = 1.0,
+    sample_seed: int = 0,
     progress_callback=None,
 ):
     """Fast ROI export for labeling — *no* full analysis.
@@ -887,11 +889,16 @@ def run_roi_only_batch(
     Writes ``csv/all_cilia_features.xlsx`` with a minimal ``all_data`` sheet
     (filename, file_short, object_type, cilia_id, coords + 3-D shape props) — the
     columns the ROI labeler and screening tab need. Returns the workbook path.
+
+    ``roi_sample_frac`` < 1 exports only a random fraction of the detected cilia
+    (≈ that % of the whole dataset, reproducible via ``sample_seed``) — handy for
+    building a smaller ROI set to label / train the CNN on.
     """
     from ..visualization.cilia_rois import save_cilia_rois
 
     if gpu_device:
         cle.select_device(gpu_device)
+    rng = np.random.default_rng(sample_seed)
     os.makedirs(output_path, exist_ok=True)
     csv_dir = os.path.join(output_path, "csv")
     os.makedirs(csv_dir, exist_ok=True)
@@ -987,6 +994,15 @@ def run_roi_only_batch(
             "cilia_id": [int(i) for i in ids],
             "coords": [[float(c[0]), float(c[1]), float(c[2])] for c in cents],
         })
+        # Optionally export only a random fraction of this image's cilia.
+        if roi_sample_frac < 1.0 and len(df):
+            keep = rng.random(len(df)) < roi_sample_frac
+            df = df[keep].reset_index(drop=True)
+            if df.empty:
+                print(f"  (sampled 0/{len(keep)} cilia at {roi_sample_frac:.0%})")
+                _flush_gpu()
+                continue
+            print(f"  sampled {len(df)}/{len(keep)} cilia at {roi_sample_frac:.0%}")
         # 3-D shape descriptors (volume, length, …) for the labeler's stat line.
         cprops = cilia_shape_props(cilia_labels, voxel_size)
         for col in SHAPE_COLS:
