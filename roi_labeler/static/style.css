@@ -1,0 +1,117 @@
+/* CILIA QUEST — retro arcade PWA. Neon green = cilium, magenta = junk/BB. */
+@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+
+:root{
+  --bg:#0b0221; --bg2:#160a3a;
+  --green:#39ff14; --magenta:#ff2bd6; --cyan:#00eaff;
+  --yellow:#ffe600; --dim:#7a6cc4; --ink:#e9e6ff;
+  --font:'Press Start 2P', ui-monospace, 'Courier New', monospace;
+}
+*{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%}
+body{
+  font-family:var(--font); color:var(--ink);
+  background:radial-gradient(120% 120% at 50% 0%, var(--bg2), var(--bg) 70%);
+  overflow:hidden; user-select:none; -webkit-user-select:none;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+
+/* CRT scanlines + vignette */
+.crt{position:fixed; inset:0; pointer-events:none; z-index:50;
+  background:repeating-linear-gradient(0deg, rgba(0,0,0,.18) 0 1px, transparent 1px 3px);
+  mix-blend-mode:multiply;}
+.crt::after{content:""; position:fixed; inset:0;
+  box-shadow:inset 0 0 140px rgba(0,0,0,.7); pointer-events:none;}
+
+.screen{position:fixed; inset:0; display:none; flex-direction:column;
+  align-items:center; justify-content:center; gap:18px; padding:22px; text-align:center;}
+.screen.show{display:flex}
+
+/* ── Logo ── */
+.logo{margin-bottom:8px}
+.logo-cilia{font-size:30px; letter-spacing:4px; color:var(--green);
+  text-shadow:0 0 8px var(--green), 0 0 20px rgba(57,255,20,.5); animation:hue 6s linear infinite}
+.logo-quest{font-size:22px; color:var(--magenta); margin-top:10px;
+  text-shadow:0 0 8px var(--magenta), 0 0 20px rgba(255,43,214,.5)}
+.blink{margin-top:16px; font-size:9px; color:var(--yellow); animation:blink 1s steps(2) infinite}
+@keyframes blink{50%{opacity:0}}
+@keyframes hue{to{filter:hue-rotate(360deg)}}
+
+.lbl{font-size:9px; color:var(--cyan); letter-spacing:2px}
+.hint{font-size:8px; color:var(--dim); line-height:1.7; max-width:300px}
+
+.retro-select{font-family:var(--font); font-size:11px; color:var(--ink);
+  background:#1a0d44; border:3px solid var(--cyan); border-radius:6px;
+  padding:12px; width:min(86vw,340px); text-align:center; outline:none;
+  box-shadow:0 0 0 2px #000, 0 0 14px rgba(0,234,255,.4)}
+
+/* ── Buttons ── */
+.btn{font-family:var(--font); cursor:pointer; border:none; color:#0b0221;
+  padding:16px 18px; font-size:13px; border-radius:8px; letter-spacing:1px;
+  box-shadow:0 5px 0 rgba(0,0,0,.5); transition:transform .05s, box-shadow .05s}
+.btn:active{transform:translateY(4px); box-shadow:0 1px 0 rgba(0,0,0,.5)}
+.btn-start{background:var(--yellow); width:min(86vw,340px);
+  box-shadow:0 5px 0 #8a7d00, 0 0 18px rgba(255,230,0,.5)}
+.btn-keep{background:var(--green); flex:1; box-shadow:0 5px 0 #1c8b08, 0 0 16px rgba(57,255,20,.5)}
+.btn-reject{background:var(--magenta); flex:1; color:#fff; box-shadow:0 5px 0 #9c1185, 0 0 16px rgba(255,43,214,.5)}
+.btn-link{background:none; border:none; color:var(--cyan); font-family:var(--font);
+  font-size:9px; cursor:pointer; margin-top:6px; letter-spacing:1px}
+
+/* ── HUD ── */
+.hud{position:fixed; top:0; left:0; right:0; display:flex; justify-content:space-between;
+  padding:12px 14px; gap:8px; background:linear-gradient(#160a3a, transparent); z-index:5}
+.hud-k{font-size:7px; color:var(--dim)}
+.hud-v{font-size:13px; margin-top:5px}
+.hud-left .hud-v{color:var(--cyan); font-size:10px}
+.hud-mid{text-align:center} .hud-mid .hud-v{color:var(--yellow)}
+.hud-right{text-align:right} .hud-right .hud-v{color:var(--magenta)}
+
+.progress{position:fixed; top:58px; left:14px; right:14px; height:10px;
+  background:#1a0d44; border:2px solid #2c1a6b; border-radius:6px; overflow:hidden; z-index:5}
+.progress-bar{height:100%; width:0; background:linear-gradient(90deg,var(--green),var(--cyan));
+  box-shadow:0 0 10px var(--green); transition:width .25s}
+.prog-text{position:fixed; top:72px; left:0; right:0; text-align:center; font-size:7px; color:var(--dim); z-index:5}
+
+/* ── Card ── */
+#game{justify-content:flex-start; padding-top:92px; gap:14px}
+.card{position:relative; width:min(86vw,420px); aspect-ratio:1/1;
+  border:4px solid var(--cyan); border-radius:14px; overflow:hidden;
+  background:#05010f; box-shadow:0 0 0 3px #000, 0 0 28px rgba(0,234,255,.35);
+  touch-action:none}
+.card.swipe-keep{border-color:var(--green); box-shadow:0 0 28px var(--green)}
+.card.swipe-reject{border-color:var(--magenta); box-shadow:0 0 28px var(--magenta)}
+.roi{width:100%; height:100%; object-fit:contain; image-rendering:pixelated;
+  display:block; background:#05010f; transition:transform .03s}
+.scan{position:absolute; left:0; right:0; height:36%; top:-40%;
+  background:linear-gradient(transparent, rgba(0,234,255,.18), transparent);
+  animation:scanmove 2.4s linear infinite; pointer-events:none}
+@keyframes scanmove{to{top:120%}}
+.card-meta{position:absolute; bottom:0; left:0; right:0; font-size:7px; color:var(--dim);
+  background:rgba(5,1,15,.7); padding:5px}
+.stamp{position:absolute; top:16px; left:50%; transform:translateX(-50%) rotate(-12deg) scale(0);
+  font-size:30px; padding:6px 14px; border:5px solid; border-radius:10px; opacity:0; pointer-events:none}
+.stamp.show{animation:stamp .5s ease-out}
+.stamp.keep{color:var(--green); border-color:var(--green); text-shadow:0 0 10px var(--green)}
+.stamp.reject{color:var(--magenta); border-color:var(--magenta); text-shadow:0 0 10px var(--magenta)}
+@keyframes stamp{0%{opacity:0; transform:translateX(-50%) rotate(-12deg) scale(2)}
+  30%{opacity:1; transform:translateX(-50%) rotate(-12deg) scale(1)}
+  100%{opacity:0; transform:translateX(-50%) rotate(-12deg) scale(1)}}
+
+.controls{display:flex; gap:12px; width:min(86vw,420px)}
+.swipe-hint{font-size:7px; color:var(--dim); letter-spacing:1px}
+
+/* ── Leaderboard / done ── */
+.board-list{list-style:none; padding:0; margin:8px 0; width:min(86vw,420px)}
+.board-list li{display:flex; justify-content:space-between; font-size:11px;
+  padding:11px 12px; margin:6px 0; border:2px solid #2c1a6b; border-radius:6px; background:#130a36}
+.board-list li.me{border-color:var(--yellow); color:var(--yellow)}
+.board-list .rk{color:var(--cyan)}
+.done-stats{font-size:11px; color:var(--green); line-height:2}
+
+/* ── Toast ── */
+.toast{position:fixed; left:50%; bottom:24px; transform:translateX(-50%) translateY(40px);
+  background:#1a0d44; border:2px solid var(--yellow); color:var(--yellow);
+  font-size:9px; padding:10px 14px; border-radius:6px; opacity:0; transition:.2s; z-index:30}
+.toast.show{opacity:1; transform:translateX(-50%) translateY(0)}
+
+@media (min-height:760px){ .logo-cilia{font-size:38px} }

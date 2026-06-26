@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+<meta name="theme-color" content="#0b0221" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<title>CILIA QUEST</title>
+<link rel="manifest" href="/manifest.webmanifest" />
+<link rel="apple-touch-icon" href="/icon-192.png" />
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div class="crt"></div>
+
+<!-- ── LOGIN / SELECT PLAYER ── -->
+<section id="login" class="screen show">
+  <div class="logo">
+    <div class="logo-cilia">C I L I A</div>
+    <div class="logo-quest">QUEST</div>
+    <div class="blink">★ INSERT  SCIENTIST ★</div>
+  </div>
+  <label class="lbl">SELECT PLAYER</label>
+  <select id="player" class="retro-select"></select>
+  <button id="startBtn" class="btn btn-start">PRESS START</button>
+  <div class="hint">label real cilia vs junk · share the work<br>🍦 top labeller wins an ice cream</div>
+</section>
+
+<!-- ── GAME ── -->
+<section id="game" class="screen">
+  <header class="hud">
+    <div class="hud-left">
+      <div class="hud-k">PLAYER</div><div id="hudPlayer" class="hud-v">—</div>
+    </div>
+    <div class="hud-mid">
+      <div class="hud-k">SCORE</div><div id="hudScore" class="hud-v">0</div>
+    </div>
+    <div class="hud-right">
+      <div class="hud-k">COMBO</div><div id="hudCombo" class="hud-v">x1</div>
+    </div>
+  </header>
+
+  <div class="progress"><div id="progBar" class="progress-bar"></div></div>
+  <div id="progText" class="prog-text">0 / 0</div>
+
+  <div id="card" class="card">
+    <div class="scan"></div>
+    <img id="roi" class="roi" alt="cilium ROI" />
+    <div id="stamp" class="stamp"></div>
+    <div class="card-meta"><span id="metaId">—</span></div>
+  </div>
+
+  <div class="controls">
+    <button id="rejectBtn" class="btn btn-reject">✘ JUNK</button>
+    <button id="keepBtn" class="btn btn-keep">✓ CILIUM</button>
+  </div>
+  <div class="swipe-hint">swipe ← junk  ·  keep → swipe · or use ← →</div>
+  <button id="boardBtn" class="btn-link">HIGH SCORES ▸</button>
+</section>
+
+<!-- ── DONE ── -->
+<section id="done" class="screen">
+  <div class="logo-quest">ALL CLEAR!</div>
+  <div class="blink">you labelled every ROI ★</div>
+  <div id="doneStats" class="done-stats"></div>
+  <button id="boardBtn2" class="btn btn-start">HIGH SCORES</button>
+</section>
+
+<!-- ── LEADERBOARD ── -->
+<section id="board" class="screen">
+  <div class="logo-quest">HIGH SCORES</div>
+  <div class="blink">🍦 #1 WINS THE ICE CREAM</div>
+  <ol id="boardList" class="board-list"></ol>
+  <button id="backBtn" class="btn btn-start">◂ BACK</button>
+</section>
+
+<div id="toast" class="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>
