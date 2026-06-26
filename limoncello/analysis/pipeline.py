@@ -84,6 +84,7 @@ def run_pipeline3(
     save_rois: bool = True,
     save_roi_crops: bool = True,
     roi_margin: int = 22,
+    roi_correct_display: bool = True,
     require_basal_body: bool = True,
     ratio_from_basal_body: bool = True,
     batch_ai_model: str | None = None,
@@ -190,20 +191,32 @@ def run_pipeline3(
     all_dfs = []
     nuclei_rows = []                      # per-file nuclei volume / count summary
 
-    all_files = sorted(f for f in os.listdir(input_path) if f.endswith(".ims"))
-    n_files = len(all_files)
+    # Input may be a folder of .ims, or a .txt manifest with one .ims path per
+    # line (blank lines / '#' comments ignored) — lets you process a hand-picked
+    # set scattered across folders without copying. ``file`` stays the basename so
+    # the per-object table, ROI names and human_validation keep their usual form.
+    if str(input_path).lower().endswith(".txt"):
+        with open(input_path, encoding="utf-8") as _fh:
+            _paths = [ln.strip() for ln in _fh
+                      if ln.strip() and not ln.lstrip().startswith("#")]
+        file_list = [(os.path.basename(p), p) for p in _paths]
+    else:
+        file_list = [(f, os.path.join(input_path, f))
+                     for f in sorted(os.listdir(input_path)) if f.endswith(".ims")]
+    all_files = [name for name, _ in file_list]
+    n_files = len(file_list)
     print(f"  Input      : {input_path}")
     print(f"  Files      : {n_files} .ims file(s)")
     print("─" * 60)
 
-    for file_idx, file in enumerate(all_files):
+    for file_idx, (file, file_path) in enumerate(file_list):
         if progress_callback is not None:
             progress_callback(file_idx, n_files, file)
         print(f"[{file_idx + 1}/{n_files}] {file}")
 
         # Load data
         try:
-            a, meta = load_image(os.path.join(input_path, file))
+            a, meta = load_image(file_path)
         except Exception as exc:
             print(f"  ✗ Could not open {file}: {exc} — skipping.")
             continue
@@ -496,6 +509,7 @@ def run_pipeline3(
                     tuple(float(v) for v in voxel_size), _roi_dir,
                     os.path.splitext(file)[0], margin=roi_margin,
                     save_crops=save_roi_crops,
+                    correct_display=roi_correct_display,
                 )
                 print(f"  📸 exported {_n_roi}/{len(df_cilia)} cilia ROIs → {_roi_dir}")
             except Exception as _exc:                         # never abort the batch
@@ -692,6 +706,44 @@ def run_pipeline3(
                 _nk = sum(1 for r in _hv if r["human_validated"])
                 print(f"  🤖 AI-validated {_nk}/{len(_hv)} cilia "
                       f"(score ≥ {batch_ai_threshold}) → csv/human_validation.csv")
+
+                # Bake a per-sample overview with green/red rings on the cilia MIP.
+                from limoncello.visualization.ring_overlay import (
+                    mip_rgb, ring_overlay_figure)
+                _dec = {(r["filename"], int(r["cilia_id"])):
+                        (bool(r["human_validated"]), float(r["ai_score"]))
+                        for r in _hv}
+                _ai_ov_dir = os.path.join(output_path, "figures", "overlays")
+                os.makedirs(_ai_ov_dir, exist_ok=True)
+                _mip_dir = os.path.join(output_path, "figures", "mips")
+
+                def _load_mip(stem, tag):
+                    _p = os.path.join(_mip_dir, f"{stem}_{tag}_mip.npy")
+                    return np.load(_p) if os.path.exists(_p) else None
+
+                for _fn, _grp in final_cilia_df.groupby("filename"):
+                    _stem = os.path.splitext(str(_fn))[0]
+                    _bg = mip_rgb(cilia=_load_mip(_stem, "cilia"),
+                                  neurite=_load_mip(_stem, "neurite"),
+                                  nuclei=_load_mip(_stem, "nuclei"),
+                                  bb=_load_mip(_stem, "bb"))
+                    if _bg is None:
+                        continue
+                    _yx, _keep, _scr, _ids = [], [], [], []
+                    for _, _row in _grp.iterrows():
+                        _c = _row["coords"]                    # [z, y, x]
+                        _k = _dec.get((str(_fn), int(_row["cilia_id"])))
+                        _yx.append((float(_c[1]), float(_c[2])))
+                        _keep.append(_k[0] if _k else None)
+                        _scr.append(_k[1] if _k else None)
+                        _ids.append(int(_row["cilia_id"]))
+                    _fig = ring_overlay_figure(
+                        _bg, _yx, _keep, _scr, ids=_ids,
+                        title=f"{_stem} — AI validation")
+                    _fig.savefig(os.path.join(_ai_ov_dir,
+                                              f"{_stem}_ai_validation.png"),
+                                 dpi=150, bbox_inches="tight")
+                    plt.close(_fig)
         except Exception as _exc:                              # never abort the run
             print(f"  ⚠ batch AI validation failed: {_exc}")
 
@@ -773,3 +825,199 @@ def run_pipeline3(
     print("═" * 60)
     print("  ✓ Pipeline complete")
     print("═" * 60)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ROI-ONLY fast batch — just enough to export labelable cilia ROIs
+# ──────────────────────────────────────────────────────────────────────────────
+def _enumerate_inputs(input_path):
+    """``[(basename, full_path), …]`` from a folder of .ims or a .txt manifest
+    (one .ims path per line; blank / '#' comment lines ignored)."""
+    if str(input_path).lower().endswith(".txt"):
+        with open(input_path, encoding="utf-8") as fh:
+            paths = [ln.strip() for ln in fh
+                     if ln.strip() and not ln.lstrip().startswith("#")]
+        return [(os.path.basename(p), p) for p in paths]
+    return [(f, os.path.join(input_path, f))
+            for f in sorted(os.listdir(input_path)) if f.endswith(".ims")]
+
+
+def run_roi_only_batch(
+    input_path,
+    output_path,
+    *,
+    gpu_device=None,
+    cilia_classifier_path,
+    cilia_channel: int = 0,
+    neurites_channel: int = 1,
+    basal_bodies_channel: int = 2,
+    nuclei_channel: int = 3,
+    use_mip: bool = False,
+    make_isotropic: bool = True,
+    p_low: int = 2,
+    p_high: int = 98,
+    per_channel_norm: dict | None = None,
+    cilia_log: bool = False,
+    cilia_gaussian_sigma: tuple = (0.0, 0.0, 0.0),
+    cilia_min_size: int = 20,
+    cilia_max_size: int = 0,
+    bb_method: str = "Voronoi-Otsu",
+    bb_classifier_path: str | None = None,
+    bb_spot_sigma: float = 2.0,
+    bb_outline_sigma: float = 2.0,
+    bb_log: bool = False,
+    bb_gaussian_sigma: tuple = (1.0, 1.0, 0.0),
+    bb_min_size: int = 5,
+    bb_max_size: int = 0,
+    roi_margin: int = 22,
+    roi_correct_display: bool = True,
+    save_roi_crops: bool = True,
+    expected_xy_um: float | None = None,
+    xy_tol: float = 0.03,
+    progress_callback=None,
+):
+    """Fast ROI export for labeling — *no* full analysis.
+
+    Per image: load → (norm) → (MIP / isotropic) → segment cilia + basal bodies →
+    export every cilium's ROI thumbnail (+ raw .npz crop). Skips
+    neurites / nuclei / distances / classification / overlays. **Keeps all
+    detected cilia** (no basal-body filtering) so junk detections are included for
+    human screening.
+
+    Writes ``csv/all_cilia_features.xlsx`` with a minimal ``all_data`` sheet
+    (filename, file_short, object_type, cilia_id, coords + 3-D shape props) — the
+    columns the ROI labeler and screening tab need. Returns the workbook path.
+    """
+    from ..visualization.cilia_rois import save_cilia_rois
+
+    if gpu_device:
+        cle.select_device(gpu_device)
+    os.makedirs(output_path, exist_ok=True)
+    csv_dir = os.path.join(output_path, "csv")
+    os.makedirs(csv_dir, exist_ok=True)
+    roi_dir = os.path.join(output_path, "figures", "cilia_rois")
+
+    file_list = _enumerate_inputs(input_path)
+    n_files = len(file_list)
+    print("═" * 60)
+    print("  LimonCELLo ROI-only batch")
+    print(f"  Input   : {input_path}")
+    print(f"  Files   : {n_files} .ims file(s)")
+    print("═" * 60)
+
+    all_dfs = []
+    for file_idx, (file, file_path) in enumerate(file_list):
+        if progress_callback is not None:
+            progress_callback(file_idx, n_files, file)
+        print(f"[{file_idx + 1}/{n_files}] {file}")
+        try:
+            a, meta = load_image(file_path)
+        except Exception as exc:                              # noqa: BLE001
+            print(f"  ✗ Could not open {file}: {exc} — skipping.")
+            continue
+        voxel_size = meta["voxel_size"]
+
+        # Skip images at a different acquisition scale than the classifier was
+        # trained on (e.g. 0.305 µm/px vs the 0.152 µm/px 40× set) — APOC does not
+        # transfer across pixel sizes, so they'd just produce garbage.
+        if expected_xy_um and abs(float(voxel_size[1]) - float(expected_xy_um)) > xy_tol:
+            print(f"  ⤼ skip {file}: XY {voxel_size[1]:.3f} µm/px ≠ classifier "
+                  f"scale {expected_xy_um:.3f} (±{xy_tol})")
+            continue
+
+        if per_channel_norm:
+            a_norm = {}
+            for c in range(a.shape[1]):
+                _lo, _hi = per_channel_norm.get(c, (p_low, p_high))
+                a_norm[0, c] = percentile_minmax_normalize(a[0, c], p_low=_lo, p_high=_hi)
+        else:
+            a_norm = normalize_intensity(a, p_low=p_low, p_high=p_high)
+
+        if use_mip:
+            n_ch = a.shape[1]
+
+            def _z_project(vol3d):
+                proj = np.asarray(cle.maximum_z_projection(cle.push(vol3d)))
+                return proj[np.newaxis] if proj.ndim == 2 else proj
+
+            a = np.stack([_z_project(a[0, ch]) for ch in range(n_ch)],
+                         axis=0)[np.newaxis]
+        elif make_isotropic and voxel_size and not all(
+                abs(v - max(voxel_size)) < 1e-6 for v in voxel_size):
+            iso = max(voxel_size)
+            print(f"  Anisotropic voxels {tuple(round(v, 3) for v in voxel_size)} — "
+                  f"resampling to isotropic {iso:.3f} µm")
+            n_ch = a.shape[1]
+            a = np.stack(
+                [resample_isotropic(np.asarray(a[0, ch]), voxel_size, iso)[0]
+                 for ch in range(n_ch)], axis=0)[np.newaxis]
+            voxel_size = (iso, iso, iso)
+
+        # ── Segment cilia + basal bodies (raw channels, like the full pipeline) ──
+        cilia_labels = np.asarray(segment_cilia_ml(
+            a[0, cilia_channel], classifier_path=cilia_classifier_path,
+            gaussian_sigma=cilia_gaussian_sigma, log_transform=cilia_log,
+            min_size=cilia_min_size, max_size=cilia_max_size)).astype(np.int32)
+
+        if bb_method == "APOC classifier":
+            bb_labels = np.asarray(segment_basal_bodies_ml(
+                a[0, basal_bodies_channel], classifier_path=bb_classifier_path,
+                gaussian_sigma=bb_gaussian_sigma, log_transform=bb_log,
+                min_size=bb_min_size, max_size=bb_max_size)).astype(np.int32)
+        else:
+            bb_labels = np.asarray(segment_basal_bodies(
+                a[0, basal_bodies_channel], spot_sigma=bb_spot_sigma,
+                outline_sigma=bb_outline_sigma, gaussian_sigma=bb_gaussian_sigma,
+                log_transform=bb_log, min_size=bb_min_size,
+                max_size=bb_max_size)).astype(np.int32)
+
+        ids = np.unique(cilia_labels)
+        ids = ids[ids != 0]
+        if ids.size == 0:
+            print("  (no cilia detected)")
+            _flush_gpu()
+            continue
+        cents = np.atleast_2d(center_of_mass(cilia_labels > 0,
+                                             labels=cilia_labels, index=ids))
+        stem = os.path.splitext(file)[0]
+        df = pd.DataFrame({
+            "filename": file,
+            "file_short": stem,
+            "object_type": "cilia",
+            "cilia_id": [int(i) for i in ids],
+            "coords": [[float(c[0]), float(c[1]), float(c[2])] for c in cents],
+        })
+        # 3-D shape descriptors (volume, length, …) for the labeler's stat line.
+        cprops = cilia_shape_props(cilia_labels, voxel_size)
+        for col in SHAPE_COLS:
+            df[col] = [cprops.get(int(i), {}).get(col, np.nan) for i in df["cilia_id"]]
+
+        try:
+            n_roi = save_cilia_rois(
+                np.asarray(a[0]), cilia_labels, bb_labels, df,
+                dict(ch_cilia=cilia_channel, ch_bb=basal_bodies_channel,
+                     ch_neurites=neurites_channel, ch_nuclei=nuclei_channel),
+                tuple(float(v) for v in voxel_size), roi_dir, stem,
+                margin=roi_margin, save_crops=save_roi_crops,
+                correct_display=roi_correct_display)
+            print(f"  📸 {n_roi}/{len(df)} cilia ROIs → {roi_dir}")
+        except Exception as exc:                              # noqa: BLE001
+            print(f"  ⚠ ROI export failed: {exc}")
+        all_dfs.append(df)
+        _flush_gpu()
+
+    final_df = pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
+    excel_path = os.path.join(csv_dir, "all_cilia_features.xlsx")
+    with pd.ExcelWriter(excel_path) as writer:
+        final_df.to_excel(writer, sheet_name="all_data", index=False)
+    try:
+        with open(os.path.join(csv_dir, "run_label.txt"), "w", encoding="utf-8") as f:
+            f.write(os.path.basename(str(input_path).rstrip("/\\")) or "roi-batch")
+    except Exception:                                         # noqa: BLE001
+        pass
+    _n_img = final_df["filename"].nunique() if not final_df.empty else 0
+    print("═" * 60)
+    print(f"  ✓ ROI-only batch complete — {len(final_df)} cilia, {_n_img} images")
+    print(f"  Table   : {excel_path}")
+    print("═" * 60)
+    return excel_path

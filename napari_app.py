@@ -56,7 +56,7 @@ from limoncello.utils.assign_label_features import (
     assign_label_features, use_basal_body_ratio)
 from limoncello.utils.shape_props import cilia_shape_props, SHAPE_COLS
 from limoncello.analysis.pair_cilia_to_bb import pair_from_mixed_df
-from limoncello.analysis.pipeline import run_pipeline3
+from limoncello.analysis.pipeline import run_pipeline3, run_roi_only_batch
 
 
 _DEFAULT_CLASSIFIER = str(
@@ -1068,8 +1068,11 @@ class LimoncelloApp:
             return
         folder = Path(str(self.folder.value))
         out    = Path(str(self.output.value))
-        if not folder.is_dir():
-            show_warning("Select a valid input folder first.")
+        # Input may be a folder of .ims OR a .txt manifest (one .ims path per
+        # line) — type/paste the manifest path into the input folder field.
+        _is_manifest = folder.is_file() and folder.suffix.lower() == ".txt"
+        if not (folder.is_dir() or _is_manifest):
+            show_warning("Select an input folder, or a .txt manifest of .ims paths.")
             return
         if not str(out):
             show_warning("Select an output folder first.")
@@ -1111,6 +1114,7 @@ class LimoncelloApp:
             # Per-cilium ROIs are now exported inside the pipeline (fast, no GUI),
             # so they're produced whether or not live capture is on.
             save_rois=self.batch_rois.value or self.batch_ai.value,
+            roi_correct_display=self.roi_correct.value,
             # Optional AI validation → writes csv/human_validation.csv (uses the
             # model + threshold chosen in the 🤖 AI cilia validation section).
             batch_ai_model=(
@@ -1121,11 +1125,35 @@ class LimoncelloApp:
         )
 
         bridge = self._bridge   # emit progress from the worker thread → GUI thread
+        roi_only = self.batch_roi_only.value
+
+        # ROI-only fast batch: cilia+BB → ROI export, skip the full analysis. Reuse
+        # the relevant subset of the parameters above.
+        roi_kwargs = dict(
+            input_path=str(folder), output_path=str(out),
+            gpu_device=p["gpu_device"],
+            cilia_classifier_path=p["classifier_path"],
+            cilia_channel=p["ch_cilia"], neurites_channel=p["ch_neurites"],
+            basal_bodies_channel=p["ch_bb"], nuclei_channel=p["ch_nuclei"],
+            use_mip=p["use_mip"], make_isotropic=p["make_isotropic"],
+            p_low=p["p_low"], p_high=p["p_high"],
+            per_channel_norm=p["ch_norm"] or None,
+            cilia_log=p["cilia_log"],
+            cilia_gaussian_sigma=(p["cilia_gauss_z"], p["cilia_gauss_y"], p["cilia_gauss_x"]),
+            cilia_min_size=p["cilia_min_size"], cilia_max_size=p["cilia_max_size"],
+            bb_method=p["bb_method"], bb_classifier_path=p["bb_classifier_path"],
+            bb_spot_sigma=p["bb_spot_sigma"], bb_outline_sigma=p["bb_outline_sigma"],
+            bb_log=p["bb_log"],
+            bb_gaussian_sigma=(p["bb_gauss_z"], p["bb_gauss_y"], p["bb_gauss_x"]),
+            bb_min_size=p["bb_min_size"], bb_max_size=p["bb_max_size"],
+            roi_correct_display=self.roi_correct.value,
+            expected_xy_um=(self.batch_xy_um.value or None),
+        )
 
         # Per-file live visualisation (optional). The callback runs in the worker
         # thread: it hands the file's arrays to the GUI thread and blocks until
         # the screenshots are taken, so napari is only ever touched on the GUI thread.
-        capture     = self.batch_capture.value
+        capture     = self.batch_capture.value and not roi_only
         viz_bridge  = self._viz_bridge
 
         def _per_file(payload):
@@ -1136,11 +1164,17 @@ class LimoncelloApp:
 
         @thread_worker
         def _work():
-            run_pipeline3(
-                **kwargs,
-                progress_callback=lambda i, n, f: bridge.progressed.emit(i, n, f),
-                per_file_callback=_per_file if capture else None,
-            )
+            if roi_only:
+                run_roi_only_batch(
+                    **roi_kwargs,
+                    progress_callback=lambda i, n, f: bridge.progressed.emit(i, n, f),
+                )
+            else:
+                run_pipeline3(
+                    **kwargs,
+                    progress_callback=lambda i, n, f: bridge.progressed.emit(i, n, f),
+                    per_file_callback=_per_file if capture else None,
+                )
 
         def _done(_):
             self._set_busy(False)
@@ -1267,6 +1301,7 @@ class LimoncelloApp:
                 state["raw"], state["cilia_labels"], state["bb_labels"],
                 cdf, state["channels"], state["voxel_size"],
                 Path(roi_dir), stem, margin=margin,
+                correct_display=self.roi_correct.value,
             )
             print(f"[LC] saved {saved}/{len(cdf)} cilia ROIs for {stem} → {roi_dir}")
         except Exception as exc:                          # never abort the batch
@@ -2030,7 +2065,13 @@ class LimoncelloApp:
         # they no longer depend on live capture being on.
         self.batch_capture = CheckBox(label="Capture overlay screenshots during batch", value=True)
         self.batch_rois    = CheckBox(label="Save per-cilium ROI thumbnails + crops", value=True)
+        self.roi_correct   = CheckBox(label="Correct/normalise ROI display (off = raw intensities)", value=False)
         self.batch_ai      = CheckBox(label="AI-validate cilia during batch", value=False)
+        self.batch_roi_only = CheckBox(
+            label="ROI-only fast batch (cilia+BB → ROIs, skip analysis)", value=False)
+        self.batch_xy_um = FloatSpinBox(
+            label="Classifier XY µm (0 = all formats)", value=0.152,
+            min=0.0, max=5.0, step=0.001)
 
         # Optional AI validation: score this image's cilia ROIs with a trained
         # validator CNN and show only the kept ones as a Labels layer.
@@ -2059,7 +2100,8 @@ class LimoncelloApp:
             widgets=[*self._step_buttons, self.run_all_btn], labels=False,
         )
         batch_box = Container(
-            widgets=[self.output, self.batch_capture, self.batch_rois,
+            widgets=[self.output, self.batch_roi_only, self.batch_xy_um,
+                     self.batch_capture, self.batch_rois, self.roi_correct,
                      self.batch_ai, self.batch_btn],
             labels=True,
         )
