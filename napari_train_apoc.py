@@ -49,6 +49,7 @@ from limoncello.segmentation.train import (
 _ANNOT = "LC-APOC: Annotation"
 _PREVIEW = "LC-APOC: Preview"
 _RAW = "LC-APOC: Raw channel"
+_RAW_BB = "LC-APOC: Basal bodies"
 _SEGMENTERS = str((Path(__file__).parent / "segmenters").resolve())
 
 
@@ -88,6 +89,8 @@ class ApocTrainerApp:
         self.next_btn.clicked.connect(lambda: self._step(1))
 
         self.ch = SpinBox(label="Channel to segment", value=1, min=0, max=16)
+        self.ch_bb = SpinBox(label="Basal-body channel (context)", value=2,
+                             min=0, max=16)
         self.use_mip = CheckBox(label="MIP (2-D)", value=False)
         self.make_iso = CheckBox(label="Make isotropic", value=True)
         self.load_btn = PushButton(text="① Load + new annotation layer")
@@ -124,7 +127,7 @@ class ApocTrainerApp:
             self.folder, self.scan_btn, self.n_pick, self.pick_btn,
             self.file_combo, self.prev_btn, self.next_btn,
             Label(value="<b>2 · Load + paint</b>  (bg=1, object=2)"),
-            self.ch, self.use_mip, self.make_iso, self.load_btn,
+            self.ch, self.ch_bb, self.use_mip, self.make_iso, self.load_btn,
             Label(value="<b>3 · Features</b>  (tick cells in the bottom grid)"),
             self.train_feat_sigmas, self.train_feat_original, self.rebuild_feat_btn,
             Label(value="<b>4 · Train</b>"),
@@ -284,10 +287,16 @@ class ApocTrainerApp:
         def _done(st):
             self.state = st
             ch = _clamp_ch(st["raw"].shape[0], self.ch.value, "channel")
+            ch_bb = _clamp_ch(st["raw"].shape[0], self.ch_bb.value, "bb channel")
             vs = st["voxel_size"]
-            for nm in (_RAW, _PREVIEW, _ANNOT):
+            for nm in (_RAW, _RAW_BB, _PREVIEW, _ANNOT):
                 if nm in self.viewer.layers:
                     self.viewer.layers.remove(nm)
+            # Basal-body channel underneath (magenta) for visual context; the
+            # segment channel (green) on top is what you annotate.
+            if ch_bb != ch:
+                _add_image_safe(self.viewer, st["raw"][ch_bb], name=_RAW_BB,
+                                scale=vs, colormap="magenta", blending="additive")
             _add_image_safe(self.viewer, st["raw"][ch], name=_RAW, scale=vs,
                             colormap="green", blending="additive")
             # Empty label layer to paint on (matches the raw channel geometry).
