@@ -42,7 +42,7 @@ from napari_app import (
     _clamp_ch,
 )
 from limoncello.segmentation.train import (
-    train_segmenter_single, predict_segmenter, DEFAULT_FEATURES,
+    train_object_segmenter, predict_segmenter, DEFAULT_FEATURES,
     feature_spec_from_pairs, FEATURE_OPERATIONS,
 )
 
@@ -63,7 +63,11 @@ class ApocTrainerApp:
         self.path_by_name: dict[str, str] = {}
         self.subset: list[str] = []         # the randomly-picked working set
         self._busy = False
-        self._trained_any = False           # → drives APOC continue_training
+        # Accumulated annotations: {subset filename: (raw_channel_image, labels)}.
+        # We retrain the classifier on ALL of them each time, so every image you
+        # label stays part of the model (re-painting an image just updates its
+        # entry). This mirrors train_object_segmenter's single-segmenter loop.
+        self._train_pairs: dict[str, tuple] = {}
         self.widget = self._build()
         self._build_feature_grid()
         self.viewer.window.add_dock_widget(
@@ -320,14 +324,14 @@ class ApocTrainerApp:
 
     # ── train / preview ────────────────────────────────────────────────────────
     def _new_classifier(self):
-        self._trained_any = False
+        self._train_pairs.clear()
         out = str(self.output.value)
         if out and os.path.exists(out):
             try:
                 os.remove(out)
             except OSError:
                 pass
-        self._say("Started a new classifier — next Train writes it fresh.")
+        self._say("Started a new classifier — cleared all accumulated annotations.")
 
     def _train(self):
         if self._busy:
@@ -342,25 +346,28 @@ class ApocTrainerApp:
         if int(gt.max()) < pos:
             show_warning(f"Paint some object pixels (label {pos}) before training.")
             return
+        # Record / update this image's annotation, then retrain on EVERY labelled
+        # image so the model keeps them all (not just the latest one).
+        key = str(self.file_combo.value)
+        self._train_pairs[key] = (image, gt)
+        pairs = list(self._train_pairs.values())
         out = str(self.output.value)
         feats = self._feature_spec_from_grid() or DEFAULT_FEATURES
-        cont = self._trained_any
         p = self._params()
         self._set_busy(True)
-        self._say("Training APOC classifier …")
+        self._say(f"Training APOC on {len(pairs)} labelled image(s) …")
 
         @thread_worker
         def _work():
-            return train_segmenter_single(
-                image, gt, out, features=feats, continue_training=cont,
-                positive_class=pos, max_depth=int(self.max_depth.value),
+            return train_object_segmenter(
+                pairs, out, features=feats, positive_class=pos,
+                max_depth=int(self.max_depth.value),
                 num_trees=int(self.num_trees.value), gpu_device=p["gpu_device"])
 
         def _done(path):
-            self._trained_any = True
             self._set_busy(False)
-            self._say(f"✓ Trained into {os.path.basename(path)} "
-                      f"({'added' if cont else 'fresh'}). Preview or go to next image.")
+            self._say(f"✓ Trained {os.path.basename(path)} on "
+                      f"{len(pairs)} image(s). Preview, or label the next image.")
 
         def _err(e):
             self._set_busy(False); show_warning(f"Training failed: {e}")
