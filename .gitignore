@@ -17,3 +17,10 @@ Thumbs.db
 
 # Trained model weights (large binaries)
 models/*.pt
+
+# Manim explainer render output (keep the .py sources, drop the mp4/partials)
+media/explainers/out/
+
+# Runtime / session state (regenerated at run time)
+.napari_app_state.json
+cilia_study/labels.csv
