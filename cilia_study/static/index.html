@@ -18,6 +18,9 @@
   <div class="card center">
     <h1 class="title">Cilia<span class="thin">Consensus</span></h1>
     <p class="sub">What counts as a cilium? Let's find out how much we agree.</p>
+    <p class="sub">Pink channel: Basal Body marker (PCNT)</p>
+    <p class="sub">Green channel: Cilia marker (AC3)</p>
+    <p class="sub">In general the cilia to evaluate is found at the center of the image.</p>
     <label class="field">
       <span>Who are you?</span>
       <select id="player"></select>
@@ -52,8 +55,11 @@
     <div class="cards" id="summary"></div>
 
     <h2 class="h2">Who's lenient, who's strict?</h2>
-    <p class="hint">Leniency = how readily a rater calls things a cilium. Bars: green = cilia,
-      red = not, amber = uncertain. Sorted most lenient → strictest.</p>
+    <p class="hint"><b>Leniency = (share you called “cilia”) − (share you called “not”)</b>,
+      over the ROIs you labeled. Range −1 … +1: <b>+1</b> = called everything a cilium
+      (most lenient), <b>0</b> = balanced, <b>−1</b> = rejected everything (strictest).
+      “Uncertain” votes count toward neither, so they pull the score toward 0.
+      Bars: green = cilia, red = not, amber = uncertain. Sorted most lenient → strictest.</p>
     <div id="leniency" class="lenlist"></div>
 
     <h2 class="h2">Who disagrees on each ROI?</h2>

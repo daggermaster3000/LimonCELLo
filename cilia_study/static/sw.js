@@ -1,4 +1,4 @@
-const CACHE = 'cilia-consensus-v4';
+const CACHE = 'cilia-consensus-v5';
 const SHELL = ['/', '/index.html', '/style.css', '/app.js',
   '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
 

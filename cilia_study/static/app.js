@@ -263,8 +263,10 @@ function renderScatter(d) {
 // ── curate (admin) ────────────────────────────────────────
 let pool = [], picked = new Set();
 
-function scoreColor(p) {                       // binary model: green=cilia, red=not
-  return p >= 0.6 ? '#1f9d76' : '#d1495b';
+function scoreColor(p) {                       // green=cilia, red=not, amber=~0.5
+  if (p >= 0.66) return '#1f9d76';
+  if (p <= 0.33) return '#d1495b';
+  return '#c98a1a';
 }
 async function startCurate() {
   const d = await api('/api/pool?user=' + encodeURIComponent(user));
