@@ -105,7 +105,10 @@ Two independent ground-truth routes, both in the data app:
 
 * **Hand counts** — a per-sample Excel of manual counts → correlation, Bland–Altman,
   threshold optimiser (Validation tab).
-* **Per-cilia boxes** — the **Annotator** app's box Excel. The data app matches
+* **Per-cilia boxes** — the **Annotator** app's box Excel (or the pipeline app's
+  own **📦 Copy boxes** / **💾 Export .xlsx**, which write the same `cilia_boxes`
+  schema — each cilium's XY bounding box — so a run can be reloaded for review).
+  The data app matches
   each detected cilium (its centroid projected onto the XY MIP) to the hand-drawn
   boxes → **recall** (which cilia we miss), a **confusion matrix** (which we
   misclassify), and an interactive manual-vs-pipeline class plot (click a point →

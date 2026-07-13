@@ -85,6 +85,39 @@ _STATE_PATH = Path(__file__).parent / ".napari_app_state.json"
 _LOAD_CACHE_DIR = Path(tempfile.gettempdir()) / "lc_iso_cache"
 _LOAD_CACHE_MAX = 40                       # keep at most N cached loads
 
+# Per-cilium XY bounding-box export — same schema/sheet the annotator app and the
+# data app's manual validation read, so a table exported here reloads there.
+_BOX_SHEET = "cilia_boxes"
+_BOX_COLS = [
+    "filename", "box_id", "class",
+    "y_min", "x_min", "y_max", "x_max",
+    "img_height", "img_width",
+    "voxel_z", "voxel_y", "voxel_x",
+    "mip", "make_isotropic",
+]
+_BOX_XY_COLS = ["y_min", "x_min", "y_max", "x_max"]   # shown in the property table
+
+
+def _cilia_bboxes(labels) -> dict:
+    """Map ``{label_id: (y_min, x_min, y_max, x_max)}`` — the XY bounding box of
+    each cilium projected onto the (max-)MIP grid (inclusive max, like the
+    annotator app). Works for 2-D (y,x) or 3-D (z,y,x) label volumes."""
+    from skimage.measure import regionprops
+    lab = np.asarray(labels)
+    if lab.size == 0 or lab.max() == 0:
+        return {}
+    if lab.dtype != np.int32:
+        lab = lab.astype(np.int32)
+    out = {}
+    for r in regionprops(lab):
+        bb = r.bbox
+        if lab.ndim == 3:
+            _, y0, x0, _, y1, x1 = bb
+        else:
+            y0, x0, y1, x1 = bb
+        out[int(r.label)] = (int(y0), int(x0), int(y1) - 1, int(x1) - 1)
+    return out
+
 
 def _load_cache_key(p: dict, mtime: float) -> str:
     payload = repr({
@@ -661,6 +694,7 @@ class LimoncelloApp:
         "cilia_id", "class", "ai_score", "ai_validated", "log_ratio", "ratio",
         "distance_to_neurite_um", "dt_neurite", "dt_nuclei", "volume_um3",
         "length_um", "sphericity",
+        "y_min", "x_min", "y_max", "x_max",
         "paired_id", "pair_distance_um", "pairing_status",
     ]
 
@@ -715,9 +749,15 @@ class LimoncelloApp:
             copy_btn = QPushButton("📋 Copy for Excel")
             copy_btn.setToolTip("Copy the whole table to the clipboard (paste into Excel)")
             copy_btn.clicked.connect(lambda: self._copy_table_tsv(whole=True))
+            boxes_btn = QPushButton("📦 Copy boxes")
+            boxes_btn.setToolTip("Copy per-cilium bounding boxes in the annotator "
+                                 "'cilia_boxes' schema (reloads in the annotator / data app)")
+            boxes_btn.clicked.connect(self._copy_boxes_tsv)
             export_btn = QPushButton("💾 Export .xlsx")
+            export_btn.setToolTip("Save a cilia_table sheet + a cilia_boxes sheet")
             export_btn.clicked.connect(self._export_table_xlsx)
             bar.addWidget(copy_btn)
+            bar.addWidget(boxes_btn)
             bar.addWidget(export_btn)
             bar.addStretch(1)
             lay.addLayout(bar)
@@ -821,8 +861,72 @@ class LimoncelloApp:
             len({idx.row() for idx in self.table.selectedIndexes()})
         self._set_status(f"📋 Copied {n} rows — paste into Excel.")
 
+    def _attach_boxes(self, state):
+        """Add XY bounding-box columns (y_min/x_min/y_max/x_max) to the cilia
+        dataframe so they show in the table, get copied, and get exported."""
+        cdf = state.get("cilia_df")
+        lab = state.get("cilia_labels")
+        if cdf is None or getattr(cdf, "empty", True) or lab is None:
+            return
+        boxes = _cilia_bboxes(lab)
+        for col in _BOX_XY_COLS:
+            cdf[col] = np.nan
+        ids = cdf["cilia_id"].astype(int)
+        for pos, cid in zip(cdf.index, ids):
+            bb = boxes.get(int(cid))
+            if bb is not None:
+                cdf.loc[pos, _BOX_XY_COLS] = bb
+        state["cilia_df"] = cdf
+
+    def _cilia_boxes_df(self, state):
+        """The cilia as a DataFrame in the annotator/data-app ``cilia_boxes``
+        schema (one box per cilium), so an export/copy reloads there."""
+        import pandas as pd
+        cdf = self._cilia_df_view if self._cilia_df_view is not None else state.get("cilia_df")
+        lab = state.get("cilia_labels")
+        if cdf is None or cdf.empty or lab is None:
+            return None
+        boxes = _cilia_bboxes(lab)
+        lab = np.asarray(lab)
+        H, W = int(lab.shape[-2]), int(lab.shape[-1])
+        vz, vy, vx = (float(s) for s in state.get("voxel_size", (1, 1, 1)))
+        p = self._params()
+        fname = Path(str(p.get("ims_path") or "")).stem
+        mip = 1 if lab.ndim == 2 else 0
+        miso = 1 if p.get("make_isotropic") else 0
+        rows = []
+        for _, row in cdf.iterrows():
+            cid = int(row["cilia_id"])
+            bb = boxes.get(cid)
+            if bb is None:
+                continue
+            y0, x0, y1, x1 = bb
+            cls = str(row.get("class", "uncertain"))
+            cls = "uncertain" if cls == "ambiguous" else cls   # annotator vocab
+            rows.append({
+                "filename": fname, "box_id": cid, "class": cls,
+                "y_min": y0, "x_min": x0, "y_max": y1, "x_max": x1,
+                "img_height": H, "img_width": W,
+                "voxel_z": vz, "voxel_y": vy, "voxel_x": vx,
+                "mip": mip, "make_isotropic": miso,
+            })
+        return pd.DataFrame(rows, columns=_BOX_COLS)
+
+    def _copy_boxes_tsv(self):
+        """Copy the boxes (annotator schema) as TSV → paste into a sheet named
+        'cilia_boxes' to reload in the annotator or the data app."""
+        df = self._cilia_boxes_df(self.state)
+        if df is None or df.empty:
+            show_warning("No cilia boxes — run “Assign & classify” first.")
+            return
+        tsv = "\t".join(_BOX_COLS) + "\n" + "\n".join(
+            "\t".join(str(v) for v in r) for r in df.itertuples(index=False, name=None))
+        QApplication.clipboard().setText(tsv)
+        self._set_status(f"📦 Copied {len(df)} boxes — paste into a 'cilia_boxes' sheet.")
+
     def _export_table_xlsx(self):
-        """Save the current table (with manual AI edits) to an .xlsx file."""
+        """Save the table (with manual AI edits) to .xlsx: a ``cilia_table`` sheet
+        plus a ``cilia_boxes`` sheet that reloads in the annotator / data app."""
         cdf = self._cilia_df_view
         if cdf is None or cdf.empty:
             show_warning("No cilia table to export — run “Assign & classify” first.")
@@ -835,9 +939,15 @@ class LimoncelloApp:
             return
         cols = [c for c in self._table_cols if c in cdf.columns]
         try:
-            cdf[cols].to_excel(path, index=False)
-            self._set_status(f"💾 Exported {len(cdf)} cilia → {Path(path).name}")
-            show_info(f"Saved cilia table → {path}")
+            import pandas as pd
+            bdf = self._cilia_boxes_df(self.state)
+            with pd.ExcelWriter(path) as xw:
+                cdf[cols].to_excel(xw, sheet_name="cilia_table", index=False)
+                if bdf is not None and not bdf.empty:
+                    bdf.to_excel(xw, sheet_name=_BOX_SHEET, index=False)
+            extra = f" (+ {len(bdf)} boxes)" if bdf is not None and not bdf.empty else ""
+            self._set_status(f"💾 Exported {len(cdf)} cilia{extra} → {Path(path).name}")
+            show_info(f"Saved cilia table + boxes → {path}")
         except Exception as e:                  # noqa: BLE001
             show_warning(f"Export failed: {e}")
 
@@ -1323,6 +1433,7 @@ class LimoncelloApp:
         the selection sync, then flash the completion image."""
         self.cilia_pts = show_centroids(viewer, state)
         show_associations(viewer, state)
+        self._attach_boxes(state)
         self._populate_table(state.get("cilia_df"))
         if self.cilia_pts is not None:
             # napari point selection → table highlight
