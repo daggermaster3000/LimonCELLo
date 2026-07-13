@@ -166,21 +166,26 @@ def compute_results(app: App) -> dict:
     shown_ids = {d["id"] for d in ds}
     users = sorted({u for (u, rid) in app.labels if rid in shown_ids})
 
-    # per-ROI vote tallies
+    # per-ROI vote tallies + who voted what (names, so the admin can see exactly
+    # who disagrees on every image — not just the top few)
     rois = []
     for d in ds:
         rid = d["id"]
         votes = {c: 0 for c in CLASSES}
+        voters = {c: [] for c in CLASSES}
         for (u, r), v in app.labels.items():
             if r == rid:
                 votes[v["label"]] += 1
+                voters[v["label"]].append(u)
+        for c in CLASSES:
+            voters[c].sort()
         n = sum(votes.values())
         counts = [votes[c] for c in CLASSES]
         cilia_frac = (votes["cilia"] / n) if n else None
         rois.append({
             "id": rid, "img": f"/api/img?id={quote(rid)}",
             "model_score": d["model_score"], "model_label": d["model_label"],
-            "votes": votes, "n": n,
+            "votes": votes, "voters": voters, "n": n,
             "entropy": round(_entropy_norm(counts), 4),
             "human_cilia_frac": cilia_frac,
         })
@@ -203,8 +208,19 @@ def compute_results(app: App) -> dict:
         cm, c_acc, c_n = _confusion(cons_pairs)
         vs_model[u] = {"matrix": mm, "acc": m_acc, "n": m_n}
         vs_cons[u] = {"matrix": cm, "acc": c_acc, "n": c_n}
-        per_user.append({"user": u, "n_labeled": len(ul),
-                         "acc_vs_model": m_acc, "acc_vs_consensus": c_acc})
+        # leniency: how readily a rater calls things "cilia". Signed index in
+        # [-1, 1] = (share called cilia) - (share called not); +1 = accepts
+        # everything as a cilium (lenient), -1 = rejects everything (strict).
+        cnt = {c: 0 for c in CLASSES}
+        for lab in ul.values():
+            cnt[lab] += 1
+        nlab = len(ul)
+        leniency = round((cnt["cilia"] - cnt["not"]) / nlab, 4) if nlab else None
+        cilia_frac = round(cnt["cilia"] / nlab, 4) if nlab else None
+        per_user.append({"user": u, "n_labeled": nlab,
+                         "acc_vs_model": m_acc, "acc_vs_consensus": c_acc,
+                         "counts": cnt, "leniency": leniency,
+                         "cilia_frac": cilia_frac})
 
     # user x user pairwise agreement (over commonly-labelled ROIs)
     agree = [[None] * len(users) for _ in users]
@@ -233,10 +249,19 @@ def compute_results(app: App) -> dict:
     top = sorted([r for r in rois if r["n"] > 0],
                  key=lambda r: (-r["entropy"], r["id"]))
 
+    # leniency ranking: most lenient (calls most things cilia) -> most strict
+    leniency = sorted(
+        [{"user": p["user"], "leniency": p["leniency"],
+          "cilia_frac": p["cilia_frac"], "counts": p["counts"],
+          "n_labeled": p["n_labeled"]}
+         for p in per_user if p["leniency"] is not None],
+        key=lambda p: (-p["leniency"], p["user"]))
+
     return {
         "n_rois": len(ds), "raters": users, "n_raters": len(users),
         "fleiss_kappa": kappa, "mean_pairwise_agreement": mean_pair,
         "classes": list(CLASSES), "rois": rois, "top_disagree": top,
+        "leniency": leniency,
         "consensus": consensus, "per_user": per_user,
         "confusion": {"vs_model": vs_model, "vs_consensus": vs_cons},
         "agreement_matrix": {"users": users, "matrix": agree},

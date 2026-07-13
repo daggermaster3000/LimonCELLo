@@ -94,6 +94,25 @@ select{padding:11px 12px;border:1px solid var(--line);border-radius:8px;backgrou
 .chip.not{color:var(--notc);border-color:var(--notc)}
 .chip.uncertain{color:var(--unc);border-color:var(--unc)}
 
+/* ── Voter names on each ROI ── */
+.names{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
+.namechip{font-size:10px;font-weight:600;padding:1px 6px;border-radius:20px;border:1px solid var(--line);background:#fff;line-height:1.5}
+.namechip.cilia{color:var(--cilia);border-color:var(--cilia);background:rgba(31,157,118,.08)}
+.namechip.notc{color:var(--notc);border-color:var(--notc);background:rgba(209,73,91,.08)}
+.namechip.unc{color:var(--unc);border-color:var(--unc);background:rgba(201,138,26,.08)}
+
+/* ── Leniency list ── */
+.lenlist{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px;margin-bottom:8px}
+.lenrow{background:var(--surface);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);padding:12px}
+.lenhead{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px}
+.lenname{font-weight:600;font-size:13px}
+.lentag{font-size:11px;font-weight:700;padding:1px 8px;border-radius:20px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.lentag.lenient{color:var(--cilia);border-color:var(--cilia)}
+.lentag.strict{color:var(--notc);border-color:var(--notc)}
+.lentag.balanced{color:var(--muted)}
+.lenmeta{margin-top:6px}
+.small{font-size:11px}
+
 /* ── Curate pool ── */
 .curbar{display:flex;gap:10px;flex-wrap:wrap;margin:6px 0 16px}
 .poolgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px}

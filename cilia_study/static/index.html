@@ -51,8 +51,14 @@
 
     <div class="cards" id="summary"></div>
 
-    <h2 class="h2">Where do we disagree most?</h2>
-    <p class="hint">ROIs ranked by how split the votes are (dark bar = disagreement).</p>
+    <h2 class="h2">Who's lenient, who's strict?</h2>
+    <p class="hint">Leniency = how readily a rater calls things a cilium. Bars: green = cilia,
+      red = not, amber = uncertain. Sorted most lenient → strictest.</p>
+    <div id="leniency" class="lenlist"></div>
+
+    <h2 class="h2">Who disagrees on each ROI?</h2>
+    <p class="hint">Every published ROI, most-split first. Each name is tinted by their call
+      (green = cilia, red = not, amber = uncertain).</p>
     <div id="disagree" class="roigrid"></div>
 
     <h2 class="h2">You vs. the model &amp; the group</h2>

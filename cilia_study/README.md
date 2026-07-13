@@ -52,8 +52,11 @@ nearest 0.5. The dashboard stats cover only the currently-published ROIs.
 Logged in as the admin, the homepage updates as votes come in (tap **Refresh**):
 
 - **Summary** — #raters, Fleiss' κ, mean pairwise agreement, model↔human R².
-- **Where do we disagree most?** — ROIs ranked by vote entropy, with the model's
-  own call for contrast.
+- **Leniency** — per-rater "how readily do you call things a cilium?" index in
+  [−1, +1] = (share called cilia) − (share called not), sorted lenient →
+  strict, with each rater's cilia/not/uncertain split.
+- **Who disagrees on each ROI?** — **every** published ROI (not just the top
+  few), most-split first, listing **who** voted what by name (tinted by call).
 - **You vs. model & group** — per-rater 3×3 confusion matrices (against the model
   and against the group majority) with accuracy.
 - **Who agrees with whom?** — user × user agreement heatmap.

@@ -86,6 +86,7 @@ async function loadDashboard() {
   ].map(([lbl, v]) => `<div class="stat"><div class="big">${v}</div><div class="lbl">${lbl}</div></div>`).join('');
 
   renderResetPanel(d);
+  renderLeniency(d);
   renderDisagree(d);
   renderConfusionPicker(d);
   renderAgreement(d);
@@ -121,10 +122,44 @@ $('resetBtn').onclick = async () => {
   else toast((res && res.error) || 'reset failed');
 };
 
+const firstName = (n) => n.split(' ')[0];
+const CCLS = { cilia: 'cilia', not: 'notc', uncertain: 'unc' };
+
+function voterNames(v) {
+  // chips of who voted, grouped by call, tinted by class
+  const chips = [];
+  CLASSES.forEach(c => (v[c] || []).forEach(u =>
+    chips.push(`<span class="namechip ${CCLS[c]}" title="${u}: ${CLABEL[c]}">${firstName(u)}</span>`)));
+  return chips.length
+    ? `<div class="names">${chips.join('')}</div>`
+    : '<div class="names muted">no votes yet</div>';
+}
+
+function renderLeniency(d) {
+  const rows = d.leniency || [];
+  if (!rows.length) { $('leniency').innerHTML = '<p class="muted">no votes yet.</p>'; return; }
+  $('leniency').innerHTML = rows.map(p => {
+    const n = p.n_labeled || 1;
+    const w = (x) => (100 * x / n).toFixed(1) + '%';
+    const c = p.counts;
+    const tag = p.leniency > 0.15 ? 'lenient' : (p.leniency < -0.15 ? 'strict' : 'balanced');
+    return `<div class="lenrow">
+      <div class="lenhead"><span class="lenname">${p.user}</span>
+        <span class="lentag ${tag}">${tag} · ${p.leniency > 0 ? '+' : ''}${p.leniency}</span></div>
+      <div class="votebar"><i class="vc" style="width:${w(c.cilia)}"></i>`
+      + `<i class="vn" style="width:${w(c.not)}"></i>`
+      + `<i class="vu" style="width:${w(c.uncertain)}"></i></div>
+      <div class="lenmeta muted small">${c.cilia} cilia · ${c.not} not · ${c.uncertain} uncertain</div>
+    </div>`;
+  }).join('');
+}
+
 function renderDisagree(d) {
-  const top = d.top_disagree.slice(0, 8);
-  if (!top.length) { $('disagree').innerHTML = ''; return; }
-  $('disagree').innerHTML = top.map(r => `
+  // ALL published ROIs that got at least one vote, most-split first
+  const all = d.rois.filter(r => r.n > 0).slice()
+    .sort((a, b) => (b.entropy - a.entropy) || a.id.localeCompare(b.id));
+  if (!all.length) { $('disagree').innerHTML = ''; return; }
+  $('disagree').innerHTML = all.map(r => `
     <div class="roicell">
       <img src="${r.img}" alt="${r.id}" loading="lazy" />
       <div class="body">
@@ -133,6 +168,7 @@ function renderDisagree(d) {
           <span title="normalised entropy">split ${Math.round(r.entropy * 100)}%</span>
           <span class="chip ${r.model_label}">model: ${CLABEL[r.model_label]}</span>
         </div>
+        ${voterNames(r.voters)}
       </div>
     </div>`).join('');
 }
