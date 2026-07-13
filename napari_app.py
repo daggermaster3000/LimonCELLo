@@ -670,6 +670,7 @@ class LimoncelloApp:
         self.files: list[str] = []     # .ims filenames in the folder
         self._busy = False
         self.cilia_pts = None          # current cilia Points layer
+        self._del_cb = None            # active "delete cilium" mouse callback (or None)
         self._cilia_df_view = None     # df backing the table (row order == points)
         self._syncing = False          # guards two-way selection sync
         self._ch_norm: dict[int, tuple[int, int]] = {}   # per-channel (p_low, p_high) overrides
@@ -1220,6 +1221,95 @@ class LimoncelloApp:
         self._run_step(step_cilia, ("raw",),
                        lambda v, s: show_labels(v, s, "cilia_labels", "LC: Cilia Labels"),
                        "Segment cilia")
+
+    # ── manual cilia editing (add / delete between steps) ────────────────────────
+    _CILIA_LAYER = "LC: Cilia Labels"
+
+    def _cilia_layer(self):
+        """The editable cilia Labels layer, or None (with a warning)."""
+        if self._CILIA_LAYER in self.viewer.layers:
+            return self.viewer.layers[self._CILIA_LAYER]
+        show_warning("Run step 2 (Segment cilia) first.")
+        return None
+
+    def _do_add_cilium(self):
+        """Paint a brand-new cilium: select the cilia layer, pick an unused label
+        id and switch to a 3-D paint brush. Click ✅ Apply edits when done."""
+        lyr = self._cilia_layer()
+        if lyr is None:
+            return
+        data = np.asarray(lyr.data)
+        new_id = int(data.max()) + 1 if data.size else 1
+        self.viewer.layers.selection.active = lyr
+        lyr.selected_label = new_id
+        try:                                    # make the brush fill across Z too
+            lyr.n_edit_dimensions = data.ndim
+        except Exception:                       # noqa: BLE001 (older napari)
+            pass
+        lyr.mode = "paint"
+        self._set_status(
+            f"✏️ Paint the new cilium (id {new_id}); brush paints in 3-D. "
+            "Click ✅ Apply edits to commit.")
+
+    def _toggle_delete_cilium(self):
+        """Toggle a click-to-delete mode: clicking a cilium zeroes that label."""
+        lyr = self._cilia_layer()
+        if lyr is None:
+            return
+        if self._del_cb is not None:            # turn OFF
+            try:
+                lyr.mouse_drag_callbacks.remove(self._del_cb)
+            except ValueError:
+                pass
+            self._del_cb = None
+            self.del_cilium_btn.text = "🗑️ Delete cilium (click)"
+            self._set_status("Delete mode off.")
+            return
+
+        self.viewer.layers.selection.active = lyr
+        lyr.mode = "pan_zoom"                    # so a click reads, doesn't paint
+
+        def _cb(layer, event):
+            data = np.asarray(layer.data)
+            try:
+                idx = tuple(int(round(c)) for c in layer.world_to_data(event.position))
+            except Exception:                   # noqa: BLE001
+                return
+            if len(idx) != data.ndim or not all(0 <= i < s for i, s in zip(idx, data.shape)):
+                return
+            val = int(data[idx])
+            if val:
+                data[data == val] = 0
+                layer.data = data
+                layer.refresh()
+                self._set_status(
+                    f"🗑️ Deleted cilium #{val}. Click ✅ Apply edits to commit.")
+
+        self._del_cb = _cb
+        lyr.mouse_drag_callbacks.append(_cb)
+        self.del_cilium_btn.text = "🗑️ Delete: ON — click cilia"
+        self._set_status("Delete mode ON — click cilia to remove; toggle off when done.")
+
+    def _do_apply_cilia_edits(self):
+        """Commit the layer's manual edits back into the pipeline state.
+
+        Re-derives one label per connected component (so painted blobs become
+        distinct cilia and ids stay contiguous), then refreshes the layer. Re-run
+        step 7 (Assign & classify) to fold the edits into the results."""
+        lyr = self._cilia_layer()
+        if lyr is None:
+            return
+        if self._del_cb is not None:            # leave delete mode first
+            self._toggle_delete_cilium()
+        from skimage.measure import label as _cc
+        data = np.asarray(lyr.data)
+        relabeled = _cc(data > 0).astype(np.int32)
+        self.state["cilia_labels"] = relabeled
+        lyr.mode = "pan_zoom"
+        show_labels(self.viewer, self.state, "cilia_labels", self._CILIA_LAYER)
+        n = int(relabeled.max())
+        self._set_status(f"✅ Applied cilia edits — {n} cilia. Re-run step 7 (Assign & classify).")
+        show_info(f"{n} cilia after manual edits. Re-run “7 · Assign & classify”.")
 
     def _do_nuclei(self):
         self._run_step(step_nuclei, ("norm",),
@@ -2317,6 +2407,18 @@ class LimoncelloApp:
         self._step_buttons = [load_btn, cilia_btn, nuclei_btn, neurite_btn,
                               bb_btn, dist_btn, assign_btn]
 
+        # Manual cilia editing (add / delete objects between steps).
+        self.add_cilium_btn = PushButton(text="➕ Add cilium (paint)")
+        self.del_cilium_btn = PushButton(text="🗑️ Delete cilium (click)")
+        self.apply_edits_btn = PushButton(text="✅ Apply cilia edits")
+        self.add_cilium_btn.clicked.connect(self._do_add_cilium)
+        self.del_cilium_btn.clicked.connect(self._toggle_delete_cilium)
+        self.apply_edits_btn.clicked.connect(self._do_apply_cilia_edits)
+        self._edit_cilia_box = Container(
+            widgets=[self.add_cilium_btn, self.del_cilium_btn, self.apply_edits_btn],
+            layout="horizontal", labels=False,
+        )
+
         self.run_all_btn = PushButton(text="▶ Run all steps (this image)")
         self.run_all_btn.clicked.connect(self._do_run_all)
         self.batch_btn = PushButton(text="⚡ Run BATCH (whole folder)")
@@ -2364,7 +2466,8 @@ class LimoncelloApp:
             labels=True,
         )
         steps_box = Container(
-            widgets=[*self._step_buttons, self.run_all_btn], labels=False,
+            widgets=[*self._step_buttons, self._edit_cilia_box, self.run_all_btn],
+            labels=False,
         )
         batch_box = Container(
             widgets=[self.output, self.batch_roi_only, self.batch_xy_um,

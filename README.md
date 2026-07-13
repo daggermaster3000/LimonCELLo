@@ -46,7 +46,10 @@ a whole folder in batch). All physical quantities use the anisotropic voxel size
    re-running load after only changing a *segmentation* parameter is instant.
 
 2. **Segment cilia** — APOC `ObjectSegmenter` (`.cl` classifier) on the raw cilia
-   channel, size-gated (min/max voxels).
+   channel, size-gated (min/max voxels). You can then **manually curate** the
+   result: **➕ Add cilium** (3-D paint brush), **🗑️ Delete cilium** (click to
+   remove a label), then **✅ Apply cilia edits** to fold them back into the
+   pipeline (re-run step 7 to update the classification).
 
 3. **Segment nuclei** — Voronoi–Otsu (tophat + spot/outline σ) **or** an APOC
    classifier (same UI layout as basal bodies).
