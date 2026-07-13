@@ -26,11 +26,11 @@ from magicgui.widgets import (
     SpinBox, FloatSpinBox, Select, LineEdit, Table,
 )
 from qtpy.QtWidgets import (
-    QWidget, QVBoxLayout, QScrollArea, QLabel, QFrame,
+    QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel, QFrame,
     QTableWidget, QTableWidgetItem, QAbstractItemView, QProgressBar,
-    QApplication,
+    QApplication, QPushButton, QShortcut,
 )
-from qtpy.QtGui import QPixmap, QColor
+from qtpy.QtGui import QPixmap, QColor, QKeySequence
 from qtpy.QtCore import Qt, QTimer, QItemSelectionModel, QObject, Signal
 from superqt import QCollapsible
 from napari.qt.threading import thread_worker
@@ -672,6 +672,7 @@ class LimoncelloApp:
         self.cilia_pts = None          # current cilia Points layer
         self._del_cb = None            # active "delete cilium" mouse callback (or None)
         self._cilia_df_view = None     # df backing the table (row order == points)
+        self._populating = False       # guards table edits fired during (re)populate
         self._syncing = False          # guards two-way selection sync
         self._ch_norm: dict[int, tuple[int, int]] = {}   # per-channel (p_low, p_high) overrides
         self._loading_norm = False     # guards programmatic norm spin-box writes
@@ -695,32 +696,150 @@ class LimoncelloApp:
         self.table.setHorizontalHeaderLabels(self._TABLE_COLS)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        # Cells are read-only except the ``ai_validated`` checkbox (handled per item).
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setAlternatingRowColors(False)
         self.table.itemSelectionChanged.connect(self._on_table_selection)
+        self.table.itemChanged.connect(self._on_table_item_changed)
+        self._table_cols: list[str] = list(self._TABLE_COLS)
+
+        # Ctrl+C copies the selection (or the whole table) as Excel-pasteable TSV.
+        sc = QShortcut(QKeySequence.Copy, self.table)
+        sc.activated.connect(self._copy_table_tsv)
+
         if self.viewer is not None:
+            wrap = QWidget()
+            lay = QVBoxLayout(wrap)
+            lay.setContentsMargins(2, 2, 2, 2)
+            bar = QHBoxLayout()
+            copy_btn = QPushButton("📋 Copy for Excel")
+            copy_btn.setToolTip("Copy the whole table to the clipboard (paste into Excel)")
+            copy_btn.clicked.connect(lambda: self._copy_table_tsv(whole=True))
+            export_btn = QPushButton("💾 Export .xlsx")
+            export_btn.clicked.connect(self._export_table_xlsx)
+            bar.addWidget(copy_btn)
+            bar.addWidget(export_btn)
+            bar.addStretch(1)
+            lay.addLayout(bar)
+            lay.addWidget(self.table)
             self.viewer.window.add_dock_widget(
-                self.table, area="bottom", name="Cilia properties",
+                wrap, area="bottom", name="Cilia properties",
             )
 
     def _populate_table(self, cdf):
         self._cilia_df_view = cdf.reset_index(drop=True) if cdf is not None else None
-        self.table.setRowCount(0)
-        if cdf is None or cdf.empty:
+        self._populating = True
+        try:
+            self.table.setRowCount(0)
+            if cdf is None or cdf.empty:
+                self._table_cols = []
+                return
+            cols = [c for c in self._TABLE_COLS if c in cdf.columns]
+            self._table_cols = cols
+            self.table.setColumnCount(len(cols))
+            self.table.setHorizontalHeaderLabels(cols)
+            self.table.setRowCount(len(cdf))
+            for r in range(len(cdf)):
+                for c, col in enumerate(cols):
+                    v = cdf.iloc[r][col]
+                    item = QTableWidgetItem()
+                    if col == "ai_validated":
+                        # editable checkbox — the user can flip the AI decision
+                        item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled
+                                      | Qt.ItemIsSelectable)
+                        item.setCheckState(Qt.Checked if bool(v) else Qt.Unchecked)
+                        item.setText("keep" if bool(v) else "reject")
+                    else:
+                        if isinstance(v, float):
+                            txt = "—" if v != v else f"{v:.3g}"   # v!=v → NaN
+                        else:
+                            txt = str(v)
+                        item.setText(txt)
+                    self.table.setItem(r, c, item)
+            self.table.resizeColumnsToContents()
+        finally:
+            self._populating = False
+
+    def _on_table_item_changed(self, item):
+        """Flip the AI decision when the user toggles the ``ai_validated`` box."""
+        if self._populating or self._cilia_df_view is None:
             return
-        cols = [c for c in self._TABLE_COLS if c in cdf.columns]
-        self.table.setColumnCount(len(cols))
-        self.table.setHorizontalHeaderLabels(cols)
-        self.table.setRowCount(len(cdf))
-        for r in range(len(cdf)):
-            for c, col in enumerate(cols):
-                v = cdf.iloc[r][col]
-                if isinstance(v, float):
-                    txt = "—" if v != v else f"{v:.3g}"   # v!=v → NaN
-                else:
-                    txt = str(v)
-                self.table.setItem(r, c, QTableWidgetItem(txt))
-        self.table.resizeColumnsToContents()
+        col = item.column()
+        if col >= len(self._table_cols) or self._table_cols[col] != "ai_validated":
+            return
+        keep = item.checkState() == Qt.Checked
+        row = item.row()
+        self._populating = True                 # avoid re-entrancy from setText
+        try:
+            item.setText("keep" if keep else "reject")
+        finally:
+            self._populating = False
+        if 0 <= row < len(self._cilia_df_view):
+            self._cilia_df_view.at[row, "ai_validated"] = bool(keep)
+            self._refresh_ai_overlay()
+
+    def _refresh_ai_overlay(self):
+        """Redraw the AI-validated / AI-rejected point overlays from the (edited)
+        table so the viewer matches the user's manual decisions."""
+        cdf = self._cilia_df_view
+        if cdf is None or "ai_validated" not in cdf.columns or "coords" not in cdf.columns:
+            return
+        _remove(self.viewer, "LC: AI-validated", "LC: AI-rejected")
+        vs = self.state.get("voxel_size", (1, 1, 1))
+        scored = cdf[cdf["ai_score"].notna()] if "ai_score" in cdf.columns else cdf
+        for keep, name, color in ((True, "LC: AI-validated", "lime"),
+                                  (False, "LC: AI-rejected", "red")):
+            sub = scored[scored["ai_validated"] == keep]
+            if len(sub):
+                pts = np.asarray([np.asarray(c, float) for c in sub["coords"]])
+                self.viewer.add_points(pts, name=name, size=6, face_color=color,
+                                       scale=vs, opacity=0.9)
+
+    def _table_tsv(self, whole: bool) -> str:
+        """The table as tab-separated text (header + rows). ``whole`` ignores the
+        selection and copies every row."""
+        cols = self.table.columnCount()
+        rows = self.table.rowCount()
+        headers = [self.table.horizontalHeaderItem(c).text() if self.table.horizontalHeaderItem(c)
+                   else "" for c in range(cols)]
+        sel_rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
+        want = range(rows) if (whole or not sel_rows) else sel_rows
+        out = ["\t".join(headers)]
+        for r in want:
+            cells = []
+            for c in range(cols):
+                it = self.table.item(r, c)
+                cells.append(it.text() if it is not None else "")
+            out.append("\t".join(cells))
+        return "\n".join(out)
+
+    def _copy_table_tsv(self, whole: bool = False):
+        if self.table.rowCount() == 0:
+            return
+        QApplication.clipboard().setText(self._table_tsv(whole))
+        n = self.table.rowCount() if (whole or not self.table.selectedIndexes()) else \
+            len({idx.row() for idx in self.table.selectedIndexes()})
+        self._set_status(f"📋 Copied {n} rows — paste into Excel.")
+
+    def _export_table_xlsx(self):
+        """Save the current table (with manual AI edits) to an .xlsx file."""
+        cdf = self._cilia_df_view
+        if cdf is None or cdf.empty:
+            show_warning("No cilia table to export — run “Assign & classify” first.")
+            return
+        from qtpy.QtWidgets import QFileDialog
+        default = str(Path(str(self.output.value or ".")) / "cilia_table.xlsx")
+        path, _ = QFileDialog.getSaveFileName(
+            self.table, "Export cilia table", default, "Excel (*.xlsx)")
+        if not path:
+            return
+        cols = [c for c in self._table_cols if c in cdf.columns]
+        try:
+            cdf[cols].to_excel(path, index=False)
+            self._set_status(f"💾 Exported {len(cdf)} cilia → {Path(path).name}")
+            show_info(f"Saved cilia table → {path}")
+        except Exception as e:                  # noqa: BLE001
+            show_warning(f"Export failed: {e}")
 
     def _on_cilia_selection(self, event=None):
         """napari point selection → highlight matching table rows."""
