@@ -1486,6 +1486,13 @@ with st.sidebar:
         "Keep if AI score ≥", 0.50, 0.99, 0.50, 0.01, key="ai_threshold",
         disabled=not (_ai_models and ai_validate))
 
+    roi_correct_display = st.checkbox(
+        "Correct/normalise ROI display (off = raw intensities)", value=False,
+        key="roi_correct_display",
+        help="On = object-aware contrast + gamma for the per-cilium ROI "
+             "thumbnails. Off = raw intensities (plain min-max)."
+    )
+
     st.markdown("---")
 
     # ── ⚡ Post-Segmentation Filters ──────────────────────────────────────────
@@ -1579,6 +1586,7 @@ if run_clicked:
                             if ai_validate and ai_model_name.endswith(".pt")
                             else None),
             batch_ai_threshold=float(ai_threshold),
+            roi_correct_display=bool(roi_correct_display),
             nuclei_spot_sigma=nuclei_sigma,
             tophat_radius=tophat_radius,
             neurite_spot_sigma=neurite_sigma,

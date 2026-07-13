@@ -1,0 +1,7 @@
+# ffmpeg concat manifest — stitch the four clips into one reel.
+# Render all four at -qh first, then:
+#   ffmpeg -f concat -safe 0 -i concat.txt -c copy out/reel.mp4
+file 'out/videos/01_overview/1080p60/PipelineOverview.mp4'
+file 'out/videos/02_iso_mip/1080p60/IsoAndMIP.mp4'
+file 'out/videos/03_apoc/1080p60/ApocPixelClassifier.mp4'
+file 'out/videos/04_cnn_heatmap/1080p60/CnnAndHeatmap.mp4'
