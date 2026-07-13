@@ -694,7 +694,8 @@ def run_pipeline3(
                                    f"{os.path.splitext(fn)[0]}_cilia{cid}.png")
                       for fn, cid in _keys]
             _probs = predict_proba(_ai_model, _paths,
-                                   size=int(_ai_meta.get("size", 64)))
+                                   size=int(_ai_meta.get("size", 64)),
+                                   normalize=_ai_meta.get("normalize"))
             _hv = [{"filename": fn, "cilia_id": cid,
                     "human_validated": bool(p >= batch_ai_threshold),
                     "ai_score": float(p)}

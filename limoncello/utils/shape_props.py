@@ -16,6 +16,51 @@ SHAPE_COLS = [
 ]
 
 
+def cilia_axis_endpoints(labels, voxel_size) -> dict[int, dict]:
+    """Per-cilium major axis + extremities, for axis-directed BB pairing.
+
+    Runs PCA on each label's voxels (in physical µm space) to get the principal
+    (major) axis ``u``; the voxels with the smallest / largest projection onto
+    ``u`` are the two extremities. Returns, per label id::
+
+        {"axis":  (uz, uy, ux)  unit vector (µm space),
+         "end_a": (z, y, x)     extremity voxel index (min projection),
+         "end_b": (z, y, x)     extremity voxel index (max projection),
+         "end_a_um": (z, y, x) µm,  "end_b_um": (z, y, x) µm}
+
+    The outward direction at ``end_a`` is ``-axis`` and at ``end_b`` is ``+axis``.
+    """
+    from skimage.measure import regionprops
+
+    lab = np.asarray(labels)
+    out: dict[int, dict] = {}
+    if lab.size == 0 or lab.max() == 0:
+        return out
+    vs = np.asarray(voxel_size, dtype=float)
+    for r in regionprops(lab):
+        pts = np.asarray(r.coords, dtype=float)           # (N, 3) voxel idx
+        if pts.shape[0] == 0:
+            continue
+        pum = pts * vs                                    # physical µm
+        m = pum.mean(axis=0)
+        if pts.shape[0] >= 2:
+            # First right-singular vector = principal (major) axis direction.
+            _, _, vt = np.linalg.svd(pum - m, full_matrices=False)
+            u = vt[0]
+            nrm = np.linalg.norm(u)
+            u = u / nrm if nrm > 0 else np.array([0.0, 0.0, 1.0])
+        else:
+            u = np.array([0.0, 0.0, 1.0])
+        t = (pum - m) @ u
+        ia, ib = int(np.argmin(t)), int(np.argmax(t))
+        out[int(r.label)] = {
+            "axis": u,
+            "end_a": pts[ia], "end_b": pts[ib],
+            "end_a_um": pum[ia], "end_b_um": pum[ib],
+        }
+    return out
+
+
 def _voxel_face_area(mask: np.ndarray, vs) -> float:
     """Exposed-face (staircase) surface area of a 3-D binary mask. Robust but
     overestimates curved surfaces (~0.66 sphericity for a digital ball)."""

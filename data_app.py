@@ -821,9 +821,10 @@ for _i, _r in enumerate(_runs, 1):
 
 
 (tab_over, tab_screen, tab_dist, tab_scatter, tab_inter, tab_corr,
- tab_table, tab_qc, tab_validate, tab_report) = st.tabs(
+ tab_table, tab_qc, tab_validate, tab_boxes, tab_report) = st.tabs(
     [":material/biotech: Overlays", ":material/person_search: Screening", ":material/bar_chart: Hist / KDE", ":material/scatter_plot: Scatter", ":material/bolt: Interactive",
-     ":material/link: Correlation", ":material/list_alt: Data table", ":material/monitor_heart: QC", ":material/handshake: Validation", ":material/description: Report"]
+     ":material/link: Correlation", ":material/list_alt: Data table", ":material/monitor_heart: QC", ":material/handshake: Validation",
+     ":material/select_all: Box GT", ":material/description: Report"]
 )
 
 _run_dir_by_label = {r["label"]: r["dir"] for r in _runs}
@@ -1337,7 +1338,8 @@ with tab_screen:
                             from limoncello.ml.roi_validator import predict_proba
                             _probs = predict_proba(
                                 _clf["model"], [p for _, p in _cand],
-                                size=_clf.get("size", 64))
+                                size=_clf.get("size", 64),
+                                normalize=_clf.get("normalize"))
                             st.session_state["ai_preds"] = {
                                 "tks": [tk for tk, _ in _cand],
                                 "paths": [p for _, p in _cand],
@@ -2577,6 +2579,9 @@ def _validation_compare(label, merged, hand_col, pipe_col, unit=""):
         ax.set_xlim(_lim); ax.set_ylim(_lim)
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlabel("hand"); ax.set_ylabel("pipeline")
+        _r2 = "—" if np.isnan(r) else f"{r**2:.2f}"
+        ax.text(0.05, 0.95, f"$R^2$ = {_r2}", transform=ax.transAxes,
+                va="top", ha="left", fontsize=9, fontweight="bold")
         ax.set_title("correlation", fontsize=9)
         fig.tight_layout()
         st.pyplot(fig, use_container_width=True)
@@ -2595,28 +2600,71 @@ def _validation_compare(label, merged, hand_col, pipe_col, unit=""):
         plt.close(fig2)
 
 
+def parse_boxes_as_hand(src) -> pd.DataFrame:
+    """Aggregate the annotator's per-cilia box Excel into the same per-sample
+    columns ``parse_hand_analysis`` yields, so the box file can drive this tab:
+    ``hand_cilia`` = boxes/sample, ``hand_on_soma``/``hand_on_neurite`` from the
+    box class. Nucleus counts aren't available from boxes (left NaN)."""
+    try:
+        b = pd.read_excel(src, sheet_name="cilia_boxes")
+    except Exception:                                     # noqa: BLE001
+        b = pd.read_excel(src, sheet_name=0)
+    if b.empty or "filename" not in b.columns:
+        return pd.DataFrame()
+    b = b.copy()
+    b["stem"] = b["filename"].apply(_img_stem)
+    b["class"] = (b["class"].astype(str).str.strip().str.lower()
+                  if "class" in b.columns else "uncertain")
+    g = b.groupby("stem")
+    out = pd.DataFrame({
+        "hand_cilia": g.size(),
+        "hand_on_soma": g["class"].apply(lambda s: int((s == "soma").sum())),
+        "hand_on_neurite": g["class"].apply(lambda s: int((s == "neurite").sum())),
+    }).reset_index()
+    out["filename"] = out["stem"]
+    out["hand_nuclei"] = np.nan
+    return out
+
+
 with tab_validate:
     st.subheader(":material/handshake: Validate pipeline vs hand analysis")
-    st.caption("Load a per-sample hand-count Excel and compare it to the pipeline "
-               "(matched by filename). Validates cilia counts, the estimated "
-               "nucleus count, and the soma / neurite split.")
+    st.caption("Compare the pipeline to ground truth (matched by filename). Use a "
+               "per-sample hand-count Excel, or the per-cilia box Excel from the "
+               "napari annotator (aggregated to per-sample counts).")
 
-    _up = st.file_uploader("Hand-analysis Excel (.xlsx)", type=["xlsx"],
-                           key="val_upload")
-    _default_hand = os.path.join("hand-analysis", "d38-hand-analysis.xlsx")
+    _val_mode = st.radio(
+        "Ground-truth source",
+        ["Per-sample hand counts", "Per-cilia boxes (annotator)"],
+        horizontal=True, key="val_mode")
+    _box_mode = _val_mode.startswith("Per-cilia")
+
+    _up = st.file_uploader(
+        "Per-cilia box Excel (.xlsx)" if _box_mode else "Hand-analysis Excel (.xlsx)",
+        type=["xlsx"], key="val_upload")
     _src = _up
-    if _up is None and os.path.exists(_default_hand):
-        st.caption(f"No file uploaded — using `{_default_hand}`.")
-        _src = _default_hand
+    if _box_mode:
+        if _up is None and st.session_state.get("_box_path"):
+            _src = st.session_state["_box_path"]
+            st.caption(f"No file uploaded — using the Box-GT tab path `{_src}`.")
+    else:
+        _default_hand = os.path.join("hand-analysis", "d38-hand-analysis.xlsx")
+        if _up is None and os.path.exists(_default_hand):
+            st.caption(f"No file uploaded — using `{_default_hand}`.")
+            _src = _default_hand
 
     if _src is None:
-        st.info("Upload a hand-analysis Excel to begin.")
+        st.info("Upload a ground-truth Excel to begin.")
     else:
         try:
-            _hand = parse_hand_analysis(_src)
+            _hand = (parse_boxes_as_hand(_src) if _box_mode
+                     else parse_hand_analysis(_src))
         except Exception as _exc:                         # noqa: BLE001
-            st.error(f"Could not read the hand-analysis file: {_exc}")
+            st.error(f"Could not read the ground-truth file: {_exc}")
             _hand = pd.DataFrame()
+
+        if _box_mode and not _hand.empty:
+            st.caption("Box mode: `hand_cilia` = boxes/sample; on-soma / on-neurite "
+                       "from the box class; nucleus counts unavailable.")
 
         if _hand.empty:
             st.warning("No rows parsed from the hand-analysis file.")
@@ -2765,6 +2813,465 @@ with tab_validate:
                     ":material/download: Download comparison (CSV)",
                     _tbl.to_csv(index=False).encode(),
                     "pipeline_vs_hand.csv", "text/csv", key="dl_validation")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB — BOX GROUND TRUTH (per-cilia comparison vs hand-drawn bounding boxes)
+# ─────────────────────────────────────────────────────────────────────────────
+# Boxes come from ``napari_annotator_app.py`` (sheet ``cilia_boxes``): one row
+# per hand-drawn box with pixel y/x bounds + a manual class. A detected cilium
+# (its centroid projected onto the XY MIP) is scored against these boxes so we
+# can measure which cilia the pipeline misses and which it misclassifies.
+_ANNOT_SHEET = "cilia_boxes"
+_ANNOT_CLASSES = ["neurite", "soma", "uncertain"]
+
+# The pipeline's "ambiguous" class is the same thing as the annotator's
+# "uncertain" — treat them as equal when scoring agreement.
+_CLS_ALIAS = {"ambiguous": "uncertain"}
+
+
+def _cls_norm(c) -> str:
+    c = str(c).strip().lower()
+    return _CLS_ALIAS.get(c, c)
+
+
+def _cls_eq(a, b) -> bool:
+    return _cls_norm(a) == _cls_norm(b)
+
+
+@st.cache_data(show_spinner=False)
+def parse_annotation_boxes(src) -> pd.DataFrame:
+    """Read the annotator Excel into tidy per-box rows (adds a ``stem`` column)."""
+    try:
+        df = pd.read_excel(src, sheet_name=_ANNOT_SHEET)
+    except Exception:                                         # noqa: BLE001
+        df = pd.read_excel(src, sheet_name=0)                 # sheet-name fallback
+    if df.empty or "filename" not in df.columns:
+        return pd.DataFrame()
+    df = df.copy()
+    df["stem"] = df["filename"].apply(_img_stem)
+    if "class" in df.columns:
+        df["class"] = df["class"].astype(str).str.strip().str.lower()
+    return df
+
+
+def _box_scale(run_dir: str, stem: str, annot_h, annot_w):
+    """(scale_y, scale_x) mapping annotation pixels → the detected cilia MIP grid.
+
+    The annotator and pipeline may resample XY differently; rescale by the saved
+    MIP shape when available. Returns (1, 1) if the shape can't be recovered."""
+    mip = _load_sample_mip(run_dir, stem, "cilia")
+    if mip is None or not annot_h or not annot_w:
+        return 1.0, 1.0, (mip.shape if mip is not None else None)
+    try:
+        return (mip.shape[0] / float(annot_h),
+                mip.shape[1] / float(annot_w), mip.shape)
+    except Exception:                                         # noqa: BLE001
+        return 1.0, 1.0, None
+
+
+def match_detections_to_boxes(boxes: pd.DataFrame, yx, pred_cls, ids,
+                              scale=(1.0, 1.0)):
+    """Score detected cilia against hand-drawn boxes for one sample.
+
+    Returns (box_records, det_records):
+      • box_records — one per GT box: matched?, predicted class of the cilium
+        inside (nearest to box centre if several), so a missed box (no detection
+        inside) is a false negative for its class.
+      • det_records — one per detected cilium: gt_class of the box it falls in
+        (None → detection outside every box, i.e. a possible false positive).
+    """
+    sy, sx = scale
+    b = boxes.copy()
+    for c, s in (("y_min", sy), ("y_max", sy), ("x_min", sx), ("x_max", sx)):
+        if c in b.columns:
+            b[c] = pd.to_numeric(b[c], errors="coerce") * s
+    box_rows = b.to_dict("records")
+
+    det_records = []
+    contained = {i: [] for i in range(len(box_rows))}    # box idx → [det idx]
+    for di, ((y, x), pc, cid) in enumerate(zip(yx, pred_cls, ids)):
+        hit = None
+        for bi, br in enumerate(box_rows):
+            if (br["y_min"] <= y <= br["y_max"]) and (br["x_min"] <= x <= br["x_max"]):
+                hit = bi
+                contained[bi].append(di)
+                break
+        det_records.append(dict(
+            cilia_id=cid, y=y, x=x, pred_class=str(pc),
+            gt_class=(str(box_rows[hit].get("class", "uncertain")) if hit is not None else None),
+            in_box=hit is not None))
+
+    box_records = []
+    for bi, br in enumerate(box_rows):
+        dets = contained[bi]
+        pred = None
+        if dets:
+            # Nearest detection to the box centre decides the predicted class.
+            cy = (br["y_min"] + br["y_max"]) / 2.0
+            cx = (br["x_min"] + br["x_max"]) / 2.0
+            nearest = min(dets, key=lambda di: (yx[di][0] - cy) ** 2
+                          + (yx[di][1] - cx) ** 2)
+            pred = str(pred_cls[nearest])
+        box_records.append(dict(
+            box_id=br.get("box_id", bi + 1),
+            gt_class=str(br.get("class", "uncertain")),
+            matched=bool(dets), n_inside=len(dets), pred_class=pred))
+    return box_records, det_records
+
+
+with tab_boxes:
+    st.subheader(":material/select_all: Per-cilia comparison vs hand-drawn boxes")
+    st.caption("Load the Excel written by the napari **annotator** app. Each "
+               "detected cilium (centroid on the XY MIP) is matched to your "
+               "boxes — so you can see which cilia the pipeline **misses** and "
+               "which it **misclassifies**. Matched by filename stem.")
+
+    _bup = st.file_uploader("Annotation Excel (.xlsx)", type=["xlsx"],
+                            key="box_upload")
+    _box_path = st.text_input(
+        "…or path to annotation Excel",
+        value=st.session_state.get("_box_path", ""), key="box_path_in")
+    st.session_state["_box_path"] = _box_path
+    _bsrc = _bup if _bup is not None else (_box_path or None)
+
+    if not _bsrc:
+        st.info("Upload or point to a `cilia_annotations.xlsx` to begin.")
+    elif "coords" not in _cilia_full.columns:
+        st.warning("Detected cilia have no `coords` column — cannot match boxes.")
+    else:
+        _boxes_all = parse_annotation_boxes(_bsrc)
+        if _boxes_all.empty:
+            st.error("No boxes found in that file (expected sheet "
+                     f"`{_ANNOT_SHEET}` with a `filename` column).")
+        else:
+            _run_labels = [r["label"] for r in _runs]
+            _sel_label = st.selectbox("Run", _run_labels, key="box_run")
+            _sel_dir = _run_dir_by_label[_sel_label]
+
+            # Compare only cilia the run actually keeps: AI-validated or manually
+            # confirmed (human_validated == True). Rejected detections are not
+            # the pipeline's output, so scoring them against GT is misleading.
+            _only_conf = st.checkbox(
+                "Only compare AI/manually confirmed cilia", value=True,
+                key="box_only_conf",
+                help="Keep detections with human_validated = True (AI-validated or "
+                     "manually kept in the Screening tab). Rejected cilia are dropped.")
+
+            # Only samples that appear both in the boxes and in this run.
+            _det_run = _cilia_full[_cilia_full["run"] == _sel_label].copy()
+            if _only_conf and "human_validated" in _det_run.columns:
+                _n_all = len(_det_run)
+                _det_run = _det_run[_det_run["human_validated"].astype(bool)]
+                st.caption(f"Kept {len(_det_run)} / {_n_all} confirmed detections "
+                           "in this run.")
+            _det_run["stem"] = _det_run["filename"].apply(lambda f: Path(str(f)).stem)
+            _common = sorted(set(_boxes_all["stem"]) & set(_det_run["stem"]))
+            _only_box = sorted(set(_boxes_all["stem"]) - set(_det_run["stem"]))
+            if _only_box:
+                st.caption(f"{len(_only_box)} annotated sample(s) have no detections "
+                           f"in this run (skipped): {', '.join(_only_box[:6])}"
+                           + (" …" if len(_only_box) > 6 else ""))
+            if not _common:
+                st.warning("No filename-stem overlap between the boxes and this "
+                           "run's detected cilia.")
+            else:
+                _all_box_rec, _all_det_rec = [], []
+                _shape_warned = False
+                for _stem in _common:
+                    _bx = _boxes_all[_boxes_all["stem"] == _stem]
+                    _dt = _det_run[_det_run["stem"] == _stem]
+                    _yx = _parse_coords_yx(_dt["coords"])
+                    _pred = list(_dt["class"]) if "class" in _dt.columns else \
+                        ["ambiguous"] * len(_dt)
+                    _ids = list(_dt["cilia_id"]) if "cilia_id" in _dt.columns else \
+                        list(range(len(_dt)))
+                    _ah = _bx.iloc[0].get("img_height")
+                    _aw = _bx.iloc[0].get("img_width")
+                    _sy, _sx, _mshape = _box_scale(_sel_dir, _stem, _ah, _aw)
+                    if _mshape is None and not _shape_warned:
+                        st.caption(":material/warning: No saved cilia MIP found — "
+                                   "assuming boxes and detections share the same "
+                                   "pixel grid (no rescaling).")
+                        _shape_warned = True
+                    _brec, _drec = match_detections_to_boxes(
+                        _bx, _yx, _pred, _ids, scale=(_sy, _sx))
+                    for _r in _brec:
+                        _r["stem"] = _stem
+                    for _r in _drec:
+                        _r["stem"] = _stem
+                    _all_box_rec += _brec
+                    _all_det_rec += _drec
+
+                _bdf = pd.DataFrame(_all_box_rec)
+                _ddf = pd.DataFrame(_all_det_rec)
+
+                # ── Headline detection metrics ─────────────────────────────────
+                _n_gt = len(_bdf)
+                _n_matched = int(_bdf["matched"].sum()) if _n_gt else 0
+                _n_missed = _n_gt - _n_matched
+                _n_det = len(_ddf)
+                _n_fp = int((~_ddf["in_box"]).sum()) if _n_det else 0
+                _recall = _n_matched / _n_gt if _n_gt else float("nan")
+                _prec = (_n_det - _n_fp) / _n_det if _n_det else float("nan")
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("GT boxes", _n_gt)
+                m2.metric("Missed (FN)", _n_missed,
+                          help="Hand-drawn boxes with no detected cilium inside.")
+                m3.metric("Recall", "—" if np.isnan(_recall) else f"{_recall:.0%}")
+                m4.metric("False positives", _n_fp,
+                          help="Detected cilia falling outside every box.")
+
+                # ── Misses by GT class (what type do we miss?) ─────────────────
+                st.markdown("#### What do we miss?")
+                _miss = _bdf.groupby("gt_class")["matched"].agg(
+                    n="count", found="sum")
+                _miss["missed"] = _miss["n"] - _miss["found"]
+                _miss["recall"] = (_miss["found"] / _miss["n"]).map(
+                    lambda v: f"{v:.0%}")
+                st.dataframe(_miss.reset_index()[["gt_class", "n", "found",
+                             "missed", "recall"]], use_container_width=True,
+                             hide_index=True)
+
+                # ── Confusion: GT class × predicted class (matched boxes only) ─
+                st.markdown("#### Misclassification (matched cilia)")
+                _mm = _bdf[_bdf["matched"]]
+                if _mm.empty:
+                    st.caption("No matched boxes to build a confusion matrix.")
+                else:
+                    _conf = pd.crosstab(_mm["gt_class"], _mm["pred_class"])
+                    st.dataframe(_conf, use_container_width=True)
+                    _correct = int(sum(_cls_eq(g, p) for g, p in
+                                       zip(_mm["gt_class"], _mm["pred_class"])))
+                    _acc = _correct / len(_mm)
+                    st.caption(f"Class accuracy on matched cilia: **{_acc:.0%}** "
+                               f"({_correct}/{len(_mm)}). Rows = your label, "
+                               "columns = pipeline class. Pipeline *ambiguous* is "
+                               "counted as manual *uncertain*.")
+
+                # ── Per-sample breakdown + downloads ───────────────────────────
+                with st.expander(":material/table: Per-sample breakdown", expanded=False):
+                    _ps = _bdf.groupby("stem")["matched"].agg(
+                        boxes="count", found="sum").reset_index()
+                    _ps["missed"] = _ps["boxes"] - _ps["found"]
+                    _fp_ps = _ddf.groupby("stem")["in_box"].agg(
+                        detections="count",
+                        fp=lambda s: int((~s).sum())).reset_index()
+                    _ps = _ps.merge(_fp_ps, on="stem", how="outer")
+                    st.dataframe(_ps, use_container_width=True, hide_index=True)
+
+                c1, c2 = st.columns(2)
+                c1.download_button(
+                    ":material/download: Per-box results (CSV)",
+                    _bdf.to_csv(index=False).encode(),
+                    "box_gt_per_box.csv", "text/csv", key="dl_box_gt")
+                c2.download_button(
+                    ":material/download: Per-detection results (CSV)",
+                    _ddf.to_csv(index=False).encode(),
+                    "box_gt_per_detection.csv", "text/csv", key="dl_det_gt")
+
+                # ── Per-cilia plots (one point = one detected cilium) ──────────
+                st.markdown("#### Per-cilia plots")
+                # Attach each detection's pipeline metrics to its match outcome.
+                _mcols = [c for c in _det_run.select_dtypes(include=[np.number]).columns
+                          if c != "cilia_id"]
+                _join = ["stem", "cilia_id"] + _mcols + (
+                    ["filename"] if "filename" in _det_run.columns else [])
+                _pcm = _ddf.merge(_det_run[_join], on=["stem", "cilia_id"], how="left")
+                _pcm["gt_class"] = _pcm["gt_class"].fillna("(no box)")
+                _pcm["match"] = [
+                    ("outside box" if not ib else
+                     ("correct" if _cls_eq(g, p) else "misclassified"))
+                    for ib, g, p in zip(_pcm["in_box"], _pcm["gt_class"],
+                                        _pcm["pred_class"])]
+                if _pcm.empty or not _mcols:
+                    st.caption("No per-cilia metrics available to plot.")
+                else:
+                    pc1, pc2, pc3 = st.columns(3)
+                    _sub = pc1.selectbox(
+                        "Cilia", ["matched (in box)", "all detected", "outside boxes"],
+                        key="pcp_sub")
+                    _colby = pc2.selectbox("Colour by",
+                                           ["gt_class", "pred_class", "match"],
+                                           key="pcp_col")
+                    _kind = pc3.selectbox("Plot",
+                                          ["Strip by class", "Scatter (2 metrics)"],
+                                          key="pcp_kind")
+                    _d = _pcm.copy()
+                    if _sub.startswith("matched"):
+                        _d = _d[_d["in_box"]]
+                    elif _sub.startswith("outside"):
+                        _d = _d[~_d["in_box"]]
+
+                    def _mi(name, default=0):
+                        return _mcols.index(name) if name in _mcols else default
+
+                    if _d.empty:
+                        st.caption("No cilia in this subset.")
+                    elif _kind.startswith("Strip"):
+                        _y = st.selectbox("Metric (y)", _mcols,
+                                          index=_mi("log_ratio"), key="pcp_y1")
+                        _xcat = st.selectbox("Group on x",
+                                             ["gt_class", "pred_class", "match"],
+                                             key="pcp_xcat")
+                        fig, ax = plt.subplots(figsize=(5.5, 3.6))
+                        sns.stripplot(data=_d, x=_xcat, y=_y, hue=_colby, ax=ax,
+                                      size=4, alpha=0.75, jitter=0.25,
+                                      dodge=_colby != _xcat, legend=_colby != _xcat)
+                        _draw_mean_bars(ax, _d, _xcat, _y)
+                        ax.set_title(f"{_y} per {_xcat}  (n={len(_d)} cilia)", fontsize=9)
+                        _tidy_legend(ax)
+                        _show_and_export(fig, f"per_cilia_{_y}_by_{_xcat}", "pcp_strip")
+                    else:
+                        sc1, sc2 = st.columns(2)
+                        _x = sc1.selectbox("X", _mcols, index=_mi("dt_neurite_um"),
+                                           key="pcp_x2")
+                        _y = sc2.selectbox("Y", _mcols, index=_mi("log_ratio"),
+                                           key="pcp_y2")
+                        fig, ax = plt.subplots(figsize=(5.5, 4.2))
+                        sns.scatterplot(data=_d, x=_x, y=_y, hue=_colby, ax=ax,
+                                        s=32, alpha=0.8, edgecolor="white",
+                                        linewidth=0.3)
+                        _xv = pd.to_numeric(_d[_x], errors="coerce").to_numpy(float)
+                        _yv = pd.to_numeric(_d[_y], errors="coerce").to_numpy(float)
+                        _ok = np.isfinite(_xv) & np.isfinite(_yv)
+                        if _ok.sum() > 1 and _xv[_ok].std() and _yv[_ok].std():
+                            _rr = np.corrcoef(_xv[_ok], _yv[_ok])[0, 1]
+                            ax.text(0.05, 0.95, f"$R^2$ = {_rr**2:.2f}",
+                                    transform=ax.transAxes, va="top", ha="left",
+                                    fontsize=9, fontweight="bold")
+                        ax.set_title(f"{_y} vs {_x}  (n={len(_d)} cilia)", fontsize=9)
+                        _tidy_legend(ax)
+                        _show_and_export(fig, f"per_cilia_{_y}_vs_{_x}", "pcp_scatter")
+
+                # ── Interactive: manual class × pipeline class (click → ROI) ───
+                st.markdown("#### Interactive: manual vs pipeline class")
+                if not _PLOTLY:
+                    st.info("Install plotly for the interactive view: `pip install plotly`")
+                elif _pcm.empty:
+                    st.caption("No detections to plot.")
+                else:
+                    st.caption("Each point is one cilium, placed at (manual box class, "
+                               "pipeline class) with jitter. Off-diagonal = "
+                               "misclassified. **Click a point** to see its ROI.")
+                    _gt_order = ["neurite", "soma", "uncertain", "(no box)"]
+                    _pd_order = ["neurite", "soma", "ambiguous"]
+                    _gt_cats = _gt_order + sorted(
+                        set(_pcm["gt_class"].astype(str)) - set(_gt_order))
+                    _pd_cats = _pd_order + sorted(
+                        set(_pcm["pred_class"].astype(str)) - set(_pd_order))
+                    _gi = {c: i for i, c in enumerate(_gt_cats)}
+                    _pi = {c: i for i, c in enumerate(_pd_cats)}
+                    _pf = _pcm.copy()
+                    _pf["_run"] = _sel_label
+                    if "filename" not in _pf.columns:
+                        _pf["filename"] = _pf["stem"]
+                    _rng = np.random.default_rng(0)
+                    _pf["manual_class"] = _pf["gt_class"].astype(str)
+                    _pf["pipeline_class"] = _pf["pred_class"].astype(str)
+                    _pf["_gx"] = [_gi[c] + _rng.uniform(-0.18, 0.18)
+                                  for c in _pf["manual_class"]]
+                    _pf["_py"] = [_pi[c] + _rng.uniform(-0.18, 0.18)
+                                  for c in _pf["pipeline_class"]]
+
+                    _color_opts = ["match", "stem", "manual_class", "pipeline_class"]
+                    _icolor = st.selectbox("Colour by", _color_opts, key="box_i_color")
+                    _match_cmap = {"correct": "#32CD32", "misclassified": "#e74c3c",
+                                   "outside box": "#95a5a6"}
+                    _cmap = (_CLASS_PALETTE if _icolor in
+                             ("manual_class", "pipeline_class")
+                             else _match_cmap if _icolor == "match" else None)
+                    _cd = ["_run", "filename", "cilia_id"]
+                    _hover = {c: True for c in
+                              ("stem", "match", "log_ratio", "cilia_id",
+                               "dt_nuclei_um", "dt_neurite_um")
+                              if c in _pf.columns}
+                    _hover["_gx"] = False
+                    _hover["_py"] = False
+                    fig = px.scatter(
+                        _pf, x="_gx", y="_py", color=_icolor,
+                        color_discrete_map=_cmap, custom_data=_cd, hover_data=_hover,
+                        opacity=0.8, template="simple_white")
+                    fig.update_traces(marker=dict(size=9, line=dict(width=0.4,
+                                                                    color="white")))
+                    fig.update_xaxes(tickvals=list(range(len(_gt_cats))),
+                                     ticktext=_gt_cats, title="manual (box) class",
+                                     range=[-0.5, len(_gt_cats) - 0.5])
+                    fig.update_yaxes(tickvals=list(range(len(_pd_cats))),
+                                     ticktext=_pd_cats, title="pipeline class",
+                                     range=[-0.5, len(_pd_cats) - 0.5])
+                    fig.update_layout(height=520, legend_title_text=_icolor,
+                                      margin=dict(l=10, r=10, t=30, b=10))
+
+                    _pcol, _rcol = st.columns([3, 1])
+                    with _pcol:
+                        try:
+                            _ev = st.plotly_chart(
+                                fig, use_container_width=True, on_select="rerun",
+                                selection_mode="points", key="box_iplot")
+                        except TypeError:
+                            st.plotly_chart(fig, use_container_width=True)
+                            _ev = None
+                    _sel = []
+                    if _ev is not None:
+                        try:
+                            _sel = _ev.selection["points"]
+                        except Exception:                         # noqa: BLE001
+                            _sel = []
+                    with _rcol:
+                        if _sel:
+                            info = dict(zip(_cd, _sel[0].get("customdata") or []))
+                            st.markdown(f"**cilia {info.get('cilia_id')}**  ·  "
+                                        f"{info.get('filename', '')}")
+                            _npz = _roi_npz_path(_sel_label, info.get("filename"),
+                                                 info.get("cilia_id"))
+                            _multi = _roi_multichannel_png(_npz)
+                            if _multi is not None:
+                                st.image(_multi, use_container_width=True)
+                                st.caption(":green[:material/circle:] cilia · "
+                                           ":violet[:material/circle:] basal body · "
+                                           ":blue[:material/circle:] nuclei · cyan neurite")
+                            else:
+                                _p = _roi_png_path(_sel_label, info.get("filename"),
+                                                   info.get("cilia_id"))
+                                st.image(_p, use_container_width=True) if _p else \
+                                    st.caption("No ROI saved for this cilium.")
+                        else:
+                            st.caption("Click a point to preview its ROI.")
+
+                # ── Overlay boxes + detections on the sample MIP ───────────────
+                st.markdown("#### Visual check")
+                _vstem = st.selectbox("Sample", _common, key="box_vstem")
+                _cil_mip = _load_sample_mip(_sel_dir, _vstem, "cilia")
+                if _cil_mip is None:
+                    st.caption("No saved cilia MIP for this sample to draw on.")
+                else:
+                    _bx = _boxes_all[_boxes_all["stem"] == _vstem]
+                    _ah = _bx.iloc[0].get("img_height")
+                    _aw = _bx.iloc[0].get("img_width")
+                    _sy, _sx, _ = _box_scale(_sel_dir, _vstem, _ah, _aw)
+                    _dt = _det_run[_det_run["stem"] == _vstem]
+                    _yx = _parse_coords_yx(_dt["coords"])
+                    fig, ax = plt.subplots(figsize=(6, 6))
+                    ax.imshow(_cil_mip, cmap="gray",
+                              vmax=np.percentile(_cil_mip, 99.5) or 1)
+                    for _, _r in _bx.iterrows():
+                        y0 = _r["y_min"] * _sy; x0 = _r["x_min"] * _sx
+                        h = (_r["y_max"] - _r["y_min"]) * _sy
+                        w = (_r["x_max"] - _r["x_min"]) * _sx
+                        _col = _CLASS_PALETTE.get(str(_r.get("class")), "#f39c12")
+                        ax.add_patch(plt.Rectangle((x0, y0), w, h, fill=False,
+                                     edgecolor=_col, linewidth=1.6))
+                    if _yx:
+                        _ys = [p[0] for p in _yx]; _xs = [p[1] for p in _yx]
+                        ax.scatter(_xs, _ys, s=18, facecolor="none",
+                                   edgecolor="cyan", linewidth=1.0)
+                    ax.set_axis_off()
+                    ax.set_title(f"{_vstem} — boxes (class colour) + detections (cyan)",
+                                 fontsize=9)
+                    st.pyplot(fig, use_container_width=True)
+                    plt.close(fig)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

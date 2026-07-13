@@ -38,6 +38,7 @@ from __future__ import annotations
 import os
 import hashlib
 import tempfile
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -66,6 +67,7 @@ from limoncello.ml.roi_validator import (
     ROINetBig, TinyROINet, load_bundle, DEFAULT_SIZE, get_device,
 )
 from limoncello.analysis.pair_cilia_to_bb import parse_coords_string
+from limoncello.utils.app_helpers import load_run_json
 
 _DEFAULT_CLASSIFIER = str(
     (Path(__file__).parent / "segmenters" / "Cilia-d38-3D.cl").resolve()
@@ -360,6 +362,74 @@ def heatmap_peaks_to_image_xy(rc: np.ndarray, stride: float, in_scale: float,
     return yx / max(in_scale, 1e-6)
 
 
+CILIAI_DEFAULT_URL = "http://localhost:5007"
+
+
+def _rgb_to_png_bytes(rgb: np.ndarray) -> bytes:
+    """``(3, H, W)`` float [0,1] → PNG bytes (``H, W, 3`` uint8)."""
+    from PIL import Image
+    import io
+    img = (np.clip(np.transpose(rgb, (1, 2, 0)), 0.0, 1.0) * 255).astype(np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(img).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def ciliai_detect_centres(rgb: np.ndarray, server_url: str,
+                          score_thr: float = 0.5, timeout: float = 180.0
+                          ) -> tuple[np.ndarray, np.ndarray]:
+    """Detect cilia centres via a CiliAI (datamarkin/ciliai) detector server.
+
+    POSTs the whole-image RGB as a PNG in a multipart ``file`` field to
+    ``<server_url>/predict/cilia-detector`` and turns every returned object with
+    ``bbox_score >= score_thr`` into its bbox centre. CiliAI reports boxes in the
+    **uploaded image's** pixel space, so — when ``rgb`` is built at input scale
+    1.0 — the centres are already native image pixels (no rescale needed).
+
+    Returns ``(centres_yx (N,2), scores (N,))``. Uses only the Python stdlib for
+    the request (no ``requests``/``detectron2`` dependency in LimonCELLo — you run
+    the CiliAI Flask server separately)."""
+    import json
+    import urllib.request
+
+    png = _rgb_to_png_bytes(rgb)
+    boundary = "----LCciliai" + uuid.uuid4().hex
+    pre = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="image.png"\r\n'
+        f"Content-Type: image/png\r\n\r\n"
+    ).encode("utf-8")
+    post = f"\r\n--{boundary}--\r\n".encode("utf-8")
+    body = pre + png + post
+    url = server_url.rstrip("/") + "/predict/cilia-detector"
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                 "Content-Length": str(len(body))})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    objs = ((data or {}).get("predictions") or {}).get("objects") or []
+    ys, xs, sc = [], [], []
+    for o in objs:
+        try:
+            s = float(o.get("bbox_score", o.get("score", 1.0)))
+        except (TypeError, ValueError):
+            s = 1.0
+        if s < score_thr:
+            continue
+        b = o.get("bbox")
+        if not b or len(b) < 4:
+            continue
+        x0, y0, x1, y1 = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+        ys.append((y0 + y1) / 2.0)
+        xs.append((x0 + x1) / 2.0)
+        sc.append(s)
+    if not ys:
+        return np.empty((0, 2), float), np.empty((0,), float)
+    return np.column_stack([ys, xs]).astype(float), np.asarray(sc, float)
+
+
 def apoc_gated_by_centres(raw: np.ndarray, ch_cilia: int, classifier_path: str,
                           centres_yx: np.ndarray, gate_radius_px: float,
                           *, min_size: int, max_size: int):
@@ -437,16 +507,50 @@ def _stamp_gaussian(target: np.ndarray, gy: int, gx: int, sigma: float) -> None:
     np.maximum(sub, g.astype(np.float32), out=sub)
 
 
-def reconstruct_targets(run_dir: str, image_folder: str, p: dict,
+def run_file_map(run_dir: str) -> dict[str, str]:
+    """``{basename: full_path}`` for every input image of a finished run.
+
+    Rebuilt from the run's ``csv/run_parameters.json`` ``input_path`` exactly the
+    way the pipeline enumerated its inputs: a ``.txt`` manifest is read line by
+    line (blank / ``#`` lines skipped) so images scattered across folders resolve
+    to their real paths; otherwise the folder is listed for ``.ims`` files. The
+    keys are basenames because that's what ``filename`` is in the tables."""
+    j = load_run_json(run_dir)
+    if not j:
+        return {}
+    input_path = j.get("input_path")
+    if not input_path:
+        return {}
+    fmap: dict[str, str] = {}
+    if str(input_path).lower().endswith(".txt"):
+        try:
+            with open(input_path, encoding="utf-8") as fh:
+                for ln in fh:
+                    ln = ln.strip()
+                    if ln and not ln.lstrip().startswith("#"):
+                        fmap[os.path.basename(ln)] = ln
+        except OSError:
+            return {}
+    elif os.path.isdir(input_path):
+        for f in sorted(os.listdir(input_path)):
+            if f.endswith(".ims"):
+                fmap[f] = os.path.join(input_path, f)
+    return fmap
+
+
+def reconstruct_targets(run_dir: str, image_folder: str | None, p: dict,
                         log=print) -> list:
     """Reconstruct full-image training targets from a finished run.
 
     Reads the run's ``csv/all_cilia_features.xlsx`` (cilium coords per image) and
-    ``csv/human_validation.csv`` (keep/reject); for each image present in
-    ``image_folder`` it loads the volume (same isotropic loader as inference),
-    builds the whole-image RGB, and stamps every **kept** cilium as a Gaussian on
-    a 1/``stride`` target heatmap. Returns ``[(rgb (3,H,W), target (Hc,Wc),
-    filename, n_pos), …]``.
+    ``csv/human_validation.csv`` (keep/reject). Each image's raw volume is located
+    from the run's own **file list** (``run_parameters.json`` → the folder or
+    ``.txt`` manifest the run was computed from), so images spread across folders
+    still resolve; ``image_folder`` is only a fallback when a file isn't found in
+    that list. For each located image it loads the volume (same isotropic loader
+    as inference), builds the whole-image RGB, and stamps every **kept** cilium as
+    a Gaussian on a 1/``stride`` target heatmap. Returns ``[(rgb (3,H,W), target
+    (Hc,Wc), filename, n_pos), …]``.
     """
     import pandas as pd
     xls = os.path.join(run_dir, "csv", "all_cilia_features.xlsx")
@@ -462,13 +566,21 @@ def reconstruct_targets(run_dir: str, image_folder: str, p: dict,
         keep = {(str(r.filename), int(r.cilia_id)): bool(r.human_validated)
                 for r in v.itertuples()}
 
+    fmap = run_file_map(run_dir)
+    log(f"  run file list: {len(fmap)} image(s) from run_parameters.json")
+
     stride, sigma = int(p["stride"]), float(p["sigma"])
     crop = float(p.get("crop_factor", 0.5))
     samples = []
     for fn, g in df.groupby("filename"):
-        ipath = os.path.join(image_folder, str(fn))
-        if not os.path.exists(ipath):
-            log(f"  skip {fn} — image not in folder"); continue
+        # Prefer the run's own file list; fall back to the Image folder only when
+        # the file isn't listed there (or its recorded path no longer exists).
+        ipath = fmap.get(str(fn))
+        if not ipath or not os.path.exists(ipath):
+            ipath = (os.path.join(image_folder, str(fn))
+                     if image_folder else None)
+        if not ipath or not os.path.exists(ipath):
+            log(f"  skip {fn} — not in run file list or image folder"); continue
         loaded = cached_load(dict(p["load"], ims_path=ipath))
         rgb = build_fcn_input(loaded["raw"], p["ch_cilia"], p["ch_bb"], 1.0)
         _, h, w = rgb.shape
@@ -644,6 +756,14 @@ class LimoncelloCNNApp:
         self.detect_btn.clicked.connect(self._on_detect)
         self.detect_status = Label(value="—")
 
+        # Alternative detector: query a CiliAI (datamarkin/ciliai) Mask R-CNN
+        # server over HTTP for cilia boxes → centres (reuses "Peak threshold" as
+        # the box-score cutoff). Needs the image loaded (step ②); no FCN build.
+        self.ciliai_url = LineEdit(label="CiliAI server URL",
+                                   value=CILIAI_DEFAULT_URL)
+        self.ciliai_btn = PushButton(text="④′ Detect via CiliAI (HTTP)")
+        self.ciliai_btn.clicked.connect(self._on_ciliai_detect)
+
         self.classifier = FileEdit(label="APOC cilia .cl",
                                    value=_DEFAULT_CLASSIFIER, mode="r")
         self.cilia_min = SpinBox(label="Cilia min size", value=10, min=0, max=100000)
@@ -675,7 +795,8 @@ class LimoncelloCNNApp:
         self.det_status = Label(value="No detector trained/loaded.")
 
         self._buttons = [self.build_fcn_btn, self.load_btn, self.run_btn,
-                         self.cam_btn, self.sw_btn, self.detect_btn, self.apoc_btn,
+                         self.cam_btn, self.sw_btn, self.detect_btn,
+                         self.ciliai_btn, self.apoc_btn,
                          self.train_det_btn, self.load_det_btn, self.run_det_btn]
 
         return Container(widgets=[
@@ -691,6 +812,7 @@ class LimoncelloCNNApp:
             Label(value="<b>3 · Heatmap → centres</b>"),
             self.run_btn, self.cam_btn, self.sw_stride, self.sw_btn,
             self.thr, self.min_dist, self.detect_btn, self.detect_status,
+            self.ciliai_url, self.ciliai_btn,
             Label(value="<b>4 · APOC gated by CNN</b>"),
             self.classifier, self.cilia_min, self.cilia_max, self.gate_radius,
             self.apoc_btn, self.apoc_status,
@@ -703,9 +825,24 @@ class LimoncelloCNNApp:
 
     # ── model discovery ────────────────────────────────────────────────────────
     def _discover_models(self) -> list[str]:
+        """ROI-classifier ``.pt`` bundles in models/ (i.e. NOT FCN-detector
+        bundles). A detector picked here would crash ``load_bundle`` / the FCN
+        build, so they're filtered out."""
         if not os.path.isdir(_MODELS_DIR):
             return []
-        return sorted(f for f in os.listdir(_MODELS_DIR) if f.endswith(".pt"))
+        out = []
+        for f in sorted(os.listdir(_MODELS_DIR)):
+            if not f.endswith(".pt"):
+                continue
+            try:
+                pl = torch.load(os.path.join(_MODELS_DIR, f),
+                                map_location="cpu", weights_only=False)
+                if isinstance(pl, dict) and pl.get("kind") == "fcn_detector":
+                    continue                                  # skip detectors
+            except Exception:                                 # noqa: BLE001
+                continue                                      # unreadable → skip
+            out.append(f)
+        return out
 
     def _on_rescan_models(self):
         self.model_combo.choices = self._discover_models()
@@ -994,6 +1131,44 @@ class LimoncelloCNNApp:
             properties={"score": scores},
         )
 
+    # ── CiliAI detector (HTTP) ────────────────────────────────────────────────
+    def _on_ciliai_detect(self):
+        if self._busy:
+            return
+        if "raw" not in self.state:
+            show_warning("Load an image first (step ②).")
+            return
+        url = str(self.ciliai_url.value or "").strip()
+        if not url:
+            show_warning("Set the CiliAI server URL (e.g. http://localhost:5007).")
+            return
+        thr = float(self.thr.value)
+        # Build the whole-image RGB at native scale so returned boxes are already
+        # in image pixels (no rescale needed to map back to centres_yx).
+        rgb = build_fcn_input(self.state["raw"], self.ch_cilia.value,
+                              self.ch_bb.value, 1.0)
+        self._set_busy(True)
+        show_info("Querying CiliAI detector — see console …")
+
+        @thread_worker
+        def _work():
+            return ciliai_detect_centres(rgb, url, thr)
+
+        def _done(res):
+            yx, scores = res
+            self.state["centres_yx"] = yx
+            self.state["fcn_in_scale"] = 1.0          # native px; no heatmap step
+            self._show_centres(yx, scores)
+            self.detect_status.value = f"CiliAI: {len(yx)} centres ≥ {thr:.2f}"
+            self._set_busy(False)
+            show_info(f"CiliAI detected {len(yx)} cilia. Run ⑤ to segment.")
+
+        def _err(e):
+            self._set_busy(False)
+            show_warning(f"CiliAI detect failed: {e}")
+
+        w = _work(); w.returned.connect(_done); w.errored.connect(_err); w.start()
+
     # ── APOC gated ──────────────────────────────────────────────────────────────
     def _on_apoc(self):
         if self._busy:
@@ -1076,8 +1251,12 @@ class LimoncelloCNNApp:
         if not os.path.isdir(run_dir):
             show_warning("Pick the run output dir (the lc-analysis-* folder with csv/).")
             return
-        if not os.path.isdir(folder):
-            show_warning("Set the Image folder (originals) the run was computed from.")
+        # Raw volumes are located from the run's own file list
+        # (run_parameters.json); the Image folder is only a fallback, so it is
+        # optional. Bail only if neither source can supply the originals.
+        if not run_file_map(run_dir) and not os.path.isdir(folder):
+            show_warning("This run has no usable file list in run_parameters.json "
+                         "and no Image folder is set — can't locate the raw images.")
             return
         self._set_busy(True)
         show_info("Reconstructing targets + training detector — see console …")
@@ -1096,12 +1275,23 @@ class LimoncelloCNNApp:
         def _work():
             _select_device(self.gpu_combo.value)
             print(f"[detector] reconstructing targets from {run_dir} …")
-            samples = reconstruct_targets(run_dir, folder, ptrain)
+            samples = reconstruct_targets(run_dir, folder or None, ptrain)
             n_pos = sum(s[3] for s in samples)
             print(f"[detector] {len(samples)} images · {n_pos} positives total")
             warm = None
             if warm_name.endswith(".pt"):
-                warm, _ = load_bundle(os.path.join(_MODELS_DIR, warm_name))
+                # Warm-start only from a ROINetBig ROI classifier; a wrong pick
+                # (e.g. a detector or tiny net) must not abort training.
+                try:
+                    _w, _ = load_bundle(os.path.join(_MODELS_DIR, warm_name))
+                    if isinstance(_w, ROINetBig):
+                        warm = _w
+                    else:
+                        print(f"[detector] warm-start skipped — {warm_name} is "
+                              f"not a 'big' ROI classifier")
+                except Exception as _exc:                     # noqa: BLE001
+                    print(f"[detector] warm-start skipped — could not load "
+                          f"{warm_name}: {_exc}")
             model, hist = train_fcn_detector(
                 samples, epochs=epochs, warm=warm,
                 progress=lambda f, m: print(f"[detector] {m}"))

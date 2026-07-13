@@ -56,10 +56,24 @@ def _norm_obj(a: np.ndarray, obj_mask: np.ndarray | None) -> np.ndarray:
     return np.clip((a - lo) / (hi - lo), 0.0, 1.0)
 
 
-def _to_rgb(cilia: np.ndarray, bb: np.ndarray) -> np.ndarray:
-    """Cilia (green) + basal body (magenta) → RGB, gamma-brightened."""
-    cilia = np.power(cilia, _DISPLAY_GAMMA)
-    bb = np.power(bb, _DISPLAY_GAMMA)
+def _norm_raw(a: np.ndarray) -> np.ndarray:
+    """Plain linear min-max of the crop to [0, 1] — no object-aware contrast, no
+    gamma. Used when display correction is switched off (raw intensities)."""
+    a = np.asarray(a, dtype=np.float32)
+    if a.size == 0:
+        return a
+    lo, hi = float(a.min()), float(a.max())
+    if hi <= lo:
+        hi = lo + 1e-6
+    return np.clip((a - lo) / (hi - lo), 0.0, 1.0)
+
+
+def _to_rgb(cilia: np.ndarray, bb: np.ndarray,
+            gamma: float = _DISPLAY_GAMMA) -> np.ndarray:
+    """Cilia (green) + basal body (magenta) → RGB. ``gamma`` < 1 brightens; pass
+    ``gamma = 1.0`` for a raw (linear) display."""
+    cilia = np.power(cilia, gamma)
+    bb = np.power(bb, gamma)
     rgb = np.zeros((*cilia.shape, 3), dtype=np.float32)
     rgb[..., 1] = cilia               # green
     rgb[..., 0] = bb                  # magenta = red + blue
@@ -67,10 +81,11 @@ def _to_rgb(cilia: np.ndarray, bb: np.ndarray) -> np.ndarray:
     return np.clip(rgb, 0.0, 1.0)
 
 
-def _xy_thumb(cilia: np.ndarray, bb: np.ndarray, px: int) -> np.ndarray:
+def _xy_thumb(cilia: np.ndarray, bb: np.ndarray, px: int,
+              gamma: float = _DISPLAY_GAMMA) -> np.ndarray:
     """Top-down XY max-projection (the view the model trains on), padded to a
     centred square and resized to ``px`` so every thumbnail is the same size."""
-    rgb = _to_rgb(cilia.max(axis=0), bb.max(axis=0))               # (Y, X, 3)
+    rgb = _to_rgb(cilia.max(axis=0), bb.max(axis=0), gamma)        # (Y, X, 3)
     h, w = rgb.shape[:2]
     s = max(h, w)
     sq = np.zeros((s, s, 3), dtype=np.float32)
@@ -120,7 +135,12 @@ def render_npz_rgb(npz_path, px: int = 240, gamma: float | None = None):
 
     _CTX_W = 0.22                                         # faint context wash
     cil = _obj("cilia", d["mask"] if "mask" in keys else None)
-    bb  = _obj("bb", d["bb_mask"] if "bb_mask" in keys else None)
+    # No paired BB mask → object-aware norm has nothing to scale to and would
+    # render black; fall back to a percentile stretch so real BB signal shows.
+    if "bb" in keys and "bb_mask" not in keys:
+        bb = np.power(_norm_pctl(d["bb"], 50.0, 99.5).max(axis=0), g)
+    else:
+        bb = _obj("bb", d["bb_mask"] if "bb_mask" in keys else None)
     neu = _ctx("neurite")
     nuc = _ctx("nuclei")
     ref = next((x for x in (cil, bb, neu, nuc) if x is not None), None)
@@ -150,9 +170,42 @@ def render_npz_rgb(npz_path, px: int = 240, gamma: float | None = None):
     return img
 
 
+def render_npz_thumb(npz_path, px: int = 192,
+                     correct_display: bool = True) -> np.ndarray | None:
+    """Re-render the cilia+basal-body **training thumbnail** from a saved ``.npz``
+    crop (same look as ``save_cilia_rois``), with display correction on/off.
+
+    on  → object-aware contrast + gamma (BB percentile fallback when unpaired).
+    off → raw intensities (plain min-max, no gamma).
+
+    Returns a ``(px, px, 3)`` uint8 array (cilia green, BB magenta), or None.
+    """
+    try:
+        d = np.load(npz_path)
+    except Exception:                                     # noqa: BLE001
+        return None
+    keys = set(getattr(d, "files", []))
+    if "cilia" not in keys or "bb" not in keys:
+        return None
+    cil, bb = d["cilia"], d["bb"]
+    if correct_display:
+        cmask = d["mask"] if "mask" in keys else None
+        bmask = d["bb_mask"] if "bb_mask" in keys else None
+        cdisp = _norm_obj(cil, cmask)
+        bbdisp = (_norm_obj(bb, bmask) if bmask is not None
+                  else _norm_pctl(bb, 50.0, 99.5))
+        gamma = _DISPLAY_GAMMA
+    else:
+        cdisp, bbdisp, gamma = _norm_raw(cil), _norm_raw(bb), 1.0
+    from PIL import Image
+    img = _xy_thumb(cdisp, bbdisp, px, gamma)
+    return np.asarray(Image.fromarray(img).resize((px, px), Image.BILINEAR))
+
+
 def save_cilia_rois(raw, cilia_labels, bb_labels, cilia_df, channels,
                     voxel_size, roi_dir, stem, *, margin: int = 22,
-                    save_crops: bool = True, thumb_px: int = 192) -> int:
+                    save_crops: bool = True, thumb_px: int = 192,
+                    correct_display: bool = True) -> int:
     """Write a MIP thumbnail (+ optional raw ``.npz`` crop) per cilium.
 
     Parameters mirror the data already available in the pipeline / napari batch
@@ -194,9 +247,23 @@ def save_cilia_rois(raw, cilia_labels, bb_labels, cilia_df, channels,
             _bmask = (bb_labels[sl] == int(pid)) if (
                 pid is not None and not (isinstance(pid, float) and np.isnan(pid))
             ) else None
-            img = Image.fromarray(_xy_thumb(
-                _norm_obj(raw[ci][sl], _cmask),
-                _norm_obj(raw[bi][sl], _bmask), thumb_px))
+            if correct_display:
+                # Object-aware contrast + gamma (the default "corrected" view).
+                # When a cilium has no paired basal body (e.g. BB-distance
+                # filtering off), there's no BB label to scale against — fall back
+                # to a robust percentile stretch so the BB channel still shows real
+                # signal instead of rendering black.
+                _cdisp = _norm_obj(raw[ci][sl], _cmask)
+                _bb_disp = (_norm_obj(raw[bi][sl], _bmask) if _bmask is not None
+                            else _norm_pctl(raw[bi][sl], 50.0, 99.5))
+                _gamma = _DISPLAY_GAMMA
+            else:
+                # Raw intensities: plain linear min-max per channel, no gamma.
+                _cdisp = _norm_raw(raw[ci][sl])
+                _bb_disp = _norm_raw(raw[bi][sl])
+                _gamma = 1.0
+            img = Image.fromarray(
+                _xy_thumb(_cdisp, _bb_disp, thumb_px, _gamma))
             img = img.resize((thumb_px, thumb_px), Image.BILINEAR)
             img.save(roi_dir / f"{stem}_cilia{cid}.png")
 

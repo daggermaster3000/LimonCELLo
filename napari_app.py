@@ -13,6 +13,9 @@ Run with:  python napari_app.py
 from __future__ import annotations
 
 import os
+import json
+import hashlib
+import tempfile
 import threading
 from pathlib import Path
 
@@ -55,7 +58,8 @@ from limoncello.segmentation.train import (
 from limoncello.utils.assign_label_features import (
     assign_label_features, use_basal_body_ratio)
 from limoncello.utils.shape_props import cilia_shape_props, SHAPE_COLS
-from limoncello.analysis.pair_cilia_to_bb import pair_from_mixed_df
+from limoncello.analysis.pair_cilia_to_bb import (
+    pair_from_mixed_df, pair_from_mixed_df_directional)
 from limoncello.analysis.pipeline import run_pipeline3, run_roi_only_batch
 
 
@@ -65,6 +69,75 @@ _DEFAULT_CLASSIFIER = str(
 _DEFAULT_BB_CLASSIFIER = str(
     (Path(__file__).parent / "segmenters" / "BB-d38-3D.cl").resolve()
 )
+_DEFAULT_NUCLEI_CLASSIFIER = str(
+    (Path(__file__).parent / "segmenters" / "Nuclei-d38-3D.cl").resolve()
+)
+
+# Parameter state auto-saved on quit and reloaded on startup.
+_STATE_PATH = Path(__file__).parent / ".napari_app_state.json"
+
+# ── Under-the-hood cache for the (slow) isotropic-resampled load ─────────────
+# The load step normalises then resamples every channel to isotropic voxels,
+# which is the expensive part. We cache its output on disk keyed on the file +
+# the load parameters, so re-running load with the same image/normalisation (but
+# different *segmentation* parameters) is instant. Non-resampled loads are cheap
+# and are not cached.
+_LOAD_CACHE_DIR = Path(tempfile.gettempdir()) / "lc_iso_cache"
+_LOAD_CACHE_MAX = 40                       # keep at most N cached loads
+
+
+def _load_cache_key(p: dict, mtime: float) -> str:
+    payload = repr({
+        "path": p["ims_path"], "mtime": round(mtime, 3),
+        "p_low": p["p_low"], "p_high": p["p_high"],
+        "ch_norm": sorted((int(k), tuple(v))
+                          for k, v in (p.get("ch_norm") or {}).items()),
+        "use_mip": bool(p["use_mip"]),
+        "make_isotropic": bool(p.get("make_isotropic")),
+    })
+    return hashlib.md5(payload.encode()).hexdigest()
+
+
+def _load_cache_read(key: str) -> dict | None:
+    path = _LOAD_CACHE_DIR / f"{key}.npz"
+    if not path.exists():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as z:
+            return dict(
+                raw=z["raw"], norm=z["norm"],
+                voxel_size=tuple(float(v) for v in z["voxel_size"]),
+                n_ch=int(z["n_ch"]),
+            )
+    except Exception as exc:                                     # noqa: BLE001
+        print(f"[LC] Ignoring unreadable load cache: {exc}")
+        return None
+
+
+def _load_cache_write(key: str, result: dict) -> None:
+    try:
+        _LOAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _LOAD_CACHE_DIR / f"{key}.tmp.npz"
+        np.savez(
+            tmp, raw=result["raw"], norm=result["norm"],
+            voxel_size=np.asarray(result["voxel_size"], dtype=float),
+            n_ch=np.asarray(result["n_ch"], dtype=int),
+        )
+        tmp.replace(_LOAD_CACHE_DIR / f"{key}.npz")
+        _load_cache_prune()
+    except Exception as exc:                                     # noqa: BLE001
+        print(f"[LC] Could not write load cache: {exc}")
+
+
+def _load_cache_prune() -> None:
+    """Evict the oldest cached loads once the cap is exceeded."""
+    try:
+        files = sorted(_LOAD_CACHE_DIR.glob("*.npz"),
+                       key=lambda f: f.stat().st_mtime)
+        for f in files[:-_LOAD_CACHE_MAX]:
+            f.unlink(missing_ok=True)
+    except Exception:                                            # noqa: BLE001
+        pass
 
 _CH_NAMES     = ["Cilia", "Neurites", "Basal Bodies", "Nuclei"]
 _CH_COLORMAPS = ["green", "cyan", "magenta", "blue"]
@@ -124,6 +197,17 @@ def _clamp_ch(n_ch: int, idx: int, label: str) -> int:
 
 def step_load(state: dict, p: dict) -> dict:
     """Load the .ims file, build raw + percentile-normalised channel stacks."""
+    # The resample path is the slow one — serve it from disk when the file and
+    # load parameters are unchanged (segmentation params don't affect this step).
+    _do_cache = bool(p.get("make_isotropic")) and not p["use_mip"]
+    _key = None
+    if _do_cache and os.path.exists(p["ims_path"]):
+        _key = _load_cache_key(p, os.path.getmtime(p["ims_path"]))
+        cached = _load_cache_read(_key)
+        if cached is not None:
+            print(f"[LC] Loaded isotropic data from cache ({p['ims_path']}).")
+            return cached
+
     print(f"[LC] Loading {p['ims_path']} …")
     img, meta = load_image(p["ims_path"])
     voxel_size = meta["voxel_size"] or (1.0, 1.0, 1.0)
@@ -153,7 +237,10 @@ def step_load(state: dict, p: dict) -> dict:
             norm = np.stack([make_isotropic(norm[c], voxel_size, iso)[0] for c in range(n_ch)])
             voxel_size = (iso, iso, iso)
 
-    return dict(raw=raw, norm=norm, voxel_size=voxel_size, n_ch=n_ch)
+    result = dict(raw=raw, norm=norm, voxel_size=voxel_size, n_ch=n_ch)
+    if _key is not None:
+        _load_cache_write(_key, result)
+    return result
 
 
 def step_cilia(state: dict, p: dict) -> dict:
@@ -171,17 +258,30 @@ def step_cilia(state: dict, p: dict) -> dict:
 
 
 def step_nuclei(state: dict, p: dict) -> dict:
-    print("[LC] Segmenting nuclei …")
-    tr = p["tophat_radius"]
-    ch = _clamp_ch(state["norm"].shape[0], p["ch_nuclei"], "Nuclei")
-    nuclei_labels = segment_nuclei(
-        state["norm"][ch],
-        tophat_radius=(tr, tr, tr),
-        spot_sigma=p["nuclei_sigma"],
-        outline_sigma=p["nuclei_outline_sigma"],
-        gaussian_sigma=(p["nuclei_gauss_z"], p["nuclei_gauss_y"], p["nuclei_gauss_x"]),
-        log_transform=p["nuclei_log"],
-    ).astype(np.int32)
+    gauss = (p["nuclei_gauss_z"], p["nuclei_gauss_y"], p["nuclei_gauss_x"])
+    if p.get("nuclei_method") == "APOC classifier":
+        print("[LC] Segmenting nuclei (APOC classifier) …")
+        ch = _clamp_ch(state["raw"].shape[0], p["ch_nuclei"], "Nuclei")
+        nuclei_labels = np.asarray(segment_cilia_ml(
+            state["raw"][ch],
+            classifier_path=p["nuclei_classifier_path"],
+            gaussian_sigma=gauss,
+            log_transform=p["nuclei_log"],
+            min_size=p["nuclei_min_size"],
+            max_size=p["nuclei_max_size"],
+        )).astype(np.int32)
+    else:
+        print("[LC] Segmenting nuclei (Voronoi-Otsu) …")
+        tr = p["tophat_radius"]
+        ch = _clamp_ch(state["norm"].shape[0], p["ch_nuclei"], "Nuclei")
+        nuclei_labels = segment_nuclei(
+            state["norm"][ch],
+            tophat_radius=(tr, tr, tr),
+            spot_sigma=p["nuclei_sigma"],
+            outline_sigma=p["nuclei_outline_sigma"],
+            gaussian_sigma=gauss,
+            log_transform=p["nuclei_log"],
+        ).astype(np.int32)
     return dict(nuclei_labels=nuclei_labels)
 
 
@@ -305,10 +405,19 @@ def step_assign(state: dict, p: dict) -> dict:
     # they pair with, so the table + overlays match the batch outputs.
     if not cilia_df.empty or not bb_df.empty:
         combined = pd.concat([cilia_df, bb_df], ignore_index=True)
-        paired   = pair_from_mixed_df(
-            combined, voxel_size=state["voxel_size"],
-            max_pair_distance_um=p["max_basal_dist_um"],
-        )
+        if p.get("directional_pairing"):
+            # Search along each cilium's major axis first, fall back to nearest.
+            paired = pair_from_mixed_df_directional(
+                combined, state["cilia_labels"], voxel_size=state["voxel_size"],
+                max_pair_distance_um=p["max_basal_dist_um"],
+                search_dist_um=p.get("pair_search_dist_um"),
+                cone_angle_deg=p.get("pair_cone_angle_deg", 45.0),
+            )
+        else:
+            paired = pair_from_mixed_df(
+                combined, voxel_size=state["voxel_size"],
+                max_pair_distance_um=p["max_basal_dist_um"],
+            )
         if p.get("require_basal_body", True):
             cilia_df = paired[(paired["object_type"] == "cilia")
                               & paired["validated"]].reset_index(drop=True)
@@ -572,6 +681,11 @@ class LimoncelloApp:
         self._viz_bridge.visualize.connect(self._on_batch_visualize)
         self.widget = self._build()
         self._build_table()
+        # Reload parameters from the previous session, then persist on quit.
+        self._load_state()
+        _app = QApplication.instance()
+        if _app is not None:
+            _app.aboutToQuit.connect(self._save_state)
 
     # ── cilia property table ────────────────────────────────────────────────────
     def _build_table(self):
@@ -652,6 +766,10 @@ class LimoncelloApp:
             make_isotropic=self.make_iso.value,
             p_low=self.p_low.value, p_high=self.p_high.value,
             ch_norm=dict(self._ch_norm),
+            nuclei_method=self.nuclei_method.value,
+            nuclei_classifier_path=str(self.nuclei_classifier.value),
+            nuclei_min_size=self.nuclei_min_size.value,
+            nuclei_max_size=self.nuclei_max_size.value,
             nuclei_sigma=self.nuclei_sigma.value,
             tophat_radius=self.tophat_radius.value,
             nuclei_outline_sigma=self.nuclei_outline_sigma.value,
@@ -676,6 +794,9 @@ class LimoncelloApp:
             ratio_epsilon=self.ratio_epsilon.value,
             neurite_threshold=self.neurite_threshold.value,
             soma_threshold=self.soma_threshold.value,
+            directional_pairing=self.directional_pairing.value,
+            pair_search_dist_um=self.pair_search_dist.value,
+            pair_cone_angle_deg=self.pair_cone_angle.value,
         )
         # Gaussian pre-blur was removed from the UI; segmentation runs unblurred.
         for pre in ("cilia", "nuclei", "neurite", "bb"):
@@ -687,6 +808,107 @@ class LimoncelloApp:
         else:
             p["ims_path"] = ""
         return p
+
+    # ── persistent parameter state (auto save/reload) ───────────────────────────
+    def _state_widgets(self) -> dict:
+        """(key → widget) whose ``.value`` is saved on quit and reloaded on start.
+
+        Widgets with data-dependent choices (hist/AI/train dropdowns, feature
+        grid) are excluded — they're rebuilt from the loaded image. ``file_combo``
+        is restored last, after the folder is re-scanned so its choices exist.
+        """
+        return {
+            "folder": self.folder, "output": self.output,
+            "classifier": self.classifier, "gpu_combo": self.gpu_combo,
+            "ch_cilia": self.ch_cilia, "ch_neurites": self.ch_neurites,
+            "ch_bb": self.ch_bb, "ch_nuclei": self.ch_nuclei,
+            "use_mip": self.use_mip, "make_iso": self.make_iso,
+            "p_low": self.p_low, "p_high": self.p_high,
+            "nuclei_method": self.nuclei_method,
+            "nuclei_classifier": self.nuclei_classifier,
+            "nuclei_min_size": self.nuclei_min_size,
+            "nuclei_max_size": self.nuclei_max_size,
+            "nuclei_sigma": self.nuclei_sigma, "tophat_radius": self.tophat_radius,
+            "nuclei_outline_sigma": self.nuclei_outline_sigma,
+            "nuclei_log": self.nuclei_log,
+            "neurite_sigma": self.neurite_sigma, "neurite_log": self.neurite_log,
+            "neurite_merge_nuclei": self.neurite_merge_nuclei,
+            "cilia_log": self.cilia_log, "cilia_min_size": self.cilia_min_size,
+            "cilia_max_size": self.cilia_max_size,
+            "bb_method": self.bb_method, "bb_classifier": self.bb_classifier,
+            "bb_spot_sigma": self.bb_spot_sigma,
+            "bb_outline_sigma": self.bb_outline_sigma, "bb_log": self.bb_log,
+            "bb_min_size": self.bb_min_size, "bb_max_size": self.bb_max_size,
+            "max_cilia_dist": self.max_cilia_dist,
+            "max_basal_dist": self.max_basal_dist, "require_bb": self.require_bb,
+            "directional_pairing": self.directional_pairing,
+            "pair_search_dist": self.pair_search_dist,
+            "pair_cone_angle": self.pair_cone_angle,
+            "ratio_from_bb": self.ratio_from_bb, "ratio_epsilon": self.ratio_epsilon,
+            "neurite_threshold": self.neurite_threshold,
+            "soma_threshold": self.soma_threshold,
+            "train_feat_sigmas": self.train_feat_sigmas,
+            "train_feat_original": self.train_feat_original,
+            "train_channel": self.train_channel,
+            "train_positive": self.train_positive,
+            "train_max_depth": self.train_max_depth,
+            "train_num_trees": self.train_num_trees,
+            "train_output": self.train_output, "train_continue": self.train_continue,
+            "train_labels_dir": self.train_labels_dir,
+            "train_all_labeled": self.train_all_labeled,
+            "batch_capture": self.batch_capture, "batch_rois": self.batch_rois,
+            "roi_correct": self.roi_correct, "batch_ai": self.batch_ai,
+            "batch_roi_only": self.batch_roi_only, "batch_xy_um": self.batch_xy_um,
+            "batch_roi_pct": self.batch_roi_pct, "batch_roi_tile": self.batch_roi_tile,
+            "ai_keep_thr": self.ai_keep_thr,
+            "file_combo": self.file_combo,      # restored last (needs scan first)
+        }
+
+    def _save_state(self, *_):
+        data = {}
+        for key, w in self._state_widgets().items():
+            try:
+                v = w.value
+                data[key] = str(v) if isinstance(v, Path) else v
+            except Exception:
+                pass
+        # Per-channel norm overrides: int keys → JSON-safe [ch, lo, hi] rows.
+        data["_ch_norm"] = [[c, lo, hi] for c, (lo, hi) in self._ch_norm.items()]
+        try:
+            _STATE_PATH.write_text(json.dumps(data, indent=2))
+        except Exception as exc:
+            print(f"[LC] Could not save parameter state: {exc}")
+
+    def _load_state(self):
+        if not _STATE_PATH.exists():
+            return
+        try:
+            data = json.loads(_STATE_PATH.read_text())
+        except Exception as exc:
+            print(f"[LC] Could not read parameter state: {exc}")
+            return
+        self._ch_norm = {int(c): (int(lo), int(hi))
+                         for c, lo, hi in data.get("_ch_norm", [])}
+        widgets = self._state_widgets()
+        file_val = data.get("file_combo")
+        for key, w in widgets.items():
+            if key == "file_combo" or key not in data:
+                continue
+            v = data[key]
+            try:
+                if isinstance(w, FileEdit) and isinstance(v, str):
+                    v = Path(v)
+                w.value = v
+            except Exception as exc:
+                print(f"[LC] Skipped restoring '{key}': {exc}")
+        # Re-scan the saved folder so file_combo has its choices, then reselect.
+        if str(self.folder.value):
+            try:
+                self._scan_folder()
+            except Exception:
+                pass
+        if file_val and file_val in getattr(self.file_combo, "choices", ()):
+            self.file_combo.value = file_val
 
     # ── folder / navigation ────────────────────────────────────────────────────
     def _scan_folder(self):
@@ -957,6 +1179,24 @@ class LimoncelloApp:
         self.bb_classifier.visible = apoc
         self.bb_spot_sigma.visible = not apoc
         self.bb_outline_sigma.visible = not apoc
+
+    def _on_nuclei_method_changed(self, *_):
+        """Show only the controls relevant to the selected nuclei method:
+        the .cl classifier + size gates for APOC, spot/tophat/outline σ for
+        Voronoi-Otsu."""
+        apoc = self.nuclei_method.value == "APOC classifier"
+        self.nuclei_classifier.visible = apoc
+        self.nuclei_min_size.visible = apoc
+        self.nuclei_max_size.visible = apoc
+        self.nuclei_sigma.visible = not apoc
+        self.tophat_radius.visible = not apoc
+        self.nuclei_outline_sigma.visible = not apoc
+
+    def _on_directional_pairing_changed(self, *_):
+        """Show the axis-search controls only when directional pairing is on."""
+        on = self.directional_pairing.value
+        self.pair_search_dist.visible = on
+        self.pair_cone_angle.visible = on
 
     def _after_assign(self, viewer, state):
         """Draw centroids + association overlays, fill the property table, wire
@@ -1360,7 +1600,8 @@ class LimoncelloApp:
                 model, meta = load_bundle(mpath)
                 ids = [int(c) for c in cdf["cilia_id"].tolist()]
                 paths = [str(tmp / f"ai_cilia{c}.png") for c in ids]
-                probs = predict_proba(model, paths, size=int(meta.get("size", 64)))
+                probs = predict_proba(model, paths, size=int(meta.get("size", 64)),
+                                       normalize=meta.get("normalize"))
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
             return ids, np.asarray(probs, dtype=float)
@@ -1954,10 +2195,20 @@ class LimoncelloApp:
         self.hist_ax = self.hist_fig.add_subplot(111)
 
         # Nuclei
+        self.nuclei_method     = ComboBox(label="Nuclei method",
+                                          choices=["Voronoi-Otsu", "APOC classifier"],
+                                          value="Voronoi-Otsu")
+        self.nuclei_classifier = FileEdit(label="Nuclei classifier (.cl)", mode="r",
+                                          filter="APOC classifier (*.cl)",
+                                          value=_DEFAULT_NUCLEI_CLASSIFIER)
+        self.nuclei_min_size   = SpinBox(label="Nuclei min vox", value=50, min=0, max=1000000)
+        self.nuclei_max_size   = SpinBox(label="Nuclei max vox (0=off)", value=0, min=0, max=10000000)
         self.nuclei_sigma         = SpinBox(label="Nuclei spot σ",    value=15, min=1, max=50)
         self.tophat_radius        = SpinBox(label="Nuclei tophat r",  value=12, min=1, max=50)
         self.nuclei_outline_sigma = SpinBox(label="Nuclei outline σ", value=3,  min=0, max=10)
         self.nuclei_log           = CheckBox(label="Nuclei log", value=False)
+        # Show/hide the method-specific nuclei widgets when the method changes
+        self.nuclei_method.changed.connect(self._on_nuclei_method_changed)
         # Neurites
         self.neurite_sigma = SpinBox(label="Neurite spot σ", value=5, min=1, max=20)
         self.neurite_log   = CheckBox(label="Neurite log", value=False)
@@ -1985,6 +2236,15 @@ class LimoncelloApp:
         self.max_cilia_dist = FloatSpinBox(label="Max cilia dist (µm)", value=2.0, min=0.1, max=30.0, step=0.5)
         self.max_basal_dist = FloatSpinBox(label="Max BB dist (µm)",    value=5.0, min=0.1, max=30.0, step=0.5)
         self.require_bb     = CheckBox(label="Require basal body (filter by BB distance)", value=True)
+        # Axis-directed pairing: search along the cilium's major axis first.
+        self.directional_pairing = CheckBox(
+            label="Axis-directed BB pairing (search along cilium axis first)",
+            value=False)
+        self.pair_search_dist = FloatSpinBox(
+            label="Axis search dist (µm)", value=5.0, min=0.5, max=30.0, step=0.5)
+        self.pair_cone_angle = FloatSpinBox(
+            label="Axis cone half-angle (°)", value=45.0, min=5.0, max=90.0, step=5.0)
+        self.directional_pairing.changed.connect(self._on_directional_pairing_changed)
         self.ratio_from_bb  = CheckBox(label="Ratio from basal body position", value=True)
         self.ratio_epsilon  = FloatSpinBox(label="Ratio ε",             value=1.0, min=0.0, max=10.0, step=0.1)
         self.neurite_threshold = FloatSpinBox(label="Neurite log-ratio thr",  value=-0.1, min=-10, max=10.0, step=0.1)
@@ -2124,9 +2384,12 @@ class LimoncelloApp:
         )
         norm_box  = Container(widgets=[self.p_low, self.p_high], labels=True)
         nuclei_box = Container(
-            widgets=[self.nuclei_sigma, self.tophat_radius,
+            widgets=[self.nuclei_method, self.nuclei_classifier,
+                     self.nuclei_min_size, self.nuclei_max_size,
+                     self.nuclei_sigma, self.tophat_radius,
                      self.nuclei_outline_sigma, self.nuclei_log], labels=True,
         )
+        self._on_nuclei_method_changed()   # set initial widget visibility
         neurite_box = Container(
             widgets=[self.neurite_sigma, self.neurite_log, self.neurite_merge_nuclei],
             labels=True)
@@ -2142,9 +2405,12 @@ class LimoncelloApp:
         self._on_bb_method_changed()   # set initial widget visibility
         dist_box = Container(
             widgets=[self.max_cilia_dist, self.max_basal_dist, self.require_bb,
+                     self.directional_pairing, self.pair_search_dist,
+                     self.pair_cone_angle,
                      self.ratio_from_bb, self.ratio_epsilon,
                      self.neurite_threshold, self.soma_threshold], labels=True,
         )
+        self._on_directional_pairing_changed()   # set initial widget visibility
         # The training section mixes magicgui widgets with two native Qt tables
         # (feature grid + importance), so it is assembled as a native wrapper
         # (``train_wrap``) below rather than a single magicgui Container.

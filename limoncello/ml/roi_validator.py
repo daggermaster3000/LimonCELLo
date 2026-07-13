@@ -23,6 +23,7 @@ done on demand.
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -35,6 +36,7 @@ from PIL import Image
 CLASS_NAMES = ("reject", "keep")          # index 0 = junk, 1 = real cilium
 DEFAULT_SIZE = {"tiny": 64, "big": 96}    # input resolution per architecture
 IMG_SIZE = DEFAULT_SIZE["tiny"]           # back-compat default
+NORM_PERCENTILES = (1.0, 99.8)            # per-channel stretch (train + inference)
 
 
 _CUDNN_HANDLED = False
@@ -63,21 +65,47 @@ def get_device() -> torch.device:
 # ─────────────────────────────────────────────────────────────────────────────
 # Image IO
 # ─────────────────────────────────────────────────────────────────────────────
-def load_roi_image(path: str, size: int = IMG_SIZE) -> np.ndarray | None:
-    """Load an ROI PNG as a ``(C, H, W)`` float array in ``[0, 1]``, or None."""
+def _percentile_norm(arr: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Per-channel percentile contrast stretch of a ``(C, H, W)`` image to
+    ``[0, 1]``. Each channel is mapped **independently** between its ``lo``/``hi``
+    percentiles, so it is robust to hot pixels / outliers and doesn't couple the
+    (green cilia / magenta basal-body) channels together."""
+    out = np.empty_like(arr, dtype=np.float32)
+    for c in range(arr.shape[0]):
+        ch = arr[c]
+        p_lo, p_hi = np.percentile(ch, [lo, hi])
+        if p_hi <= p_lo:
+            p_hi = p_lo + 1e-6
+        out[c] = np.clip((ch - p_lo) / (p_hi - p_lo), 0.0, 1.0)
+    return out
+
+
+def load_roi_image(path: str, size: int = IMG_SIZE,
+                   normalize: str | None = None) -> np.ndarray | None:
+    """Load an ROI PNG as a ``(C, H, W)`` float array in ``[0, 1]``, or None.
+
+    ``normalize="pctl"`` applies a per-channel 1st–99.8 percentile stretch (the
+    training-time normalization). The **same** value must be used at inference,
+    so it is recorded in the model bundle's meta and read back by
+    ``predict_proba`` — ``normalize=None`` keeps the legacy plain ``/255``
+    behaviour for models trained before this was added."""
     try:
         img = Image.open(path).convert("RGB").resize((size, size))
     except Exception:                                     # noqa: BLE001
         return None
     arr = np.asarray(img, dtype=np.float32) / 255.0       # H, W, C
-    return np.transpose(arr, (2, 0, 1))                   # C, H, W
+    arr = np.transpose(arr, (2, 0, 1))                    # C, H, W
+    if normalize == "pctl":
+        arr = _percentile_norm(arr, *NORM_PERCENTILES)
+    return arr
 
 
-def _stack_images(paths: Sequence[str], size: int) -> tuple[np.ndarray, list[int]]:
+def _stack_images(paths: Sequence[str], size: int,
+                  normalize: str | None = None) -> tuple[np.ndarray, list[int]]:
     """Load many images; return the stacked array + indices that loaded OK."""
     imgs, ok = [], []
     for i, p in enumerate(paths):
-        a = load_roi_image(p, size)
+        a = load_roi_image(p, size, normalize)
         if a is not None:
             imgs.append(a)
             ok.append(i)
@@ -144,16 +172,39 @@ def make_model(arch: str = "big") -> nn.Module:
 # Training
 # ─────────────────────────────────────────────────────────────────────────────
 def _augment(xb: torch.Tensor) -> torch.Tensor:
-    """Label-preserving augmentation for square microscopy crops: random
-    horizontal/vertical flips + a random 90° rotation."""
+    """Label-preserving augmentation for square microscopy crops on a batch
+    ``(B, C, H, W)`` in ``[0, 1]``.
+
+    Geometric (the classic flips — upside-down / back-to-front — + 90° rot):
+      random horizontal flip, random vertical flip, random 90° rotation.
+
+    Photometric, per-sample (imaging variability the net must ignore):
+      random brightness ±20%, random contrast ±20% (about each sample's mean),
+      random gamma (log-uniform ≈0.8–1.25), and additive Gaussian noise (σ≈0.02).
+    Brightness/contrast/gamma share one factor across channels so the
+    cilia/basal-body colour relationship is preserved; the result is re-clamped
+    to ``[0, 1]``."""
+    # ── geometric ──
     if torch.rand(1).item() < 0.5:
-        xb = torch.flip(xb, dims=[3])
+        xb = torch.flip(xb, dims=[3])                     # back-to-front (H)
     if torch.rand(1).item() < 0.5:
-        xb = torch.flip(xb, dims=[2])
+        xb = torch.flip(xb, dims=[2])                     # upside-down (V)
     k = int(torch.randint(0, 4, (1,)).item())
     if k:
         xb = torch.rot90(xb, k, dims=[2, 3])
-    return xb
+
+    # ── photometric (per-sample factors, shape (B,1,1,1)) ──
+    b, dev = xb.shape[0], xb.device
+    def _u(lo, hi):                                       # per-sample U[lo,hi]
+        return torch.empty(b, 1, 1, 1, device=dev).uniform_(lo, hi)
+
+    xb = xb * _u(0.8, 1.2)                                # brightness ±20%
+    mean = xb.mean(dim=(1, 2, 3), keepdim=True)
+    xb = (xb - mean) * _u(0.8, 1.2) + mean               # contrast ±20%
+    gamma = torch.exp(_u(-math.log(1.25), math.log(1.25)))  # log-uniform gamma
+    xb = xb.clamp(0.0, 1.0).pow(gamma)
+    xb = xb + torch.randn_like(xb) * 0.02                # Gaussian noise
+    return xb.clamp(0.0, 1.0)
 
 
 def train_validator(
@@ -167,6 +218,7 @@ def train_validator(
     val_frac: float = 0.25,
     patience: int = 8,
     seed: int = 0,
+    normalize: str | None = None,
     progress: Callable[[float, str], None] | None = None,
 ) -> dict:
     """Train the validator on ``(image_path, label)`` pairs (1 = keep, 0 = reject).
@@ -182,7 +234,7 @@ def train_validator(
 
     paths = [p for p, _ in samples]
     labels = np.array([int(y) for _, y in samples], dtype=np.int64)
-    X, ok = _stack_images(paths, size)
+    X, ok = _stack_images(paths, size, normalize)
     if len(ok) < 8:
         raise ValueError(
             f"Need at least 8 ROI images to train (got {len(ok)} with an image).")
@@ -273,6 +325,7 @@ def train_validator(
         "model": model,
         "arch": arch,
         "size": size,
+        "normalize": normalize,
         "device": device.type,
         "history": history,
         "val_acc": val_acc,
@@ -303,10 +356,15 @@ def _safe_auc(y_true: np.ndarray, scores: np.ndarray) -> float:
 # Prediction
 # ─────────────────────────────────────────────────────────────────────────────
 def predict_proba(model: nn.Module, paths: Sequence[str],
-                  size: int = IMG_SIZE, batch_size: int = 256) -> np.ndarray:
-    """Return P(real cilium) per path; ``NaN`` where the image is missing."""
+                  size: int = IMG_SIZE, batch_size: int = 256,
+                  normalize: str | None = None) -> np.ndarray:
+    """Return P(real cilium) per path; ``NaN`` where the image is missing.
+
+    ``normalize`` must match what the model was trained with — pass
+    ``meta["normalize"]`` from ``load_bundle`` so inference preprocessing is
+    identical to training."""
     out = np.full(len(paths), np.nan, dtype=np.float32)
-    X, ok = _stack_images(paths, size)
+    X, ok = _stack_images(paths, size, normalize)
     if not ok:
         return out
     device = get_device()
@@ -425,6 +483,7 @@ def save_bundle(path: str, model: nn.Module, meta: dict) -> str:
         "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
         "arch": meta.get("arch", "big"),
         "size": meta.get("size", DEFAULT_SIZE.get(meta.get("arch", "big"), 64)),
+        "normalize": meta.get("normalize"),
         "meta": {k: v for k, v in meta.items() if k != "model"},
     }
     torch.save(payload, path)
@@ -433,6 +492,15 @@ def save_bundle(path: str, model: nn.Module, meta: dict) -> str:
 
 def load_bundle(path: str) -> tuple[nn.Module, dict]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
+    # Guard against being handed a different bundle type (e.g. an FCN-detector
+    # ``{"kind": "fcn_detector", ...}``) — otherwise ``load_state_dict`` fails
+    # with a cryptic shape/key mismatch far from the real cause.
+    if not isinstance(payload, dict) or "state_dict" not in payload:
+        raise ValueError(f"{path} is not an ROI-classifier bundle "
+                         f"(no 'state_dict').")
+    if payload.get("kind") and payload["kind"] != "roi_validator":
+        raise ValueError(f"{path} is a '{payload['kind']}' bundle, not an ROI "
+                         f"classifier.")
     arch = payload.get("arch", "tiny")            # old bundles were the tiny net
     model = make_model(arch)
     model.load_state_dict(payload["state_dict"])
@@ -440,4 +508,7 @@ def load_bundle(path: str) -> tuple[nn.Module, dict]:
     meta = payload.get("meta", {})
     meta["arch"] = arch
     meta.setdefault("size", payload.get("size", DEFAULT_SIZE.get(arch, 64)))
+    # Legacy bundles have no normalization key → None (plain /255), matching how
+    # they were trained. New bundles carry "pctl".
+    meta.setdefault("normalize", payload.get("normalize"))
     return model, meta
