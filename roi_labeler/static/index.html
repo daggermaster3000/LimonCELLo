@@ -56,7 +56,31 @@
     <button id="keepBtn" class="btn btn-keep">✓ CILIUM</button>
   </div>
   <div class="swipe-hint">swipe ← junk  ·  keep → swipe · or use ← →</div>
-  <button id="boardBtn" class="btn-link">HIGH SCORES ▸</button>
+  <div class="game-links">
+    <button id="galleryBtn" class="btn-link">▦ GALLERY MODE</button>
+    <button id="boardBtn" class="btn-link">HIGH SCORES ▸</button>
+  </div>
+</section>
+
+<!-- ── GALLERY (batch labelling) ── -->
+<section id="gallery" class="screen">
+  <header class="hud">
+    <div class="hud-left"><div class="hud-k">PLAYER</div><div id="galPlayer" class="hud-v">—</div></div>
+    <div class="hud-mid"><div class="hud-k">PICKED CILIA</div><div id="galPicked" class="hud-v">0</div></div>
+    <div class="hud-right"><div class="hud-k">YOU</div><div id="galMine" class="hud-v">0</div></div>
+  </header>
+  <div class="progress"><div id="galProgBar" class="progress-bar"></div></div>
+  <div id="galProgText" class="prog-text">0 / 0</div>
+
+  <div id="grid" class="grid"></div>
+
+  <div class="gallery-bar">
+    <button id="galJunkAll" class="btn-mini btn-mini-junk">ALL JUNK</button>
+    <button id="galKeepAll" class="btn-mini btn-mini-keep">ALL CILIA</button>
+    <button id="galSubmit" class="btn btn-start">SUBMIT ✓</button>
+  </div>
+  <div class="swipe-hint">tap a tile to flip · green = cilium · magenta = junk · ★ = model unsure</div>
+  <button id="galSwipe" class="btn-link">◂ SWIPE MODE</button>
 </section>
 
 <!-- ── DONE ── -->

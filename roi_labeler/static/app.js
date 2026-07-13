@@ -155,6 +155,93 @@ card.addEventListener('pointerup', (e) => {
   else $('roi').style.transform = 'translateX(0) rotate(0)';
 });
 
+/* ── gallery (batch labelling) ── */
+const GAL_N = 24;
+let galItems = [];           // [{id,img,cilia_id,filename,guess,keep}]
+let galBusy = false;
+
+function enterGallery() {
+  $('galPlayer').textContent = user.split(' ')[0].toUpperCase();
+  show('gallery');
+  loadGallery();
+}
+
+async function loadGallery() {
+  if (galBusy) return;
+  galBusy = true;
+  $('grid').innerHTML = '<div class="prog-text" style="position:static">LOADING…</div>';
+  const d = await api(`/api/batch?user=${encodeURIComponent(user)}&n=${GAL_N}`);
+  galBusy = false;
+  if (d.error === 'login') { show('login'); return; }
+  setGalProgress(d);
+  if (d.done || !d.items.length) {
+    const board = await api('/api/leaderboard');
+    const w = board[0];
+    const champ = w ? `🍦 ${w.user.split(' ')[0].toUpperCase()} WINS THE ICE CREAM!<br>(${w.count} labelled)` : '';
+    $('doneStats').innerHTML = `TEAM DONE ${d.answered}/${d.total}<br>YOU ${d.mine || 0}<br><br>${champ}`;
+    show('done'); return;
+  }
+  // Pre-select from the model's guess (1 = cilium). Unknown → junk + ★ flag.
+  galItems = d.items.map(it => ({ ...it, keep: it.guess === 1 }));
+  renderGrid();
+}
+
+function renderGrid() {
+  $('grid').innerHTML = galItems.map((it, i) =>
+    `<div class="tile ${it.keep ? 'keep' : ''}" data-i="${i}">
+       <img src="${it.img}" loading="lazy" alt="roi">
+       ${it.guess == null ? '<span class="unsure">★</span>' : ''}
+       <span class="mark"></span>
+     </div>`).join('');
+  updatePicked();
+}
+
+function updatePicked() {
+  $('galPicked').textContent = galItems.filter(it => it.keep).length;
+}
+
+function setGalProgress(d) {
+  $('galMine').textContent = d.mine || 0;
+  $('galProgBar').style.width = (100 * d.answered / Math.max(1, d.total)) + '%';
+  $('galProgText').textContent = `TEAM ${d.answered}/${d.total}  ·  YOU ${d.mine || 0}`;
+}
+
+$('grid').addEventListener('click', (e) => {
+  const tile = e.target.closest('.tile');
+  if (!tile) return;
+  const i = +tile.dataset.i;
+  galItems[i].keep = !galItems[i].keep;
+  tile.classList.toggle('keep', galItems[i].keep);
+  galItems[i].keep ? beep(660, .05) : beep(220, .06, 'sawtooth');
+  updatePicked();
+});
+
+$('galKeepAll').onclick = () => { galItems.forEach(it => it.keep = true); renderGrid(); sfxCombo(); };
+$('galJunkAll').onclick = () => { galItems.forEach(it => it.keep = false); renderGrid(); sfxReject(); };
+
+$('galSubmit').onclick = async () => {
+  if (galBusy || !galItems.length) return;
+  galBusy = true;
+  const items = galItems.map(it => ({ id: it.id, keep: it.keep }));
+  const res = await api('/api/label_batch', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user, items })
+  });
+  galBusy = false;
+  if (res && res.ok) {
+    updateScore(10 * res.n);
+    sfxKeep();
+    toast(`+${res.n} LABELLED`);
+    setGalProgress(res);
+    loadGallery();
+  } else {
+    toast((res && res.error) || 'submit failed');
+  }
+};
+
+$('galleryBtn').onclick = enterGallery;
+$('galSwipe').onclick = () => { show('game'); nextCard(); };
+
 /* ── leaderboard ── */
 async function showBoard() {
   const data = await api('/api/leaderboard');

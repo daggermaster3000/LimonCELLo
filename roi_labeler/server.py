@@ -3,16 +3,27 @@ Cilia ROI Labeler — retro PWA backend (stdlib only, no FastAPI needed).
 
 A tiny threaded HTTP server that serves a phone-friendly, arcade-styled PWA where
 logged-in lab members swipe/keep-reject per-cilium ROI thumbnails. Each answer is
-appended to ``<run>/csv/labels.csv`` (per user, with timestamp) and a consensus
-``<run>/csv/human_validation.csv`` (the format the pipeline + data app already
-read) is regenerated on every submission — so multiple labelers' answers land in
+appended to ``<csv>/labels.csv`` (per user, with timestamp) and a consensus
+``<csv>/human_validation.csv`` (the format the pipeline + data app already read)
+is regenerated on every submission — so multiple labelers' answers land in
 ``human_validation.csv`` as a majority vote while every individual answer is kept.
+
+Two ROI sources are supported:
+
+  * ``--run "<lc-analysis run dir>"`` — the classic layout
+    (``figures/cilia_rois/*.png`` + ``csv/all_cilia_features.xlsx``).
+  * ``--roi-dir "<folder>"`` — any folder scanned **recursively** for ``*.png``
+    (e.g. the auto-labelled ``labelling_set/{cilia,background}/``). If a
+    ``labels.csv`` sits at the folder root (``roi,prob_cilia,label`` — the
+    ``build_labelset`` output), its labels seed the model's *guess* so the
+    gallery view pre-selects them and a labeler only fixes the mistakes.
 
 Run:
     python roi_labeler/server.py --run "<lc-analysis run dir>" --port 8000
+    python roi_labeler/server.py --roi-dir "<labelling_set>" --port 8000
 
 Then open http://<this-machine-ip>:8000 on any phone on the same network.
-Defaults to the bundled tutorial run if --run is omitted.
+Defaults to the bundled tutorial run if neither --run nor --roi-dir is given.
 """
 from __future__ import annotations
 
@@ -43,13 +54,45 @@ def _img_stem(filename: str) -> str:
     return s
 
 
-def load_rois(run_dir: Path) -> list[dict]:
-    """Build the labeling queue: every cilium with an ROI PNG on disk.
+def _parse_cilia_png(name: str) -> tuple[str, int] | None:
+    """``<stem>_cilia<id>.png`` → (stem, id), or None if it doesn't match."""
+    if "_cilia" not in name:
+        return None
+    stem, tail = name.rsplit("_cilia", 1)
+    try:
+        return stem, int(os.path.splitext(tail)[0])
+    except ValueError:
+        return None
 
-    Prefers the canonical (filename, cilia_id) pairs from ``all_cilia_features``
-    so the consensus CSV matches the pipeline; falls back to parsing the ROI PNG
-    filenames when the workbook is absent.
-    """
+
+def _load_guesses(root: Path) -> dict[str, int]:
+    """Model auto-labels from ``<root>/labels.csv`` (``roi,prob_cilia,label``).
+
+    Returns ``{roi_stem: label}`` (1 = cilia, 0 = background) for seeding the
+    gallery's pre-selection. Empty dict when the file is absent/unreadable."""
+    p = root / "labels.csv"
+    if not p.exists():
+        return {}
+    out: dict[str, int] = {}
+    try:
+        with p.open(encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                roi = row.get("roi")
+                if roi is None or "label" not in row:
+                    continue
+                try:
+                    out[str(roi)] = int(float(row["label"]))
+                except (TypeError, ValueError):
+                    continue
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"[labeler] could not read {p}: {exc}")
+    return out
+
+
+def load_rois_run(run_dir: Path) -> list[dict]:
+    """Classic run layout: ROIs under ``figures/cilia_rois`` keyed by the
+    ``(filename, cilia_id)`` pairs in ``all_cilia_features`` (xlsx) when present,
+    else by parsing the PNG names. ``path`` is relative to that ROI folder."""
     roi_dir = run_dir / "figures" / "cilia_rois"
     pngs = {p.name for p in roi_dir.glob("*.png")} if roi_dir.is_dir() else set()
     out: list[dict] = []
@@ -70,67 +113,86 @@ def load_rois(run_dir: Path) -> list[dict]:
                 png = f"{stem}_cilia{cid}.png"
                 if png in pngs:
                     out.append({"id": f"{stem}__cilia{cid}", "filename": str(fn),
-                                "cilia_id": cid, "png": png})
+                                "cilia_id": cid, "path": png, "guess": None})
             if out:
                 return out
         except Exception as exc:                              # noqa: BLE001
             print(f"[labeler] could not read {xls}: {exc} — scanning PNGs instead")
-    # Fallback: parse the PNG names (filename := stem, no extension known).
     for png in sorted(pngs):
-        if "_cilia" not in png:
+        parsed = _parse_cilia_png(png)
+        if not parsed:
             continue
-        stem, tail = png.rsplit("_cilia", 1)
-        try:
-            cid = int(os.path.splitext(tail)[0])
-        except ValueError:
-            continue
+        stem, cid = parsed
         out.append({"id": f"{stem}__cilia{cid}", "filename": stem,
-                    "cilia_id": cid, "png": png})
+                    "cilia_id": cid, "path": png, "guess": None})
+    return out
+
+
+def load_rois_dir(roi_root: Path) -> list[dict]:
+    """Generic folder: every ``*.png`` found **recursively** becomes an ROI.
+
+    ``path`` is the PNG path relative to ``roi_root`` (so sub-folders like
+    ``cilia/`` and ``background/`` are served correctly). Seeds each ROI's
+    ``guess`` from ``<roi_root>/labels.csv`` when available."""
+    guesses = _load_guesses(roi_root)
+    out: list[dict] = []
+    for p in sorted(roi_root.rglob("*.png")):
+        rel = p.relative_to(roi_root).as_posix()
+        parsed = _parse_cilia_png(p.name)
+        if parsed:
+            stem, cid = parsed
+        else:                                                 # still labelable
+            stem, cid = p.stem, 0
+        # guesses.csv is keyed by the full PNG stem (e.g. ``..._cilia13``).
+        out.append({"id": rel, "filename": stem, "cilia_id": cid,
+                    "path": rel, "guess": guesses.get(p.stem)})
     return out
 
 
 # ── persistence ──────────────────────────────────────────────────────────────
-def _labels_path(run_dir: Path) -> Path:
-    return run_dir / "csv" / "labels.csv"
+def _labels_path(csv_dir: Path) -> Path:
+    return csv_dir / "labels.csv"
 
 
-def _val_path(run_dir: Path) -> Path:
-    return run_dir / "csv" / "human_validation.csv"
+def _val_path(csv_dir: Path) -> Path:
+    return csv_dir / "human_validation.csv"
 
 
-def read_labels(run_dir: Path) -> list[dict]:
-    p = _labels_path(run_dir)
+def read_labels(csv_dir: Path) -> list[dict]:
+    p = _labels_path(csv_dir)
     if not p.exists():
         return []
     with p.open(encoding="utf-8") as fh:
         return list(csv.DictReader(fh))
 
 
-def append_label(run_dir: Path, user: str, filename: str, cilia_id: int,
-                 keep: bool) -> None:
-    """Append one answer to labels.csv and regenerate the consensus
-    human_validation.csv (majority vote per cilium; ties → keep)."""
-    p = _labels_path(run_dir)
+def append_labels(csv_dir: Path, user: str,
+                  items: list[tuple[str, int, bool]]) -> None:
+    """Append one or more answers ``(filename, cilia_id, keep)`` to labels.csv
+    and regenerate the consensus human_validation.csv (majority vote; ties →
+    keep). Batched so a gallery submission is a single rebuild."""
+    p = _labels_path(csv_dir)
     p.parent.mkdir(parents=True, exist_ok=True)
     new = not p.exists()
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
     with p.open("a", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         if new:
             w.writerow(["ts", "user", "filename", "cilia_id", "keep"])
-        w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), user, filename,
-                    cilia_id, int(bool(keep))])
-    _rebuild_consensus(run_dir)
+        for filename, cilia_id, keep in items:
+            w.writerow([ts, user, filename, cilia_id, int(bool(keep))])
+    _rebuild_consensus(csv_dir)
 
 
-def _rebuild_consensus(run_dir: Path) -> None:
+def _rebuild_consensus(csv_dir: Path) -> None:
     votes: dict[tuple[str, int], list[int]] = {}
-    for row in read_labels(run_dir):
+    for row in read_labels(csv_dir):
         try:
             key = (str(row["filename"]), int(row["cilia_id"]))
         except (KeyError, ValueError):
             continue
         votes.setdefault(key, []).append(int(row["keep"]))
-    with _val_path(run_dir).open("w", newline="", encoding="utf-8") as fh:
+    with _val_path(csv_dir).open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["filename", "cilia_id", "human_validated"])
         for (fn, cid), vs in votes.items():
@@ -138,25 +200,9 @@ def _rebuild_consensus(run_dir: Path) -> None:
             w.writerow([fn, cid, bool(keep)])
 
 
-def user_done_ids(run_dir: Path, user: str, by_id: dict) -> set[str]:
-    """ROI ids already answered by ``user`` (matched back to the queue id)."""
-    key_to_id = {(r["filename"], r["cilia_id"]): r["id"] for r in by_id.values()}
-    done = set()
-    for row in read_labels(run_dir):
-        if row.get("user") != user:
-            continue
-        try:
-            rid = key_to_id.get((str(row["filename"]), int(row["cilia_id"])))
-        except ValueError:
-            rid = None
-        if rid:
-            done.add(rid)
-    return done
-
-
-def leaderboard(run_dir: Path) -> list[dict]:
+def leaderboard(csv_dir: Path) -> list[dict]:
     counts: dict[str, int] = {}
-    for row in read_labels(run_dir):
+    for row in read_labels(csv_dir):
         u = row.get("user") or "?"
         counts[u] = counts.get(u, 0) + 1
     return sorted(({"user": u, "count": c} for u, c in counts.items()),
@@ -168,11 +214,12 @@ _CLAIM_TTL = 120.0      # seconds a handed-out ROI is reserved before it frees
 
 
 class App:
-    def __init__(self, run_dir: Path):
-        self.run_dir = run_dir
+    def __init__(self, roi_root: Path, csv_dir: Path, rois: list[dict]):
+        self.roi_root = roi_root
+        self.csv_dir = csv_dir
         self.members = json.loads((HERE / "members.json").read_text("utf-8"))
         self.member_names = {m["name"] for m in self.members}
-        self.rois = load_rois(run_dir)
+        self.rois = rois
         self.by_id = {r["id"]: r for r in self.rois}
         self.key_to_id = {(r["filename"], r["cilia_id"]): r["id"]
                           for r in self.rois}
@@ -183,14 +230,17 @@ class App:
         # In-flight claims: roi_id → (user, expiry_ts). Stops two players getting
         # the same ROI at once; expires so an idle player's ROI returns to pool.
         self.claims: dict[str, tuple[str, float]] = {}
-        print(f"[labeler] run={run_dir}")
-        print(f"[labeler] {len(self.rois)} ROIs · {len(self.members)} members")
+        n_guess = sum(1 for r in self.rois if r.get("guess") is not None)
+        print(f"[labeler] roi_root={roi_root}")
+        print(f"[labeler] csv_dir ={csv_dir}")
+        print(f"[labeler] {len(self.rois)} ROIs · {len(self.members)} members"
+              f" · {n_guess} with a model guess")
 
     # ── shared-pool work distribution (call under _LOCK) ──────────────────────
     def global_done(self) -> set[str]:
         """ROI ids that have at least one label from anyone."""
         done = set()
-        for row in read_labels(self.run_dir):
+        for row in read_labels(self.csv_dir):
             try:
                 rid = self.key_to_id.get((str(row["filename"]), int(row["cilia_id"])))
             except (KeyError, ValueError):
@@ -203,6 +253,12 @@ class App:
         now = time.time()
         for rid in [k for k, (_, exp) in self.claims.items() if exp < now]:
             del self.claims[rid]
+
+    def _roi_view(self, r: dict) -> dict:
+        """The JSON an ROI is sent to the client as."""
+        return {"id": r["id"], "filename": r["filename"],
+                "cilia_id": r["cilia_id"], "guess": r.get("guess"),
+                "img": f"/api/img?id={_q(r['id'])}"}
 
     def claim_next(self, user: str, gdone: set[str]):
         """Next unlabeled ROI not currently claimed by another player; reserve it
@@ -224,12 +280,41 @@ class App:
             return r
         return None
 
+    def claim_batch(self, user: str, gdone: set[str], n: int) -> list[dict]:
+        """Claim up to ``n`` unlabeled ROIs for ``user`` (for the gallery view)."""
+        now = time.time()
+        out, seen = [], set()
+        # Re-serve the user's own live claims first so a reload is stable.
+        for rid, (u, _) in list(self.claims.items()):
+            if u == user and rid not in gdone and rid in self.by_id:
+                self.claims[rid] = (user, now + _CLAIM_TTL)
+                out.append(self.by_id[rid]); seen.add(rid)
+                if len(out) >= n:
+                    return out
+        for r in self.order:
+            rid = r["id"]
+            if rid in gdone or rid in seen:
+                continue
+            c = self.claims.get(rid)
+            if c and c[0] != user and c[1] > now:
+                continue
+            self.claims[rid] = (user, now + _CLAIM_TTL)
+            out.append(r); seen.add(rid)
+            if len(out) >= n:
+                break
+        return out
+
     def release(self, rid: str):
         self.claims.pop(rid, None)
 
     def user_count(self, user: str) -> int:
-        return sum(1 for row in read_labels(self.run_dir)
+        return sum(1 for row in read_labels(self.csv_dir)
                    if row.get("user") == user)
+
+
+def _q(s: str) -> str:
+    from urllib.parse import quote
+    return quote(str(s), safe="")
 
 
 def make_handler(app: App):
@@ -290,8 +375,8 @@ def make_handler(app: App):
                 roi = app.by_id.get(rid)
                 if not roi:
                     return self._send(404, "no roi", "text/plain")
-                fp = app.run_dir / "figures" / "cilia_rois" / roi["png"]
-                if not fp.is_file():
+                fp = (app.roi_root / roi["path"]).resolve()
+                if not str(fp).startswith(str(app.roi_root.resolve())) or not fp.is_file():
                     return self._send(404, "no img", "text/plain")
                 return self._send(200, fp.read_bytes(), "image/png",
                                   {"Cache-Control": "max-age=86400"})
@@ -304,21 +389,38 @@ def make_handler(app: App):
                     app.purge_claims()
                     nxt = app.claim_next(user, gdone)
                     mine = app.user_count(user)
-                    board = leaderboard(app.run_dir)
+                    board = leaderboard(app.csv_dir)
                 total = len(app.rois)
                 answered = len(gdone)            # GLOBAL progress (shared work)
                 if nxt is None:                  # whole pool labelled by the team
                     return self._json({"done": True, "answered": answered,
                                        "total": total, "mine": mine,
                                        "winner": board[0] if board else None})
+                v = app._roi_view(nxt)
+                v.update({"answered": answered, "total": total, "mine": mine})
+                return self._json(v)
+            if path == "/api/batch":
+                user = (q.get("user") or [""])[0]
+                if user not in app.member_names:
+                    return self._json({"error": "login"}, 401)
+                try:
+                    n = max(1, min(60, int((q.get("n") or ["24"])[0])))
+                except ValueError:
+                    n = 24
+                with _LOCK:
+                    gdone = app.global_done()
+                    app.purge_claims()
+                    items = app.claim_batch(user, gdone, n)
+                    mine = app.user_count(user)
+                total = len(app.rois)
+                answered = len(gdone)
                 return self._json({
-                    "id": nxt["id"], "filename": nxt["filename"],
-                    "cilia_id": nxt["cilia_id"],
-                    "img": f"/api/img?id={nxt['id']}",
+                    "items": [app._roi_view(r) for r in items],
+                    "done": len(items) == 0,
                     "answered": answered, "total": total, "mine": mine})
             if path == "/api/leaderboard":
                 with _LOCK:
-                    return self._json(leaderboard(app.run_dir))
+                    return self._json(leaderboard(app.csv_dir))
             if path.startswith("/api/"):
                 return self._json({"error": "unknown"}, 404)
             # static / PWA shell
@@ -345,12 +447,37 @@ def make_handler(app: App):
                 if not roi:
                     return self._json({"error": "no roi"}, 404)
                 with _LOCK:
-                    append_label(app.run_dir, user, roi["filename"],
-                                 roi["cilia_id"], keep)
+                    append_labels(app.csv_dir, user,
+                                  [(roi["filename"], roi["cilia_id"], keep)])
                     app.release(rid)
                     answered = len(app.global_done())     # global shared progress
                     mine = app.user_count(user)
                 return self._json({"ok": True, "answered": answered, "mine": mine,
+                                   "total": len(app.rois)})
+            if u.path == "/api/label_batch":
+                b = self._body()
+                user = (b.get("user") or "").strip()
+                raw = b.get("items") or []
+                if user not in app.member_names:
+                    return self._json({"error": "login"}, 401)
+                items, rids = [], []
+                for it in raw:
+                    roi = app.by_id.get(it.get("id"))
+                    if not roi:
+                        continue
+                    items.append((roi["filename"], roi["cilia_id"],
+                                  bool(it.get("keep"))))
+                    rids.append(roi["id"])
+                if not items:
+                    return self._json({"error": "no items"}, 400)
+                with _LOCK:
+                    append_labels(app.csv_dir, user, items)
+                    for rid in rids:
+                        app.release(rid)
+                    answered = len(app.global_done())
+                    mine = app.user_count(user)
+                return self._json({"ok": True, "n": len(items),
+                                   "answered": answered, "mine": mine,
                                    "total": len(app.rois)})
             return self._json({"error": "unknown"}, 404)
 
@@ -359,17 +486,33 @@ def make_handler(app: App):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run", default=str(_DEFAULT_RUN),
+    ap.add_argument("--run", default=None,
                     help="lc-analysis run dir (csv/ + figures/cilia_rois/)")
+    ap.add_argument("--roi-dir", default=None,
+                    help="any folder of ROI PNGs (scanned recursively); labels "
+                         "are written to <roi-dir>/csv/")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
-    run_dir = Path(args.run).resolve()
-    if not (run_dir / "figures" / "cilia_rois").is_dir():
-        raise SystemExit(f"No figures/cilia_rois in {run_dir}")
-    app = App(run_dir)
-    if not app.rois:
+
+    if args.roi_dir:
+        roi_root = Path(args.roi_dir).resolve()
+        if not roi_root.is_dir():
+            raise SystemExit(f"--roi-dir not a folder: {roi_root}")
+        csv_dir = roi_root / "csv"
+        rois = load_rois_dir(roi_root)
+    else:
+        run_dir = Path(args.run or _DEFAULT_RUN).resolve()
+        roi_root = run_dir / "figures" / "cilia_rois"
+        if not roi_root.is_dir():
+            raise SystemExit(f"No figures/cilia_rois in {run_dir}")
+        csv_dir = run_dir / "csv"
+        rois = load_rois_run(run_dir)
+
+    if not rois:
         raise SystemExit("No ROIs found to label.")
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    app = App(roi_root, csv_dir, rois)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(app))
     import socket
     ip = socket.gethostbyname(socket.gethostname())
