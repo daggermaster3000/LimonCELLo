@@ -62,11 +62,9 @@ def _load_roi_validator():
 
 
 def _model_label(p: float) -> str:
-    if p >= 0.66:
-        return "cilia"
-    if p <= 0.33:
-        return "not"
-    return "uncertain"
+    # cilialpha-3 is a binary keep/reject classifier — it has no "uncertain"
+    # class. P(cilia) >= 0.6 -> cilia, else not.
+    return "cilia" if p >= 0.6 else "not"
 
 
 def main() -> int:

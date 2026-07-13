@@ -34,6 +34,13 @@ LABELS = HERE / "labels.csv"
 
 CLASSES = ("cilia", "not", "uncertain")
 ADMIN = "Quillan Favey"          # only this user may see the statistics dashboard
+MODEL_THR = 0.6                  # cilialpha-3 is binary: P(cilia) >= thr -> cilia
+
+
+def _model_label(p: float) -> str:
+    """cilialpha-3 has no 'uncertain' class — everything under the threshold
+    is 'not'."""
+    return "cilia" if p >= MODEL_THR else "not"
 _LOCK = threading.Lock()
 
 _CTYPES = {
@@ -50,6 +57,10 @@ _CTYPES = {
 class App:
     def __init__(self) -> None:
         self.dataset = json.loads(DATASET.read_text(encoding="utf-8"))
+        # binary model: re-derive labels from scores so an older 3-class
+        # dataset.json (with "uncertain") is corrected without a rebuild
+        for d in self.dataset:
+            d["model_label"] = _model_label(d["model_score"])
         self.by_id = {d["id"]: d for d in self.dataset}
         self.members = json.loads(MEMBERS.read_text(encoding="utf-8"))
         self.member_names = {m["name"] for m in self.members}
