@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="theme-color" content="#ffffff" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="/icon-192.png" />
+  <link rel="stylesheet" href="/style.css" />
+  <title>Cilia Consensus</title>
+</head>
+<body>
+
+<!-- ── Login ─────────────────────────────────────────────── -->
+<section id="login" class="screen show">
+  <div class="card center">
+    <h1 class="title">Cilia<span class="thin">Consensus</span></h1>
+    <p class="sub">What counts as a cilium? Let's find out how much we agree.</p>
+    <label class="field">
+      <span>Who are you?</span>
+      <select id="player"></select>
+    </label>
+    <button id="startBtn" class="btn primary block">Enter</button>
+  </div>
+</section>
+
+<!-- ── Dashboard ─────────────────────────────────────────── -->
+<section id="home" class="screen">
+  <header class="topbar">
+    <div class="brand">Cilia<span class="thin">Consensus</span></div>
+    <div class="who"><span id="whoName"></span><button id="logout" class="link">switch</button></div>
+  </header>
+
+  <main class="wrap">
+    <div class="cta-row">
+      <button id="goLabel" class="btn primary">Start / continue labeling</button>
+      <button id="goCurate" class="btn ghost" hidden>Curate ROIs</button>
+      <button id="refresh" class="btn ghost">Refresh</button>
+      <span id="myprog" class="muted"></span>
+    </div>
+
+    <div id="empty" class="note" hidden>No labels yet — be the first to judge the ROIs.</div>
+
+    <div id="adminReset" class="resetbar" hidden>
+      <span class="resetlbl">Reset decisions:</span>
+      <select id="resetUser"></select>
+      <button id="resetBtn" class="btn danger">Reset</button>
+    </div>
+
+    <div class="cards" id="summary"></div>
+
+    <h2 class="h2">Where do we disagree most?</h2>
+    <p class="hint">ROIs ranked by how split the votes are (dark bar = disagreement).</p>
+    <div id="disagree" class="roigrid"></div>
+
+    <h2 class="h2">You vs. the model &amp; the group</h2>
+    <p class="hint">Pick a rater. Rows = reference, columns = their call. Diagonal = agreement.</p>
+    <div class="picker">
+      <label class="field inline"><span>Rater</span><select id="cmUser"></select></label>
+    </div>
+    <div class="matrix-row">
+      <div class="mtile"><h3>vs. model (cilialpha-3)<span id="accModel" class="acc"></span></h3><div id="cmModel"></div></div>
+      <div class="mtile"><h3>vs. group majority<span id="accCons" class="acc"></span></h3><div id="cmCons"></div></div>
+    </div>
+
+    <h2 class="h2">Who agrees with whom?</h2>
+    <p class="hint">% of shared ROIs where two raters gave the same call.</p>
+    <div id="agree" class="scroll"></div>
+
+    <h2 class="h2">Model vs. humans</h2>
+    <p class="hint">Each dot is an ROI: x = model P(cilia), y = fraction of people who called it a cilium.</p>
+    <div id="scatter"></div>
+
+    <div class="foot">Cilia Consensus · LimonCELLo</div>
+  </main>
+</section>
+
+<!-- ── Labeling ──────────────────────────────────────────── -->
+<section id="label" class="screen">
+  <header class="topbar">
+    <button id="backHome" class="link">‹ Back</button>
+    <div id="labelProg" class="muted">0 / 20</div>
+  </header>
+  <main class="wrap center-col">
+    <div class="progress"><div id="pbar" class="pbar"></div></div>
+    <div class="roiframe"><img id="roiImg" alt="ROI" /></div>
+    <div class="qtext">Is this a cilium?</div>
+    <div class="choices">
+      <button class="btn choice cilia" data-label="cilia">Cilia<span class="key">1</span></button>
+      <button class="btn choice notc"  data-label="not">Not a cilium<span class="key">2</span></button>
+      <button class="btn choice unc"   data-label="uncertain">Uncertain<span class="key">3</span></button>
+    </div>
+    <div id="prevPick" class="muted small"></div>
+    <div class="navrow">
+      <button id="prevBtn" class="btn ghost">‹ Prev</button>
+      <button id="nextBtn" class="btn ghost">Next ›</button>
+    </div>
+  </main>
+</section>
+
+<!-- ── Curate (admin only) ───────────────────────────────── -->
+<section id="curate" class="screen">
+  <header class="topbar">
+    <button id="curBack" class="link">‹ Dashboard</button>
+    <div class="who"><span id="curCount" class="muted">0 selected</span></div>
+  </header>
+  <main class="wrap">
+    <h2 class="h2">Pick the ROIs shown to the group</h2>
+    <p class="hint">Tap to toggle. Green border = shown to everyone. Each tile shows the model's score
+      (dot colour) so you can spot the ambiguous ones (~0.5). Save to publish.</p>
+    <div class="curbar">
+      <button id="curNone" class="btn ghost">Clear all</button>
+      <button id="curAmb" class="btn ghost">Auto-pick ambiguous</button>
+      <button id="curSave" class="btn primary">Save selection</button>
+    </div>
+    <div id="pool" class="poolgrid"></div>
+  </main>
+</section>
+
+<!-- ── Thanks (non-admin, after finishing) ───────────────── -->
+<section id="thanks" class="screen">
+  <div class="wrap center-col">
+    <div class="card center" style="max-width:420px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:28px;text-align:center">
+      <h1 class="title">Thank you!</h1>
+      <p class="sub">Your calls are saved. You can review or change any answer.</p>
+      <button id="thanksReview" class="btn primary block">Review my answers</button>
+      <button id="thanksSwitch" class="link" style="margin-top:10px">Switch user</button>
+    </div>
+  </div>
+</section>
+
+<div id="toast" class="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>
