@@ -10,7 +10,8 @@ classifies where each cilium sits — on a **neurite** or on the **soma** — fr
 geometry of the surrounding structures. It ships three GUIs plus a batch pipeline
 and a small CNN that learns to reject false-positive cilia.
 
-Check out the [tutorial notebook](tutorial/tutorial.ipynb).
+📖 **Full documentation: [the Wiki](docs/Home.md)** — install, app guides, theory,
+training and troubleshooting. Also check the [tutorial notebook](tutorial/tutorial.ipynb).
 
 ### Install
 

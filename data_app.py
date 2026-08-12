@@ -32,7 +32,6 @@ import pandas as pd
 import seaborn as sns
 import streamlit as st
 
-from limoncello.utils.app_helpers import find_latest_run_dir
 
 try:
     import plotly.express as px
@@ -105,7 +104,10 @@ def discover_runs(base: str) -> dict[str, str]:
     """Map ``{run_name: run_dir}`` for a base folder.
 
     Accepts either an output base that *contains* ``lc-analysis-*`` run folders,
-    or a single run directory itself.
+    or a single run directory itself. The walk is **recursive** so a super-batch
+    output tree (``OUT/<sample>/lc-analysis-*``, possibly nested) is found too;
+    each run's key is its path relative to ``base`` so sibling samples stay
+    distinct.
     """
     out: dict[str, str] = {}
     if not base or not os.path.isdir(base):
@@ -113,11 +115,31 @@ def discover_runs(base: str) -> dict[str, str]:
     if _is_run_dir(base):
         out[os.path.basename(base.rstrip("/\\"))] = base
         return out
-    for d in sorted(os.listdir(base)):
-        full = os.path.join(base, d)
-        if d.startswith("lc-analysis-") and _is_run_dir(full):
-            out[d] = full
-    return out
+    # A run dir is any folder holding ``csv/all_cilia_features.xlsx`` — the name
+    # varies (``lc-analysis-*`` from single batch, but ``cv2`` / ``2026-06-17`` /
+    # ``40x FOVs/…`` from super batch, which mirrors the input tree). Match on
+    # content, not name. Collect *every* run dir (including nested ones): a
+    # re-run writes a fresh ``<mirror>/lc-analysis-*`` inside the mirror folder
+    # that still holds a stale flat run, so we must see both, then supersede.
+    run_dirs: list[str] = []
+    for dirpath, dirnames, _files in os.walk(base):
+        if _is_run_dir(dirpath):
+            run_dirs.append(os.path.normpath(dirpath))
+        # Never descend into a run's own content dirs (``csv``/``figures`` are
+        # huge — thousands of ROI PNGs — and never contain nested runs), but do
+        # keep descending into sibling ``lc-analysis-*`` / sample subfolders.
+        dirnames[:] = [d for d in dirnames if d not in ("csv", "figures")]
+
+    # Supersede: if a run dir has another run dir strictly inside it, the outer
+    # one is a stale earlier output (e.g. a flat ROI-only run later re-run in
+    # full pipeline mode) — keep only the innermost (freshest) run per branch.
+    _sep = os.sep
+    for d in sorted(run_dirs):
+        if any(o != d and o.startswith(d + _sep) for o in run_dirs):
+            continue
+        rel = os.path.relpath(d, base).replace("\\", "/")
+        out[rel] = d
+    return dict(sorted(out.items()))
 
 
 def _excel_mtime(run_dir: str) -> float:
@@ -125,31 +147,64 @@ def _excel_mtime(run_dir: str) -> float:
     return os.path.getmtime(p) if os.path.exists(p) else 0.0
 
 
-@st.cache_data(show_spinner=False)
-def load_run_df(run_dir: str, mtime: float) -> pd.DataFrame:
-    """Load the per-object ``all_data`` sheet for a run (cached on mtime)."""
-    _ = mtime
-    path = os.path.join(run_dir, "csv", "all_cilia_features.xlsx")
+def _read_run_table(run_dir: str) -> pd.DataFrame:
+    """Read a run's ``all_data`` table. Reading .xlsx via openpyxl is slow (~1 s
+    each — the bottleneck when loading a whole super-batch), so we keep a
+    ``csv/all_data.parquet`` sidecar next to it: read the parquet when it's at
+    least as new as the workbook, otherwise read the workbook once and write the
+    sidecar for next time. All disk writes are best-effort (read-only shares just
+    fall back to the workbook)."""
+    xlsx = os.path.join(run_dir, "csv", "all_cilia_features.xlsx")
+    pq = os.path.join(run_dir, "csv", "all_data.parquet")
     try:
-        return pd.read_excel(path, sheet_name="all_data")
+        if os.path.exists(pq) and os.path.getmtime(pq) >= os.path.getmtime(xlsx):
+            return pd.read_parquet(pq)
+    except Exception:                                     # noqa: BLE001
+        pass                                              # fall back to the workbook
+    try:
+        df = pd.read_excel(xlsx, sheet_name="all_data")
     except Exception as exc:                              # noqa: BLE001
-        st.warning(f"Could not read {path}: {exc}")
+        print(f"[data_app] Could not read {xlsx}: {exc}")
         return pd.DataFrame()
+    try:
+        df.to_parquet(pq)
+    except Exception:                                     # noqa: BLE001
+        pass                                              # sidecar is an optimisation
+    return df
+
+
+@st.cache_data(show_spinner="Loading run tables…")
+def _combined_cached(sig: tuple) -> pd.DataFrame:
+    """Concatenate every run's table (tagged with ``run``), read in parallel and
+    cached on the (dir, label, mtime) signature so reruns are instant."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(item):
+        _dir, _label, _mt = item
+        df = _read_run_table(_dir)
+        if df is None or df.empty:
+            return None
+        df = df.copy()
+        df["run"] = _label
+        return df
+
+    n = len(sig)
+    if not n:
+        return pd.DataFrame()
+    # Threads help most once the parquet sidecars exist (pyarrow releases the
+    # GIL); the first, workbook-only load is still serial-ish but happens once.
+    with ThreadPoolExecutor(max_workers=min(8, n)) as ex:
+        frames = [f for f in ex.map(_one, sig) if f is not None]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _runs_sig(runs: list[dict]) -> tuple:
+    return tuple((r["dir"], r["label"], _excel_mtime(r["dir"])) for r in runs)
 
 
 def combined_dataframe(runs: list[dict]) -> pd.DataFrame:
     """Concatenate every added run's table, tagged with a ``run`` column."""
-    frames = []
-    for r in runs:
-        df = load_run_df(r["dir"], _excel_mtime(r["dir"]))
-        if df is None or df.empty:
-            continue
-        df = df.copy()
-        df["run"] = r["label"]
-        frames.append(df)
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    return _combined_cached(_runs_sig(runs))
 
 
 def load_nuclei_summary(run_dir: str) -> pd.DataFrame | None:
@@ -163,16 +218,21 @@ def load_nuclei_summary(run_dir: str) -> pd.DataFrame | None:
     return None
 
 
-def combined_nuclei(runs: list[dict]) -> pd.DataFrame:
-    """Concatenate each run's nuclei summary, tagged with a ``run`` column."""
+@st.cache_data(show_spinner=False)
+def _combined_nuclei_cached(sig: tuple) -> pd.DataFrame:
     frames = []
-    for r in runs:
-        n = load_nuclei_summary(r["dir"])
+    for _dir, _label, _mt in sig:
+        n = load_nuclei_summary(_dir)
         if n is not None and not n.empty:
             n = n.copy()
-            n["run"] = r["label"]
+            n["run"] = _label
             frames.append(n)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def combined_nuclei(runs: list[dict]) -> pd.DataFrame:
+    """Concatenate each run's nuclei summary, tagged with a ``run`` column."""
+    return _combined_nuclei_cached(_runs_sig(runs))
 
 
 _IMG_EXTS = (".ims", ".tif", ".tiff", ".czi", ".nd2", ".lif", ".png")
@@ -287,6 +347,27 @@ def load_validation_file(run_dir: str) -> dict[tuple[str, int], bool]:
             v = pd.read_csv(p)
             for _, r in v.iterrows():
                 out[(str(r["filename"]), int(r["cilia_id"]))] = bool(r["human_validated"])
+        except Exception:                                 # noqa: BLE001
+            pass
+    return out
+
+
+def load_validation_scores(run_dir: str) -> dict[tuple[str, int], float]:
+    """``{(filename, cilia_id): ai_score}`` from ``human_validation.csv``, or
+    ``{}``. Present only when the pipeline **batch-AI-validated** the run (the
+    napari app's "AI-validate cilia during batch" option writes the ``ai_score``
+    column), so the data app can show those cilia as already AI-screened."""
+    p = _val_file(run_dir)
+    out: dict[tuple[str, int], float] = {}
+    if os.path.exists(p):
+        try:
+            v = pd.read_csv(p)
+            if "ai_score" in v.columns:
+                for _, r in v.iterrows():
+                    try:
+                        out[(str(r["filename"]), int(r["cilia_id"]))] = float(r["ai_score"])
+                    except (ValueError, TypeError):
+                        pass
         except Exception:                                 # noqa: BLE001
             pass
     return out
@@ -408,7 +489,7 @@ def _show_and_export(fig, basename: str, key: str, *, despine: bool = True):
     png = BytesIO(); fig.savefig(png, format="png", dpi=300, bbox_inches="tight")
     svg = BytesIO(); fig.savefig(svg, format="svg", bbox_inches="tight")
     plt.close(fig)
-    st.image(png.getvalue(), use_container_width=True)
+    st.image(png.getvalue(), width='stretch')
     c1, c2 = st.columns(2)
     c1.download_button(":material/download: PNG (300 dpi)", png.getvalue(),
                        f"{basename}.png", "image/png", key=f"{key}_png")
@@ -582,28 +663,35 @@ with st.sidebar:
             if d in added_dirs:
                 continue
             _saved = load_run_label(d)
-            _disp_to_name[f":material/label: {_saved}  ({name})" if _saved else name] = name
+            _disp_to_name[f"{_saved}  ({name})" if _saved else name] = name
         c1, c2 = st.columns([3, 1])
         with c1:
             pick = st.multiselect("Available runs", list(_disp_to_name), key="pick_runs")
         with c2:
             st.write("")
             st.write("")
-            if st.button(":material/add: Add", use_container_width=True):
+            if st.button(":material/add: Add", width='stretch'):
                 for disp in pick:
                     name = _disp_to_name[disp]
-                    _dir = found[name]
-                    st.session_state["runs"].append(
-                        {"dir": _dir, "label": load_run_label(_dir) or name}
-                    )
+                    # Label = the run's path relative to the base (e.g. ``d11/cv2``)
+                    # so every coverslip stays distinct — run_label.txt names like
+                    # "cv1"/"cv2" repeat across days and would merge in the graphs.
+                    st.session_state["runs"].append({"dir": found[name], "label": name})
                 st.rerun()
-        if st.button(":material/add: Add latest run", use_container_width=True):
-            latest = find_latest_run_dir(base) if not _is_run_dir(base) else base
+        # One-click load the whole (super-)batch — 44 coverslips is a lot to pick.
+        if st.button(":material/library_add: Add ALL found runs", width='stretch'):
+            for name, _dir in found.items():
+                if _dir not in added_dirs:
+                    st.session_state["runs"].append({"dir": _dir, "label": name})
+            st.rerun()
+        if st.button(":material/add: Add latest run", width='stretch'):
+            # Newest run across the (possibly nested super-batch) tree, by mtime.
+            latest = base if _is_run_dir(base) else max(
+                found.values(), key=_excel_mtime, default=None)
             if latest and latest not in added_dirs:
-                st.session_state["runs"].append(
-                    {"dir": latest,
-                     "label": load_run_label(latest) or os.path.basename(latest)}
-                )
+                _lbl = (os.path.basename(latest) if _is_run_dir(base)
+                        else os.path.relpath(latest, base).replace("\\", "/"))
+                st.session_state["runs"].append({"dir": latest, "label": _lbl})
                 st.rerun()
 
     st.markdown("---")
@@ -627,7 +715,7 @@ with st.sidebar:
                     st.rerun()
                 st.caption(os.path.basename(r["dir"]))
                 if st.button(":material/delete: Remove", key=f"rm_{r['dir']}",
-                             use_container_width=True):
+                             width='stretch'):
                     st.session_state["runs"] = [
                         x for x in st.session_state["runs"] if x["dir"] != r["dir"]]
                     try:                                  # drop the orphaned widget
@@ -635,7 +723,7 @@ with st.sidebar:
                     except Exception:                     # noqa: BLE001
                         pass
                     st.rerun()
-        if st.button("Clear all runs", use_container_width=True):
+        if st.button("Clear all runs", width='stretch'):
             st.session_state["runs"] = []
             st.rerun()
 
@@ -647,7 +735,7 @@ _runs = st.session_state["runs"]
 _df = combined_dataframe(_runs)
 _ready = not _df.empty
 
-st.title(":material/nutrition: Limoncello — Data Analysis :material/bar_chart:")
+st.title(":material/nutrition: Limoncello Data Analysis :material/bar_chart:")
 
 if not _ready:
     st.info(
@@ -746,12 +834,23 @@ def _val_key(run_label, filename, cid):
 # Seed each run's saved decisions from disk under its current label (never
 # clobbers live edits). Keyed by (dir, label) so a relabel re-seeds the same
 # disk decisions under the new label — relabeling never loses screening data.
+st.session_state.setdefault("ai_scores", {})         # {(run, filename, cid): score}
+st.session_state.setdefault("ai_validated", set())   # keys decided by the AI
+_ai_scores_seed = st.session_state["ai_scores"]
+_ai_set_seed = st.session_state["ai_validated"]
 for _r in _runs:
     _seed_key = (_r["dir"], _r["label"])
     if _seed_key in st.session_state["_val_seeded"]:
         continue
     for (_fn, _cid), _ok in load_validation_file(_r["dir"]).items():
         _VAL.setdefault(_val_key(_r["label"], _fn, _cid), _ok)
+    # If the run was AI-pre-validated in batch, seed the AI scores and mark those
+    # cilia as AI-decided so the app shows them as already screened by the AI
+    # (scores appear in the gallery; they're excluded from the human-only rate).
+    for (_fn, _cid), _sc in load_validation_scores(_r["dir"]).items():
+        _tk = _val_key(_r["label"], _fn, _cid)
+        _ai_scores_seed.setdefault(_tk, _sc)
+        _ai_set_seed.add(_tk)
     st.session_state["_val_seeded"].add(_seed_key)
 
 
@@ -802,11 +901,22 @@ with st.sidebar:
 if _excl_rejected and "human_validated" in _df.columns:
     _df = _df[_df["human_validated"]]
 
+# ── Day / coverslip grouping ────────────────────────────────────────────────
+# Super-batch mirrors the input tree, so each run's label is its path (e.g.
+# ``d11/cv2`` or ``d38/40x FOVs/…``). Split it into ``day`` (first component) and
+# ``coverslip`` (second, else the whole label) so graphs can compare **between
+# days** while still colouring/splitting by coverslip.
+if "run" in _df.columns:
+    _rparts = _df["run"].astype(str).str.split("/")
+    _df["day"] = _rparts.str[0]
+    _df["coverslip"] = np.where(_rparts.str.len() > 1, _rparts.str[1], _rparts.str[0])
+
 # Convenience masks/columns (computed AFTER the size filter)
 _cilia = _df[_df["object_type"] == "cilia"] if _has_otype else _df
 _num_cols = _df.select_dtypes(include=[np.number]).columns.tolist()
 _cat_cols = [c for c in _df.columns if c not in _num_cols]
-_group_opts = [c for c in ("run", "class", "file_short", "filename") if c in _df.columns]
+_group_opts = [c for c in ("day", "coverslip", "run", "class", "file_short", "filename")
+               if c in _df.columns]
 
 # Compact comparison header
 _mcols = st.columns(len(_runs) + 1)
@@ -950,7 +1060,7 @@ with tab_over:
             for col, tag in zip(cols, [t for t in _OVERVIEW_TAGS if t in imgs]):
                 with col:
                     st.caption(_OVERVIEW_LABEL[tag])
-                    st.image(imgs[tag], use_container_width=True)
+                    st.image(imgs[tag], width='stretch')
 
         # ── Validation rings on the XY MIP (pixel-accurate, from coords) ───────
         _cil_mip = _load_sample_mip(_sel_run["dir"], _stem, "cilia")
@@ -1013,7 +1123,7 @@ with tab_over:
                     _fig = ring_overlay_figure(
                         _bg, _yx, _keep, None, ids=_ids, show_ids=_show_ids,
                         radius=float(_ring_r), title=f"{_stem}")
-                    st.pyplot(_fig, use_container_width=True)
+                    st.pyplot(_fig, width='stretch')
                     plt.close(_fig)
                     st.caption(_cap + ". Positions from each cilium's centroid "
                                "coordinates, projected onto the XY MIP.")
@@ -1061,7 +1171,7 @@ with tab_over:
                 for col, p in zip(st.columns(_per_row), row):
                     with col:
                         st.image(_raw_roi_thumb(p), caption=os.path.basename(p),
-                                 use_container_width=True)
+                                 width='stretch')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1378,7 +1488,7 @@ with tab_screen:
                                 for _col, _i in zip(st.columns(len(_order)), _order):
                                     with _col:
                                         st.image(_preds["paths"][_i],
-                                                 use_container_width=True)
+                                                 width='stretch')
                                         _tk_i = _preds["tks"][_i]
                                         _samp_i = Path(str(_tk_i[1])).stem
                                         st.caption(f"score {_pa[_i]:.2f}")
@@ -1473,10 +1583,10 @@ with tab_screen:
                                                         size=_size)
                                         if _cam is not None:
                                             st.pyplot(gradcam_figure(_cam),
-                                                      use_container_width=True)
+                                                      width='stretch')
                                     if _show_layers:
                                         st.pyplot(layer_overview_figure(_res),
-                                                  use_container_width=True)
+                                                  width='stretch')
                                         # Per-filter detail for a chosen layer.
                                         st.session_state["av_layers_cache"] = [
                                             {"name": l["name"],
@@ -1499,7 +1609,7 @@ with tab_screen:
                             from limoncello.visualization.activations import (
                                 feature_maps_figure as _fmf)
                             st.pyplot(_fmf(_layer, max_channels=_maxc),
-                                      use_container_width=True)
+                                      width='stretch')
 
         # ── Gallery controls ──────────────────────────────────────────────────
         gc1, gc2, gc3 = st.columns(3)
@@ -1571,7 +1681,7 @@ with tab_screen:
                         _bg, _yx, _keep, None, ids=_ids,
                         show_ids=_sc_ring_ids, radius=float(_sc_ring_r),
                         title=_sc_sample)
-                    st.pyplot(_fig, use_container_width=True)
+                    st.pyplot(_fig, width='stretch')
                     plt.close(_fig)
                     st.caption(":green[:material/circle:] kept · "
                                ":red[:material/circle:] rejected · "
@@ -1634,7 +1744,7 @@ with tab_screen:
         b1, b2, b3, b4, b5 = st.columns(5)
         _shown_tks = list(_view_c["_tk"])
         if b1.button(":material/check: Mark all reviewed", type="primary",
-                     use_container_width=True, key="sc_markrev",
+                     width='stretch', key="sc_markrev",
                      help="Marks every still-undecided cilium shown as KEPT, "
                           "leaving your rejections untouched — so the whole set "
                           "counts as screened and is used for training."):
@@ -1643,25 +1753,25 @@ with tab_screen:
                     _commit_decision(t, True, persist=False)
             _persist_run(_sc_run)
             st.rerun()
-        if b2.button(":material/check_circle: Keep all shown", use_container_width=True, key="sc_keepall",
+        if b2.button(":material/check_circle: Keep all shown", width='stretch', key="sc_keepall",
                      help="Force-keep everything shown, overriding any rejections."):
             for t in _shown_tks:
                 _commit_decision(t, True, persist=False)
             _persist_run(_sc_run)
             st.rerun()
-        if b3.button(":material/cancel: Reject all shown", use_container_width=True, key="sc_rejall"):
+        if b3.button(":material/cancel: Reject all shown", width='stretch', key="sc_rejall"):
             for t in _shown_tks:
                 _commit_decision(t, False, persist=False)
             _persist_run(_sc_run)
             st.rerun()
-        if b4.button(":material/undo: Reset shown", use_container_width=True, key="sc_resetall"):
+        if b4.button(":material/undo: Reset shown", width='stretch', key="sc_resetall"):
             for t in _shown_tks:
                 _VAL.pop(t, None)                          # back to undecided (defaults to keep)
                 st.session_state.setdefault("ai_validated", set()).discard(t)
             _persist_run(_sc_run)
             st.rerun()
         if b5.button(":material/save: Save decisions", type="secondary",
-                     use_container_width=True, key="sc_save"):
+                     width='stretch', key="sc_save"):
             _saved = 0
             for r in _runs:
                 rows = [{"filename": fn, "cilia_id": cid, "human_validated": ok}
@@ -1702,7 +1812,7 @@ with tab_screen:
                 # Gallery shows RAW intensities (re-rendered from the .npz crop).
                 _p = _roi_model_png(_sc_run, row["filename"], cid, False)
                 if _p:
-                    st.image(_p, use_container_width=True)
+                    st.image(_p, width='stretch')
                 else:
                     st.warning("No ROI screenshot saved for this cilium.")
             with sc:
@@ -1711,18 +1821,18 @@ with tab_screen:
                 st.caption(f"{_i + 1} / {_n}")
 
             n1, n2, n3, n4 = st.columns(4)
-            if n1.button(":material/arrow_back: Prev", use_container_width=True, key="fx_prev"):
+            if n1.button(":material/arrow_back: Prev", width='stretch', key="fx_prev"):
                 st.session_state["_focus_i"] = max(0, _i - 1)
                 st.rerun()
-            if n2.button(":material/check_circle: Keep ▶", use_container_width=True, key="fx_keep"):
+            if n2.button(":material/check_circle: Keep ▶", width='stretch', key="fx_keep"):
                 _commit_decision(tk, True)
                 st.session_state["_focus_i"] = min(_n - 1, _i + 1)
                 st.rerun()
-            if n3.button(":material/cancel: Reject ▶", use_container_width=True, key="fx_rej"):
+            if n3.button(":material/cancel: Reject ▶", width='stretch', key="fx_rej"):
                 _commit_decision(tk, False)
                 st.session_state["_focus_i"] = min(_n - 1, _i + 1)
                 st.rerun()
-            if n4.button("Next :material/arrow_forward:", use_container_width=True, key="fx_next"):
+            if n4.button("Next :material/arrow_forward:", width='stretch', key="fx_next"):
                 st.session_state["_focus_i"] = min(_n - 1, _i + 1)
                 st.rerun()
 
@@ -1761,7 +1871,7 @@ with tab_screen:
                 # Gallery shows RAW intensities (re-rendered from the .npz crop).
                 _p = _roi_model_png(run_label, row["filename"], cid, False)
                 if _p:
-                    st.image(_p, use_container_width=True)
+                    st.image(_p, width='stretch')
                 else:
                     st.markdown(
                         "<div style='height:120px;display:flex;"
@@ -1797,8 +1907,9 @@ with tab_dist:
                                index=_num_cols.index(_def_m) if _def_m else 0,
                                key="d_metric") if _num_cols else None
     with dc2:
+        _def_grp = "day" if "day" in _group_opts else "run"
         _grp = st.selectbox("Compare by", _group_opts,
-                            index=_group_opts.index("run") if "run" in _group_opts else 0,
+                            index=_group_opts.index(_def_grp) if _def_grp in _group_opts else 0,
                             key="d_group")
     with dc3:
         _kind = st.radio("Style",
@@ -1981,7 +2092,7 @@ with tab_dist:
             _stats = (_data.groupby(_grp)[_metric]
                       .agg(["count", "mean", "median", "std"])
                       .reset_index())
-            st.dataframe(_stats, use_container_width=True)
+            st.dataframe(_stats, width='stretch')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2000,7 +2111,8 @@ with tab_scatter:
             _yi = _num_cols.index("dt_nuclei_um") if "dt_nuclei_um" in _num_cols else 1
             _sy = st.selectbox("Y", _num_cols, index=_yi, key="s_y")
         with sc3:
-            _color_opts = [c for c in ("run", "class", "file_short") if c in _df.columns] or ["run"]
+            _color_opts = [c for c in ("day", "coverslip", "run", "class", "file_short")
+                           if c in _df.columns] or ["run"]
             _sc_color = st.selectbox("Color by", _color_opts, key="s_color")
         with sc4:
             _sc_cilia = st.checkbox("Cilia only", value=True, key="s_cilia")
@@ -2126,7 +2238,7 @@ with tab_inter:
             _iy = st.selectbox("Y", _num_cols, index=_iyi, key="i_y",
                                disabled=_i_mode == "PCA")
         with ic3:
-            _icol_opts = [c for c in ("class", "run", "file_short",
+            _icol_opts = [c for c in ("class", "day", "coverslip", "run", "file_short",
                                       "human_validated") if c in _df.columns] or ["run"]
             _icolor = st.selectbox("Color by", _icol_opts, key="i_color")
 
@@ -2178,12 +2290,12 @@ with tab_inter:
             _plot_col, _img_col = st.columns([3, 1])
             with _plot_col:
                 try:
-                    _event = st.plotly_chart(fig, use_container_width=True,
+                    _event = st.plotly_chart(fig, width='stretch',
                                              on_select="rerun", selection_mode="points",
                                              key="iplot")
                 except TypeError:
                     # Older Streamlit without selection events — hover still works.
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width='stretch')
                     _event = None
 
             # Resolve the clicked point → its ROI screenshot.
@@ -2209,13 +2321,13 @@ with tab_inter:
                     _npz = _roi_npz_path(rl, info.get("filename"), info.get("cilia_id"))
                     _multi = _roi_multichannel_png(_npz)
                     if _multi is not None:
-                        st.image(_multi, use_container_width=True)
+                        st.image(_multi, width='stretch')
                         st.caption(":green[:material/circle:] cilia · :violet[:material/circle:] basal body · :blue[:material/circle:] nuclei · cyan neurite")
                     else:
                         path = _roi_png_path(rl, info.get("filename"),
                                              info.get("cilia_id"))
                         if path:
-                            st.image(path, use_container_width=True)
+                            st.image(path, width='stretch')
                         else:
                             st.caption("No ROI saved for this cilium.")
                 else:
@@ -2309,7 +2421,7 @@ with tab_table:
     _view = _view[_order]
 
     st.caption(f"Showing {len(_view):,} of {len(_df):,} objects")
-    st.dataframe(_view, use_container_width=True, height=420)
+    st.dataframe(_view, width='stretch', height=420)
     st.download_button(":material/download: Download filtered (CSV)",
                        _view.to_csv(index=False).encode(),
                        "objects_filtered.csv", "text/csv", key="dl_tbl")
@@ -2327,7 +2439,7 @@ with tab_table:
                 "std_log_ratio": ("log_ratio", "std")}
         _by = [c for c in ("run", "file_short") if c in _cil.columns] or ["run"]
         _summary = _cil.groupby(_by).agg(**_agg).reset_index()
-        st.dataframe(_summary, use_container_width=True)
+        st.dataframe(_summary, width='stretch')
         st.download_button(":material/download: Download summary (CSV)",
                            _summary.to_csv(index=False).encode(),
                            "summary.csv", "text/csv", key="dl_sum")
@@ -2365,12 +2477,12 @@ with tab_qc:
         else:
             st.success(":material/check: No deviant samples — all metrics within robust range.")
 
-        st.pyplot(_qc_bar_fig(_qc), use_container_width=True)
+        st.pyplot(_qc_bar_fig(_qc), width='stretch')
 
         # Per-sample QC table, flagged rows highlighted
         def _hl(row):
             return ["background-color: #fdecea" if row["flags"] else "" for _ in row]
-        st.dataframe(_qc.style.apply(_hl, axis=1), use_container_width=True)
+        st.dataframe(_qc.style.apply(_hl, axis=1), width='stretch')
         st.download_button(":material/download: Download QC table (CSV)",
                            _qc.to_csv(index=False).encode(),
                            "qc_per_sample.csv", "text/csv", key="dl_qc")
@@ -2391,7 +2503,7 @@ with tab_qc:
                         color=_PRISM_PALETTE[:len(_per_run)] or "#0C5DA5")
                 _ax.set_ylabel("cilia")
                 _ax.tick_params(axis="x", rotation=30)
-                st.pyplot(_frun, use_container_width=True)
+                st.pyplot(_frun, width='stretch')
                 plt.close(_frun)
             with cc2:
                 st.caption("Per sample (cilia per image)")
@@ -2403,9 +2515,9 @@ with tab_qc:
                               color="#222", size=3, alpha=0.6)
                 _axs.set_ylabel("cilia / image")
                 _axs.tick_params(axis="x", rotation=30)
-                st.pyplot(_fsm, use_container_width=True)
+                st.pyplot(_fsm, width='stretch')
                 plt.close(_fsm)
-            st.dataframe(_per_run, use_container_width=True, hide_index=True)
+            st.dataframe(_per_run, width='stretch', hide_index=True)
 
         # ── Ciliation rate (cilia per estimated nucleus) ───────────────────────
         st.markdown("#### :material/science: Ciliation rate")
@@ -2445,7 +2557,7 @@ with tab_qc:
                          color=_PRISM_PALETTE[:len(_cr_run)] or "#00B945")
                 _axc.set_ylabel("cilia / nucleus")
                 _axc.tick_params(axis="x", rotation=30)
-                st.pyplot(_fcr, use_container_width=True)
+                st.pyplot(_fcr, width='stretch')
                 plt.close(_fcr)
             with gc2:
                 st.caption("Per sample")
@@ -2457,9 +2569,9 @@ with tab_qc:
                               color="#222", size=3, alpha=0.6)
                 _axcs.set_ylabel("cilia / nucleus")
                 _axcs.tick_params(axis="x", rotation=30)
-                st.pyplot(_fcs, use_container_width=True)
+                st.pyplot(_fcs, width='stretch')
                 plt.close(_fcs)
-            st.dataframe(_merged[_disp_cols].round(3), use_container_width=True,
+            st.dataframe(_merged[_disp_cols].round(3), width='stretch',
                          hide_index=True)
             st.download_button(":material/download: Download ciliation table (CSV)",
                                _merged[_disp_cols].to_csv(index=False).encode(),
@@ -2514,7 +2626,7 @@ with tab_qc:
                 _fp_tbl["FP_rate_%"] = (
                     100 * _fp_tbl["false_positives"]
                     / _fp_tbl["screened"].replace(0, np.nan)).round(1)
-                st.dataframe(_fp_tbl, use_container_width=True)
+                st.dataframe(_fp_tbl, width='stretch')
                 st.download_button(":material/download: Download false-positive table (CSV)",
                                    _fp_tbl.to_csv(index=False).encode(),
                                    "false_positives.csv", "text/csv", key="dl_fp")
@@ -2526,10 +2638,10 @@ with tab_qc:
                 st.markdown(f"**{r['label']}**")
                 if not sheets["qc_global"].empty:
                     st.caption("qc_global")
-                    st.dataframe(sheets["qc_global"], use_container_width=True)
+                    st.dataframe(sheets["qc_global"], width='stretch')
                 if not sheets["qc_per_sample"].empty:
                     st.caption("qc_per_sample")
-                    st.dataframe(sheets["qc_per_sample"], use_container_width=True)
+                    st.dataframe(sheets["qc_per_sample"], width='stretch')
                 if sheets["qc_global"].empty and sheets["qc_per_sample"].empty:
                     st.caption("— no QC sheets saved for this run —")
 
@@ -2584,7 +2696,7 @@ def _validation_compare(label, merged, hand_col, pipe_col, unit=""):
                 va="top", ha="left", fontsize=9, fontweight="bold")
         ax.set_title("correlation", fontsize=9)
         fig.tight_layout()
-        st.pyplot(fig, use_container_width=True)
+        st.pyplot(fig, width='stretch')
         plt.close(fig)
     with g2:
         fig2, ax2 = plt.subplots(figsize=(3.5, 3.1))
@@ -2596,7 +2708,7 @@ def _validation_compare(label, merged, hand_col, pipe_col, unit=""):
         ax2.set_xlabel("mean(hand, pipeline)"); ax2.set_ylabel("pipeline − hand")
         ax2.set_title("Bland–Altman", fontsize=9)
         fig2.tight_layout()
-        st.pyplot(fig2, use_container_width=True)
+        st.pyplot(fig2, width='stretch')
         plt.close(fig2)
 
 
@@ -2791,7 +2903,7 @@ with tab_validate:
                         _oax.set_xlabel("neurite thr"); _oax.set_ylabel("soma thr")
                         _ofig.colorbar(_im, ax=_oax, label="soma-fraction error")
                         _ofig.tight_layout()
-                        st.pyplot(_ofig, use_container_width=False)
+                        st.pyplot(_ofig, width='content')
                         plt.close(_ofig)
                         if st.button(":material/check_circle: Apply optimized thresholds",
                                      type="primary", key="apply_opt_thr"):
@@ -2808,7 +2920,7 @@ with tab_validate:
                 if {"hand_cilia", "pipe_cilia"}.issubset(_tbl.columns):
                     _tbl["Δ cilia"] = _tbl["pipe_cilia"] - _tbl["hand_cilia"]
                 st.markdown("**Per-sample comparison**")
-                st.dataframe(_tbl.round(1), use_container_width=True, hide_index=True)
+                st.dataframe(_tbl.round(1), width='stretch', hide_index=True)
                 st.download_button(
                     ":material/download: Download comparison (CSV)",
                     _tbl.to_csv(index=False).encode(),
@@ -3031,7 +3143,7 @@ with tab_boxes:
                 _miss["recall"] = (_miss["found"] / _miss["n"]).map(
                     lambda v: f"{v:.0%}")
                 st.dataframe(_miss.reset_index()[["gt_class", "n", "found",
-                             "missed", "recall"]], use_container_width=True,
+                             "missed", "recall"]], width='stretch',
                              hide_index=True)
 
                 # ── Confusion: GT class × predicted class (matched boxes only) ─
@@ -3041,7 +3153,7 @@ with tab_boxes:
                     st.caption("No matched boxes to build a confusion matrix.")
                 else:
                     _conf = pd.crosstab(_mm["gt_class"], _mm["pred_class"])
-                    st.dataframe(_conf, use_container_width=True)
+                    st.dataframe(_conf, width='stretch')
                     _correct = int(sum(_cls_eq(g, p) for g, p in
                                        zip(_mm["gt_class"], _mm["pred_class"])))
                     _acc = _correct / len(_mm)
@@ -3059,7 +3171,7 @@ with tab_boxes:
                         detections="count",
                         fp=lambda s: int((~s).sum())).reset_index()
                     _ps = _ps.merge(_fp_ps, on="stem", how="outer")
-                    st.dataframe(_ps, use_container_width=True, hide_index=True)
+                    st.dataframe(_ps, width='stretch', hide_index=True)
 
                 c1, c2 = st.columns(2)
                 c1.download_button(
@@ -3208,10 +3320,10 @@ with tab_boxes:
                     with _pcol:
                         try:
                             _ev = st.plotly_chart(
-                                fig, use_container_width=True, on_select="rerun",
+                                fig, width='stretch', on_select="rerun",
                                 selection_mode="points", key="box_iplot")
                         except TypeError:
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.plotly_chart(fig, width='stretch')
                             _ev = None
                     _sel = []
                     if _ev is not None:
@@ -3228,14 +3340,14 @@ with tab_boxes:
                                                  info.get("cilia_id"))
                             _multi = _roi_multichannel_png(_npz)
                             if _multi is not None:
-                                st.image(_multi, use_container_width=True)
+                                st.image(_multi, width='stretch')
                                 st.caption(":green[:material/circle:] cilia · "
                                            ":violet[:material/circle:] basal body · "
                                            ":blue[:material/circle:] nuclei · cyan neurite")
                             else:
                                 _p = _roi_png_path(_sel_label, info.get("filename"),
                                                    info.get("cilia_id"))
-                                st.image(_p, use_container_width=True) if _p else \
+                                st.image(_p, width='stretch') if _p else \
                                     st.caption("No ROI saved for this cilium.")
                         else:
                             st.caption("Click a point to preview its ROI.")
@@ -3270,7 +3382,7 @@ with tab_boxes:
                     ax.set_axis_off()
                     ax.set_title(f"{_vstem} — boxes (class colour) + detections (cyan)",
                                  fontsize=9)
-                    st.pyplot(fig, use_container_width=True)
+                    st.pyplot(fig, width='stretch')
                     plt.close(fig)
 
 

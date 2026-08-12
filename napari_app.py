@@ -1195,7 +1195,8 @@ class LimoncelloApp:
 
     def _set_busy(self, busy: bool):
         self._busy = busy
-        for b in self._step_buttons + [self.run_all_btn, self.batch_btn, self.train_btn]:
+        for b in self._step_buttons + [self.run_all_btn, self.batch_btn,
+                                       self.super_batch_btn, self.train_btn]:
             b.enabled = not busy
         if busy:
             self._progress_busy()
@@ -1623,27 +1624,11 @@ class LimoncelloApp:
         _run_idx(0)
 
     # ── batch ───────────────────────────────────────────────────────────────────
-    def _do_batch(self):
-        if self._busy:
-            return
-        folder = Path(str(self.folder.value))
-        out    = Path(str(self.output.value))
-        # Input may be a folder of .ims OR a .txt manifest (one .ims path per
-        # line) — type/paste the manifest path into the input folder field.
-        _is_manifest = folder.is_file() and folder.suffix.lower() == ".txt"
-        if not (folder.is_dir() or _is_manifest):
-            show_warning("Select an input folder, or a .txt manifest of .ims paths.")
-            return
-        if not str(out):
-            show_warning("Select an output folder first.")
-            return
-        out.mkdir(parents=True, exist_ok=True)
-        p = self._params()
-        self._set_busy(True)
-        self._set_status("⚙️ Batch running over folder …")
-
+    def _batch_kwargs(self, p: dict) -> tuple[dict, dict]:
+        """Shared kwargs for the full pipeline and the ROI-only fast batch, minus
+        ``input_path`` / ``output_path`` (the callers fill those in per run so the
+        same parameter set drives both single-folder and super-batch)."""
         kwargs = dict(
-            input_path=str(folder), output_path=str(out),
             gpu_device=p["gpu_device"],
             cilia_classifier_path=p["classifier_path"],
             cilia_channel=p["ch_cilia"], neurites_channel=p["ch_neurites"],
@@ -1683,14 +1668,7 @@ class LimoncelloApp:
                 and str(self.ai_model_combo.value).endswith(".pt") else None),
             batch_ai_threshold=float(self.ai_keep_thr.value),
         )
-
-        bridge = self._bridge   # emit progress from the worker thread → GUI thread
-        roi_only = self.batch_roi_only.value
-
-        # ROI-only fast batch: cilia+BB → ROI export, skip the full analysis. Reuse
-        # the relevant subset of the parameters above.
         roi_kwargs = dict(
-            input_path=str(folder), output_path=str(out),
             gpu_device=p["gpu_device"],
             cilia_classifier_path=p["classifier_path"],
             cilia_channel=p["ch_cilia"], neurites_channel=p["ch_neurites"],
@@ -1711,6 +1689,122 @@ class LimoncelloApp:
             roi_sample_frac=float(self.batch_roi_pct.value) / 100.0,
             roi_tile_px=int(self.batch_roi_tile.value),
         )
+        return kwargs, roi_kwargs
+
+    @staticmethod
+    def _discover_ims_folders(root: Path) -> list[Path]:
+        """Every folder at/under ``root`` that *directly* holds ≥1 .ims file,
+        sorted. Used by super-batch to walk a tree of sample folders."""
+        hits = []
+        for dp, _dn, fns in os.walk(root):
+            if any(f.lower().endswith(".ims") for f in fns):
+                hits.append(Path(dp))
+        return sorted(hits)
+
+    def _do_super_batch(self):
+        """Super batch: process every subfolder (recursively) that contains .ims
+        files as its own run, mirroring each input folder's path under the output
+        folder so the naming convention is preserved. Reuses every batch option
+        (full vs ROI-only, live capture, AI validation)."""
+        if self._busy:
+            return
+        root = Path(str(self.folder.value))
+        out_root = Path(str(self.output.value))
+        if not root.is_dir():
+            show_warning("Super batch needs an input FOLDER (not a .txt manifest).")
+            return
+        if not str(self.output.value):
+            show_warning("Select an output folder first.")
+            return
+        folders = self._discover_ims_folders(root)
+        if not folders:
+            show_warning(f"No .ims files found in {root} or any subfolder.")
+            return
+
+        p = self._params()
+        kwargs, roi_kwargs = self._batch_kwargs(p)
+        bridge     = self._bridge
+        roi_only   = self.batch_roi_only.value
+        capture    = self.batch_capture.value and not roi_only
+        viz_bridge = self._viz_bridge
+        n_fold     = len(folders)
+
+        def _per_file(payload):
+            payload["capture_rois"] = False   # ROIs handled by the pipeline now
+            done = threading.Event()
+            viz_bridge.visualize.emit(payload, done)
+            done.wait()
+
+        self._set_busy(True)
+        self._set_status(f"⚙️ Super batch — {n_fold} folder(s) …")
+
+        @thread_worker
+        def _work():
+            for fi, fdir in enumerate(folders):
+                rel = fdir.relative_to(root)
+                # Mirror the input tree under the output folder, keeping names.
+                # The root itself (rel == '.') maps to a folder named after root.
+                sub = str(rel) if str(rel) != "." else root.name
+                out_sub = out_root / sub
+                out_sub.mkdir(parents=True, exist_ok=True)
+
+                def _cb(i, n, f, _fi=fi, _sub=sub):
+                    bridge.progressed.emit(i, n, f"[{_fi + 1}/{n_fold}] {_sub} — {f}")
+
+                if roi_only:
+                    run_roi_only_batch(
+                        **{**roi_kwargs, "input_path": str(fdir),
+                           "output_path": str(out_sub)},
+                        progress_callback=_cb,
+                    )
+                else:
+                    run_pipeline3(
+                        **{**kwargs, "input_path": str(fdir),
+                           "output_path": str(out_sub)},
+                        progress_callback=_cb,
+                        per_file_callback=_per_file if capture else None,
+                    )
+
+        def _done(_):
+            self._set_busy(False)
+            self._set_status(f"✅ Super batch complete — {n_fold} folder(s). See output.")
+            show_info("Super batch processing complete.")
+            self._flash_complete()
+
+        def _err(e):
+            self._set_busy(False)
+            show_warning(f"❌ Super batch failed: {e}")
+
+        w = _work()
+        w.returned.connect(_done)
+        w.errored.connect(_err)
+        w.start()
+
+    def _do_batch(self):
+        if self._busy:
+            return
+        folder = Path(str(self.folder.value))
+        out    = Path(str(self.output.value))
+        # Input may be a folder of .ims OR a .txt manifest (one .ims path per
+        # line) — type/paste the manifest path into the input folder field.
+        _is_manifest = folder.is_file() and folder.suffix.lower() == ".txt"
+        if not (folder.is_dir() or _is_manifest):
+            show_warning("Select an input folder, or a .txt manifest of .ims paths.")
+            return
+        if not str(out):
+            show_warning("Select an output folder first.")
+            return
+        out.mkdir(parents=True, exist_ok=True)
+        p = self._params()
+        self._set_busy(True)
+        self._set_status("⚙️ Batch running over folder …")
+
+        kwargs, roi_kwargs = self._batch_kwargs(p)
+        kwargs.update(input_path=str(folder), output_path=str(out))
+        roi_kwargs.update(input_path=str(folder), output_path=str(out))
+
+        bridge = self._bridge   # emit progress from the worker thread → GUI thread
+        roi_only = self.batch_roi_only.value
 
         # Per-file live visualisation (optional). The callback runs in the worker
         # thread: it hands the file's arrays to the GUI thread and blocks until
@@ -2653,6 +2747,10 @@ class LimoncelloApp:
         self.run_all_btn.clicked.connect(self._do_run_all)
         self.batch_btn = PushButton(text="⚡ Run BATCH (whole folder)")
         self.batch_btn.clicked.connect(self._do_batch)
+        # Super batch: walk the input folder's subfolders and process each one
+        # that holds .ims files as its own run, mirroring the tree under output.
+        self.super_batch_btn = PushButton(text="🗂️ Run SUPER BATCH (all subfolders)")
+        self.super_batch_btn.clicked.connect(self._do_super_batch)
         # Live batch visualisation: show each file's layers in the viewer and
         # save the whole-image overlay screenshots. The per-cilium ROIs are now
         # exported by the pipeline itself (fast MIP thumbnails + raw crops), so
@@ -2703,7 +2801,7 @@ class LimoncelloApp:
             widgets=[self.output, self.batch_roi_only, self.batch_xy_um,
                      self.batch_roi_pct, self.batch_roi_tile, self.batch_capture,
                      self.batch_rois, self.roi_correct, self.batch_ai,
-                     self.batch_btn],
+                     self.batch_btn, self.super_batch_btn],
             labels=True,
         )
         ai_box = Container(
